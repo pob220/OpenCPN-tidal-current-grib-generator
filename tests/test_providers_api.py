@@ -5,6 +5,7 @@ import os
 import sys
 import types
 
+import numpy as np
 import pytest
 
 from tidal_current_grib_generator.api import default_output_filename
@@ -14,6 +15,7 @@ from tidal_current_grib_generator.dependencies import check_dependencies
 from tidal_current_grib_generator.geo import BoundingBox
 from tidal_current_grib_generator.providers import ProviderRegistry, select_best_provider_for_bbox
 from tidal_current_grib_generator.security import REDACTED, redact_mapping
+from tidal_current_grib_generator.sources.netcdf import _regular_spacing
 
 
 def test_provider_selection_prefers_nws_for_irish_sea():
@@ -23,9 +25,38 @@ def test_provider_selection_prefers_nws_for_irish_sea():
     assert provider.id == "copernicus_nws"
 
 
-def test_provider_selection_returns_none_when_only_unimplemented_global_matches():
+def test_provider_registry_includes_global_provider():
+    provider = ProviderRegistry().get("copernicus_global")
+    assert provider.implemented is True
+    assert provider.dataset_id == "cmems_mod_glo_phy_anfc_0.083deg_PT1H-m"
+    assert provider.variables == ("uo", "vo")
+    assert provider.source_grid_regularity_tolerance == pytest.approx(5e-5)
+    assert provider.maximum_depth == pytest.approx(0.5)
+
+
+def test_provider_registry_keeps_nws_source_grid_tolerance():
+    provider = ProviderRegistry().get("copernicus_nws")
+    assert provider.source_grid_regularity_tolerance == pytest.approx(1e-5)
+
+
+def test_global_source_grid_tolerance_accepts_copernicus_float_noise():
+    coordinates = np.array(
+        [-40.5, -40.4166717529297, -40.3333435058594, -40.25, -40.1666564941406, -40.0833282470703],
+        dtype=np.float32,
+    )
+    spacing = _regular_spacing(
+        coordinates,
+        "longitude",
+        ProviderRegistry().get("copernicus_global").source_grid_regularity_tolerance,
+    )
+    assert spacing == pytest.approx(0.0833282470703)
+
+
+def test_provider_selection_uses_global_outside_nws():
     bbox = BoundingBox(140.0, -30.0, 141.0, -29.0)
-    assert select_best_provider_for_bbox(bbox, registry=ProviderRegistry()) is None
+    provider = select_best_provider_for_bbox(bbox, registry=ProviderRegistry())
+    assert provider is not None
+    assert provider.id == "copernicus_global"
 
 
 def test_redact_mapping_removes_passwords():
@@ -170,6 +201,47 @@ def test_download_copernicus_cli_accepts_end(monkeypatch, tmp_path: Path):
     assert calls["kwargs"]["end_datetime"].isoformat() == "2026-07-01T03:00:00+00:00"
 
 
+def test_download_copernicus_auto_uses_global_outside_nws(monkeypatch, tmp_path: Path):
+    calls = {}
+
+    class FakeResponse:
+        def model_dump(self, mode="json"):
+            return {"ok": True}
+
+    def fake_subset(**kwargs):
+        calls["kwargs"] = kwargs
+        return FakeResponse()
+
+    monkeypatch.setitem(sys.modules, "copernicusmarine", types.SimpleNamespace(subset=fake_subset))
+    monkeypatch.setattr("tidal_current_grib_generator.copernicus.copernicusmarine_available", lambda: True)
+    monkeypatch.setenv("CURRENTGRIB_TEST_COPERNICUS_USERNAME", "user")
+    monkeypatch.setenv("CURRENTGRIB_TEST_COPERNICUS_PASSWORD", "secret")
+    rc = main(
+        [
+            "download-copernicus",
+            "--bbox",
+            "140.0",
+            "-30.0",
+            "141.0",
+            "-29.0",
+            "--start",
+            "2026-07-01T00:00:00Z",
+            "--hours",
+            "6",
+            "--output-directory",
+            str(tmp_path),
+            "--output-filename",
+            "global_subset.nc",
+            "--dry-run",
+        ]
+    )
+    assert rc == 0
+    assert calls["kwargs"]["dataset_id"] == "cmems_mod_glo_phy_anfc_0.083deg_PT1H-m"
+    assert calls["kwargs"]["variables"] == ["uo", "vo"]
+    assert calls["kwargs"]["minimum_depth"] == 0.0
+    assert calls["kwargs"]["maximum_depth"] == 0.5
+
+
 def test_download_copernicus_cli_rejects_nonpositive_hours(tmp_path: Path, capsys):
     rc = main(
         [
@@ -309,6 +381,146 @@ def test_generate_copernicus_cli_uses_password_env_without_printing(monkeypatch,
     captured = capsys.readouterr()
     assert "secret" not in captured.out
     assert "secret" not in captured.err
+
+
+def test_generate_copernicus_explicit_global_uses_global_dataset(monkeypatch, tmp_path: Path):
+    calls = {}
+    first = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    download_path = tmp_path / "downloads" / "global_subset.nc"
+
+    class FakeDownloadResult:
+        path = download_path
+
+        def as_dict(self):
+            return {"path": str(self.path), "dataset_id": calls["download_request"].dataset_id}
+
+    class FakeGenerateResult:
+        output = tmp_path / "global.grb"
+        message_count = 14
+        byte_count = 100
+
+        def as_dict(self):
+            return {"output": str(self.output), "message_count": self.message_count, "byte_count": self.byte_count}
+
+    def fake_download(request, progress_callback=None):
+        calls["download_request"] = request
+        return FakeDownloadResult()
+
+    def fake_generate(request, progress_callback=None):
+        calls["generate_request"] = request
+        return FakeGenerateResult()
+
+    monkeypatch.setattr("tidal_current_grib_generator.cli.download_copernicus_subset", fake_download)
+    monkeypatch.setattr("tidal_current_grib_generator.cli.generate_current_grib_from_netcdf", fake_generate)
+    monkeypatch.setattr("tidal_current_grib_generator.cli.inspect_grib", lambda path: {"message_count": 14})
+    monkeypatch.setattr(
+        "tidal_current_grib_generator.cli.netcdf_time_metadata",
+        lambda path: {
+            "first_time": first,
+            "last_time": first + timedelta(hours=6),
+            "time_count": 7,
+            "step_hours": 1.0,
+            "times": [first + timedelta(hours=i) for i in range(7)],
+        },
+    )
+    monkeypatch.setenv("CURRENTGRIB_TEST_COPERNICUS_USERNAME", "user")
+    monkeypatch.setenv("CURRENTGRIB_COPERNICUS_PASSWORD", "secret")
+    rc = main(
+        [
+            "generate-copernicus",
+            "--provider",
+            "copernicus_global",
+            "--bbox",
+            "140.0",
+            "-30.0",
+            "141.0",
+            "-29.0",
+            "--start",
+            "2026-07-01T00:00:00Z",
+            "--hours",
+            "6",
+            "--download-directory",
+            str(tmp_path / "downloads"),
+            "--download-filename",
+            "global_subset.nc",
+            "--output",
+            str(tmp_path / "global.grb"),
+            "--metadata-summary",
+        ]
+    )
+    assert rc == 0
+    download_request = calls["download_request"]
+    assert download_request.dataset_id == "cmems_mod_glo_phy_anfc_0.083deg_PT1H-m"
+    assert download_request.variables == ("uo", "vo")
+    assert download_request.minimum_depth == 0.0
+    assert download_request.maximum_depth == 0.5
+    assert calls["generate_request"].step_hours == 1
+    assert calls["generate_request"].hours == 6
+    assert calls["generate_request"].source_grid_regularity_tolerance == pytest.approx(5e-5)
+
+
+def test_generate_copernicus_allows_explicit_source_grid_tolerance(monkeypatch, tmp_path: Path):
+    calls = {}
+    first = datetime(2026, 7, 1, tzinfo=timezone.utc)
+
+    class FakeDownloadResult:
+        path = tmp_path / "downloads" / "subset.nc"
+
+        def as_dict(self):
+            return {"path": str(self.path)}
+
+    class FakeGenerateResult:
+        output = tmp_path / "current.grb"
+        message_count = 8
+        byte_count = 100
+
+        def as_dict(self):
+            return {"output": str(self.output), "message_count": self.message_count, "byte_count": self.byte_count}
+
+    monkeypatch.setattr("tidal_current_grib_generator.cli.download_copernicus_subset", lambda request, progress_callback=None: FakeDownloadResult())
+
+    def fake_generate(request, progress_callback=None):
+        calls["generate_request"] = request
+        return FakeGenerateResult()
+
+    monkeypatch.setattr("tidal_current_grib_generator.cli.generate_current_grib_from_netcdf", fake_generate)
+    monkeypatch.setattr("tidal_current_grib_generator.cli.inspect_grib", lambda path: {"message_count": 8})
+    monkeypatch.setattr(
+        "tidal_current_grib_generator.cli.netcdf_time_metadata",
+        lambda path: {
+            "first_time": first,
+            "last_time": first + timedelta(hours=3),
+            "time_count": 4,
+            "step_hours": 1.0,
+            "times": [first + timedelta(hours=i) for i in range(4)],
+        },
+    )
+    monkeypatch.setenv("CURRENTGRIB_TEST_COPERNICUS_USERNAME", "user")
+    monkeypatch.setenv("CURRENTGRIB_COPERNICUS_PASSWORD", "secret")
+    rc = main(
+        [
+            "generate-copernicus",
+            "--provider",
+            "copernicus_global",
+            "--bbox",
+            "-40.5",
+            "30.0",
+            "-40.0",
+            "30.5",
+            "--start",
+            "2026-07-01T00:00:00Z",
+            "--hours",
+            "3",
+            "--source-grid-regularity-tolerance",
+            "0.0002",
+            "--download-directory",
+            str(tmp_path / "downloads"),
+            "--output",
+            str(tmp_path / "current.grb"),
+        ]
+    )
+    assert rc == 0
+    assert calls["generate_request"].source_grid_regularity_tolerance == pytest.approx(0.0002)
 
 
 def test_generate_copernicus_aligns_to_downloaded_netcdf_times(monkeypatch, tmp_path: Path, capsys):

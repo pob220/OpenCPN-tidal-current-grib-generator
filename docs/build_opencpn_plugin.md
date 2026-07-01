@@ -2,7 +2,7 @@
 
 This project keeps the generator engine as a Python CLI/library and provides an OpenCPN plugin front-end in `plugins/currentgrib_pi`.
 
-The plugin currently invokes the installed `tidal-current-grib` executable for dependency checks and for synthetic/local NetCDF generation. Copernicus live download is deliberately stubbed in the plugin until credential handling and background-worker behaviour are hardened.
+The plugin invokes the installed `tidal-current-grib` executable for dependency checks, synthetic generation, local NetCDF conversion, and Copernicus live download/generation. Copernicus passwords are passed only through the child-process environment and are not placed on the command line.
 
 ## Development Layout
 
@@ -120,12 +120,15 @@ The dialog also exposes a generator executable field so a development path can b
 7. Load the generated GRIB in OpenCPN's GRIB plugin and confirm it appears as `Current`.
 8. Select `Local NetCDF file`, choose a Copernicus current NetCDF file, and generate a GRIB.
 9. Load the generated NetCDF-derived GRIB and confirm current arrows and speed/direction values display.
-10. Merge the current GRIB with a weather GRIB using the GRIB plugin's merge workflow if available.
-11. Run Weather Routing and check that current effects appear where current and weather time ranges overlap.
+10. Select `Copernicus Marine North-West Shelf high-resolution currents` and generate a tiny live test.
+11. Select `Copernicus Marine Global currents` and generate a tiny live test outside NWS coverage.
+12. Load the generated Copernicus GRIBs and confirm current arrows and speed/direction values display.
+13. Merge the current GRIB with a weather GRIB using the GRIB plugin's merge workflow if available.
+14. Run Weather Routing and check that current effects appear where current and weather time ranges overlap.
 
 ## Current v1 Limits
 
-- Copernicus live download in the plugin is stubbed. Use `tidal-current-grib download-copernicus` from a trusted shell, then select `Local NetCDF file`.
-- Generation runs synchronously in the UI thread. This is acceptable for quick synthetic/local tests, but larger downloads and conversions need a background worker before serious use.
+- Copernicus generation is delegated to the Python helper process; cancellation sends SIGTERM to the child process tree on Linux.
+- Automatic opening of generated GRIBs is best-effort through the GRIB plugin message API. If the GRIB plugin does not accept the request, open the generated file manually.
 - Passwords are not stored, not passed on command lines, and not logged by the plugin scaffold.
 - The plugin does not modify OpenCPN core and does not bundle Copernicus, Admiralty, UKHO, TotalTide, or other proprietary current data.

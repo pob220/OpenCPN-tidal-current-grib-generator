@@ -19,6 +19,11 @@ class Provider:
     implemented: bool
     resolution: str
     description: str
+    product_id: str | None = None
+    default_step_hours: int = 1
+    minimum_depth: float | None = None
+    maximum_depth: float | None = None
+    source_grid_regularity_tolerance: float = 1e-5
 
     def supports_bbox(self, bbox: BoundingBox) -> bool:
         if self.coverage is None:
@@ -45,17 +50,26 @@ COPERNICUS_NWS = Provider(
     implemented=True,
     resolution="approx 1.5 km",
     description="Modelled North-West European shelf currents including tides/residuals.",
+    product_id="NWSHELF_ANALYSISFORECAST_PHY_004_013",
 )
 
 COPERNICUS_GLOBAL = Provider(
     id="copernicus_global",
     label="Copernicus Marine Global currents",
     coverage=BoundingBox(-180.0, -80.0, 180.0, 90.0),
-    dataset_id=None,
+    dataset_id="cmems_mod_glo_phy_anfc_0.083deg_PT1H-m",
     variables=("uo", "vo"),
-    implemented=False,
-    resolution="global model resolution depends on selected product",
-    description="Global Copernicus fallback is a provider stub until an exact dataset is selected and tested.",
+    implemented=True,
+    resolution="about 0.083 degrees / 1/12 degree",
+    description=(
+        "Global Copernicus Ocean Physics Analysis and Forecast surface currents. "
+        "Lower resolution than NWS and not a high-resolution tidal-stream model."
+    ),
+    product_id="GLOBAL_ANALYSISFORECAST_PHY_001_024",
+    default_step_hours=1,
+    minimum_depth=0.0,
+    maximum_depth=0.5,
+    source_grid_regularity_tolerance=5e-5,
 )
 
 LOCAL_NETCDF = Provider(
@@ -110,3 +124,24 @@ def select_best_provider_for_bbox(
     if global_provider.implemented and global_provider.supports_bbox(bbox):
         return global_provider
     return None
+
+
+def select_copernicus_provider(
+    provider_id: str,
+    bbox: BoundingBox,
+    registry: ProviderRegistry | None = None,
+) -> Provider:
+    registry = registry or ProviderRegistry()
+    if provider_id == "auto":
+        provider = select_best_provider_for_bbox(bbox, registry=registry)
+        if provider is None or not provider.id.startswith("copernicus_"):
+            raise ValueError("no implemented Copernicus provider supports the requested bbox")
+        return provider
+    provider = registry.get(provider_id)
+    if not provider.id.startswith("copernicus_"):
+        raise ValueError(f"{provider_id} is not a Copernicus provider")
+    if not provider.implemented:
+        raise ValueError(f"{provider.label} is not implemented")
+    if not provider.supports_bbox(bbox):
+        raise ValueError(f"{provider.label} does not support the requested bbox")
+    return provider

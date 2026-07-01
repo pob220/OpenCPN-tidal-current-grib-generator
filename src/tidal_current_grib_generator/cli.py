@@ -26,7 +26,12 @@ from tidal_current_grib_generator.reference import compare_reference_csv
 from tidal_current_grib_generator.sources import create_source
 from tidal_current_grib_generator.sources.netcdf import NetCDFCurrentSource, inspect_netcdf, netcdf_time_metadata
 from tidal_current_grib_generator.sources.pytmd import inspect_pytmd_source
-from tidal_current_grib_generator.providers import ProviderRegistry, select_best_provider_for_bbox
+from tidal_current_grib_generator.providers import (
+    Provider,
+    ProviderRegistry,
+    select_best_provider_for_bbox,
+    select_copernicus_provider,
+)
 from tidal_current_grib_generator.api import GenerateCurrentGribRequest, generate_current_grib_from_netcdf
 from tidal_current_grib_generator.security import redact_text
 
@@ -141,6 +146,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     download = subparsers.add_parser("download-copernicus", help="Download a Copernicus Marine current subset.")
     download.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"))
+    download.add_argument(
+        "--provider",
+        choices=["auto", "copernicus_nws", "copernicus_global"],
+        default="auto",
+        help="Copernicus provider to use; auto prefers NWS inside its coverage and Global elsewhere.",
+    )
     download.add_argument("--start", required=True)
     end_group = download.add_mutually_exclusive_group(required=True)
     end_group.add_argument("--end")
@@ -162,12 +173,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Download a Copernicus Marine current subset and convert it to GRIB.",
     )
     generate_copernicus.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"))
+    generate_copernicus.add_argument(
+        "--provider",
+        choices=["auto", "copernicus_nws", "copernicus_global"],
+        default="auto",
+        help="Copernicus provider to use; auto prefers NWS inside its coverage and Global elsewhere.",
+    )
     generate_copernicus.add_argument("--start", required=True)
     generate_copernicus_end = generate_copernicus.add_mutually_exclusive_group(required=True)
     generate_copernicus_end.add_argument("--end")
     generate_copernicus_end.add_argument("--hours", type=int)
-    generate_copernicus.add_argument("--step-hours", type=int, default=1)
+    generate_copernicus.add_argument("--step-hours", type=int)
     generate_copernicus.add_argument("--grid-spacing-deg", type=float, default=0.03)
+    generate_copernicus.add_argument(
+        "--source-grid-regularity-tolerance",
+        type=float,
+        help="Tolerance for nearly regular native NetCDF coordinate spacing; defaults from provider metadata.",
+    )
     generate_copernicus.add_argument("--download-directory", type=Path, required=True)
     generate_copernicus.add_argument("--download-filename")
     generate_copernicus.add_argument("--output", type=Path, required=True)
@@ -388,6 +410,13 @@ def cmd_providers(args: argparse.Namespace) -> int:
     return 0
 
 
+def _select_copernicus_provider(provider_id: str, bbox: BoundingBox) -> Provider:
+    try:
+        return select_copernicus_provider(provider_id, bbox, registry=ProviderRegistry())
+    except (KeyError, ValueError) as exc:
+        raise ValidationError(str(exc)) from exc
+
+
 def cmd_download_copernicus(args: argparse.Namespace) -> int:
     start = parse_utc_datetime(args.start)
     if args.hours is not None:
@@ -402,14 +431,20 @@ def cmd_download_copernicus(args: argparse.Namespace) -> int:
     password = os.environ.get(args.password_env)
     if not password:
         password = getpass.getpass("Copernicus password: ")
+    bbox = BoundingBox.from_values(args.bbox)
+    provider = _select_copernicus_provider(args.provider, bbox)
     request = CopernicusDownloadRequest(
-        bbox=BoundingBox.from_values(args.bbox),
+        bbox=bbox,
         start=start,
         end=end,
         output_directory=args.output_directory,
         output_filename=args.output_filename,
         username=username,
         password=password,
+        dataset_id=provider.dataset_id or "",
+        variables=provider.variables,
+        minimum_depth=provider.minimum_depth,
+        maximum_depth=provider.maximum_depth,
         overwrite=args.overwrite,
         dry_run=args.dry_run,
     )
@@ -439,8 +474,18 @@ def cmd_generate_copernicus(args: argparse.Namespace) -> int:
         if seconds % 3600:
             raise ValidationError("--end must fall on an exact hour relative to --start")
         hours = seconds // 3600
-    if args.step_hours <= 0:
+    bbox = BoundingBox.from_values(args.bbox)
+    provider = _select_copernicus_provider(args.provider, bbox)
+    step_hours = args.step_hours or provider.default_step_hours
+    source_grid_regularity_tolerance = (
+        args.source_grid_regularity_tolerance
+        if args.source_grid_regularity_tolerance is not None
+        else provider.source_grid_regularity_tolerance
+    )
+    if step_hours <= 0:
         raise ValidationError("--step-hours must be greater than zero")
+    if source_grid_regularity_tolerance <= 0:
+        raise ValidationError("--source-grid-regularity-tolerance must be greater than zero")
 
     username = args.username or os.environ.get(args.username_env)
     if not username:
@@ -449,9 +494,8 @@ def cmd_generate_copernicus(args: argparse.Namespace) -> int:
     if not password:
         password = getpass.getpass("Copernicus password: ")
 
-    bbox = BoundingBox.from_values(args.bbox)
     download_filename = args.download_filename or (
-        f"copernicus_nws_currents_{start:%Y%m%dT%H%MZ}_{hours}h.nc"
+        f"{provider.id}_currents_{start:%Y%m%dT%H%MZ}_{hours}h.nc"
     )
     download_request = CopernicusDownloadRequest(
         bbox=bbox,
@@ -461,6 +505,10 @@ def cmd_generate_copernicus(args: argparse.Namespace) -> int:
         output_filename=download_filename,
         username=username,
         password=password,
+        dataset_id=provider.dataset_id or "",
+        variables=provider.variables,
+        minimum_depth=provider.minimum_depth,
+        maximum_depth=provider.maximum_depth,
         overwrite=args.overwrite,
         dry_run=args.dry_run,
     )
@@ -470,9 +518,12 @@ def cmd_generate_copernicus(args: argparse.Namespace) -> int:
         print("checking inputs", flush=True)
         print(
             f"requested time range: start={start.isoformat()} end={requested_end.isoformat()} "
-            f"hours={requested_hours} step_hours={args.step_hours}",
+            f"hours={requested_hours} step_hours={step_hours}",
             flush=True,
         )
+        print(f"selected provider: {provider.id} ({provider.label})", flush=True)
+        print(f"dataset: {provider.dataset_id}", flush=True)
+        print(f"source grid regularity tolerance: {source_grid_regularity_tolerance}", flush=True)
         print("downloading Copernicus NetCDF", flush=True)
     download_result = download_copernicus_subset(
         download_request,
@@ -486,7 +537,7 @@ def cmd_generate_copernicus(args: argparse.Namespace) -> int:
     if args.metadata_summary:
         print(f"downloaded NetCDF path: {download_result.path}", flush=True)
         print("inspecting NetCDF", flush=True)
-    time_plan = _generation_time_plan_from_netcdf(download_result.path, start, requested_end, args.step_hours)
+    time_plan = _generation_time_plan_from_netcdf(download_result.path, start, requested_end, step_hours)
     generation_start = time_plan["start"]
     generation_end = time_plan["end"]
     generation_hours = time_plan["hours"]
@@ -517,13 +568,14 @@ def cmd_generate_copernicus(args: argparse.Namespace) -> int:
             bbox=bbox,
             start=generation_start,
             hours=generation_hours,
-            step_hours=args.step_hours,
+            step_hours=step_hours,
             output=args.output,
             source="netcdf",
             input_netcdf=download_result.path,
             grid_spacing_deg=args.grid_spacing_deg,
             clip_bbox_to_source=True,
             use_source_grid=True,
+            source_grid_regularity_tolerance=source_grid_regularity_tolerance,
         ),
         progress_callback=_generate_copernicus_progress_callback(args.verbose),
     )

@@ -37,6 +37,17 @@ wxString DefaultStartUtc() {
   return now.FormatISOCombined('T') + "Z";
 }
 
+bool IsCopernicusProvider(const wxString& provider) {
+  return provider == "Auto" || provider.Contains("Copernicus Marine North-West Shelf") ||
+         provider.Contains("Copernicus Marine Global");
+}
+
+wxString CopernicusProviderId(const wxString& provider) {
+  if (provider.Contains("Copernicus Marine North-West Shelf")) return "copernicus_nws";
+  if (provider.Contains("Copernicus Marine Global")) return "copernicus_global";
+  return "auto";
+}
+
 wxString JsonEscape(const wxString& value) {
   wxString escaped;
   for (wxUniChar ch : value) {
@@ -102,7 +113,8 @@ CurrentGribDialog::CurrentGribDialog(wxWindow* parent)
   m_east = new wxTextCtrl(scrolled, wxID_ANY, "-2.5");
   m_north = new wxTextCtrl(scrolled, wxID_ANY, "56.5");
   wxString presets[] = {"Custom bbox", "Current chart area",
-                        "Irish Sea / North Channel example", "Tiny Copernicus connection test"};
+                        "Irish Sea / North Channel example", "Tiny Copernicus connection test",
+                        "Global Copernicus tiny connection test"};
   m_presetChoice = new wxChoice(scrolled, wxID_ANY, wxDefaultPosition, wxDefaultSize, WXSIZEOF(presets), presets);
   m_presetChoice->SetSelection(0);
   m_startUtc = new wxTextCtrl(scrolled, wxID_ANY, DefaultStartUtc());
@@ -114,7 +126,7 @@ CurrentGribDialog::CurrentGribDialog(wxWindow* parent)
   m_stepHours->SetValue(1);
 
   wxString providers[] = {"Auto", "Copernicus Marine North-West Shelf high-resolution currents",
-                          "Local NetCDF file", "Synthetic test source"};
+                          "Copernicus Marine Global currents", "Local NetCDF file", "Synthetic test source"};
   m_provider = new wxChoice(scrolled, wxID_ANY, wxDefaultPosition, wxDefaultSize, WXSIZEOF(providers), providers);
   m_provider->SetSelection(1);
   m_username = new wxTextCtrl(scrolled, wxID_ANY);
@@ -223,15 +235,13 @@ void CurrentGribDialog::OnGenerate(wxCommandEvent&) {
     wxMessageBox(message, "Missing NetCDF file", wxOK | wxICON_WARNING, this);
     return;
   }
-  if ((provider.Contains("Copernicus Marine North-West Shelf") || provider == "Auto") &&
-      (m_username->GetValue().empty() || m_password->GetValue().empty())) {
+  if (IsCopernicusProvider(provider) && (m_username->GetValue().empty() || m_password->GetValue().empty())) {
     wxString message = "Enter your Copernicus Marine username and password for this operation. The password is held in memory only and is not passed on the command line.";
     AppendLog(message);
     wxMessageBox(message, "Missing Copernicus credentials", wxOK | wxICON_WARNING, this);
     return;
   }
-  if ((provider.Contains("Copernicus Marine North-West Shelf") || provider == "Auto") &&
-      !ConfirmLargeCopernicusRequest()) {
+  if (IsCopernicusProvider(provider) && !ConfirmLargeCopernicusRequest()) {
     AppendLog("Generation cancelled before launch.");
     return;
   }
@@ -240,7 +250,7 @@ void CurrentGribDialog::OnGenerate(wxCommandEvent&) {
   if (!output.DirExists()) {
     output.Mkdir(wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL);
   }
-  if (provider.Contains("Copernicus Marine North-West Shelf") || provider == "Auto") {
+  if (IsCopernicusProvider(provider)) {
     wxFileName downloadDir;
     downloadDir.AssignDir(m_outputDir->GetPath());
     downloadDir.AppendDir("currentgrib_downloads");
@@ -319,6 +329,19 @@ void CurrentGribDialog::ApplyPreset(int selection) {
     m_provider->SetSelection(1);
     m_outputFile->SetValue("plugin_copernicus_live_tiny_test.grb");
     AppendLog("Applied Tiny Copernicus connection test preset.");
+    return;
+  }
+  if (selection == 4) {
+    m_west->SetValue("-40.5");
+    m_south->SetValue("30.0");
+    m_east->SetValue("-40.0");
+    m_north->SetValue("30.5");
+    m_startUtc->SetValue("2026-07-01T00:00:00Z");
+    m_durationHours->SetValue(6);
+    m_stepHours->SetValue(1);
+    m_provider->SetSelection(2);
+    m_outputFile->SetValue("plugin_copernicus_global_tiny_test.grb");
+    AppendLog("Applied Global Copernicus tiny connection test preset.");
   }
 }
 
@@ -540,13 +563,14 @@ void CurrentGribDialog::TryOpenGeneratedGrib() {
 
 wxString CurrentGribDialog::BuildGenerateCommand() const {
   wxString provider = m_provider->GetStringSelection();
-  if (provider.Contains("Copernicus Marine North-West Shelf") || provider == "Auto") {
+  if (IsCopernicusProvider(provider)) {
     wxFileName downloadDir;
     downloadDir.AssignDir(m_outputDir->GetPath());
     downloadDir.AppendDir("currentgrib_downloads");
     return ShellQuote(m_generatorPath->GetValue()) + " generate-copernicus --bbox " +
            ShellQuote(m_west->GetValue()) + " " + ShellQuote(m_south->GetValue()) + " " +
            ShellQuote(m_east->GetValue()) + " " + ShellQuote(m_north->GetValue()) +
+           " --provider " + CopernicusProviderId(provider) +
            " --start " + ShellQuote(m_startUtc->GetValue()) +
            " --hours " + wxString::Format("%d", m_durationHours->GetValue()) +
            " --step-hours " + wxString::Format("%d", m_stepHours->GetValue()) +

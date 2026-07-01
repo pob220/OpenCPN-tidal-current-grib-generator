@@ -40,7 +40,7 @@ Users enter their Copernicus Marine username/password at runtime. v1 must not st
 
 1. Open the plugin dialog.
 2. Enter bbox manually or use chart-view bounds when implemented.
-3. Select Copernicus Marine North-West Shelf.
+3. Select Auto, Copernicus Marine North-West Shelf, Copernicus Marine Global, Local NetCDF, or Synthetic.
 4. Enter Copernicus credentials.
 5. Choose output directory and filename.
 6. Run generation.

@@ -1,6 +1,6 @@
 # currentgrib_pi
 
-Prototype OpenCPN plugin front-end for `tidal-current-grib-generator`.
+OpenCPN plugin front-end for `tidal-current-grib-generator`.
 
 This plugin is intentionally a thin GUI wrapper around the Python generator engine. It does not reimplement NetCDF or GRIB writing logic.
 
@@ -8,13 +8,15 @@ The initial asset `data/currentgrib.png` is a project-generated icon asset for t
 
 ## Status
 
-This is a v1 scaffold:
+This is a v1 plugin scaffold:
 
 - toolbar plugin class and dialog source are present
 - manual bbox/time/source/output controls are present
 - dependency check command is wired
-- synthetic/local NetCDF generation command construction is present
+- synthetic/local NetCDF generation is wired through the Python CLI
+- Copernicus NWS and Global live generation are wired through the Python CLI
+- subprocess execution is asynchronous using wx process events
 - Copernicus password must be entered at runtime and is not stored
-- Copernicus download/generate orchestration is documented but not yet fully wired into a background worker
+- Copernicus password is passed only to the helper process environment, not on argv
 
-Use the Python CLI directly for production current generation until the plugin build is integrated with an OpenCPN plugin template.
+The plugin remains a thin wrapper around the Python generator. It does not reimplement NetCDF download, conversion, or GRIB writing.

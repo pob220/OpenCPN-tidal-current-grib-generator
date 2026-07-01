@@ -43,6 +43,12 @@ Local NetCDF current-file support is optional:
 python -m pip install -e '.[netcdf]'
 ```
 
+Live Copernicus Marine downloads are optional:
+
+```bash
+python -m pip install -e '.[copernicus,netcdf,grib]'
+```
+
 For both GRIB writing and TPXO prediction:
 
 ```bash
@@ -84,6 +90,14 @@ Built-in sources:
 - `constant`: simple constant eastward current for tests.
 - `tpxo` / `pytmd`: pyTMD-backed astronomical tidal-current prediction from local user-supplied model files.
 - `netcdf`: local NetCDF current files, including Copernicus Marine files with u/v current components.
+
+Copernicus live-download providers:
+
+- `copernicus_nws`: North-West Shelf high-resolution currents for the UK/Ireland/North Sea/English Channel/Celtic Sea area, using `NWSHELF_ANALYSISFORECAST_PHY_004_013` / `cmems_mod_nws_phy-cur_anfc_1.5km-2D_PT1H-i`.
+- `copernicus_global`: lower-resolution rest-of-world currents, using `GLOBAL_ANALYSISFORECAST_PHY_001_024` / `cmems_mod_glo_phy_anfc_0.083deg_PT1H-m`.
+- `auto`: selects NWS when the bbox is inside NWS coverage, otherwise Global.
+
+Register for a Copernicus Marine account at <https://data.marine.copernicus.eu/register>. Users are responsible for complying with Copernicus Marine terms.
 
 Do not scrape, embed, redistribute, or derive open output from proprietary Admiralty, UKHO, or TotalTide atlas data. Users may use their own legally obtained reference data for private validation.
 
@@ -151,6 +165,45 @@ tidal-current-grib generate ... --json-summary --dry-run
 ```
 
 `--coverage-tolerance-deg` allows small differences between requested bbox edges and source coordinate centres. `--clip-bbox-to-source` clips the output bbox to source coordinates. `--use-source-grid` writes on the native NetCDF coordinate centres to avoid unnecessary interpolation. `--source-grid-regularity-tolerance` controls how much float precision noise is allowed before native-grid mode falls back to an error.
+
+## Generate directly from Copernicus Marine
+
+The command prompts for credentials unless supplied by environment variables. Do not put passwords on the command line.
+
+North-West Shelf:
+
+```bash
+tidal-current-grib generate-copernicus \
+  --provider copernicus_nws \
+  --bbox -8.5 50.5 -2.5 56.5 \
+  --start 2026-07-01T00:00:00Z \
+  --hours 72 \
+  --step-hours 1 \
+  --download-directory ~/.opencpn/grib/generated/currentgrib_downloads \
+  --output ~/.opencpn/grib/generated/irish_sea_copernicus_current.grb \
+  --metadata-summary
+```
+
+Global fallback example:
+
+```bash
+tidal-current-grib generate-copernicus \
+  --provider copernicus_global \
+  --bbox -40.5 30.0 -40.0 30.5 \
+  --start 2026-07-01T00:00:00Z \
+  --hours 6 \
+  --step-hours 1 \
+  --download-directory ~/.opencpn/grib/generated/currentgrib_downloads \
+  --output ~/.opencpn/grib/generated/global_copernicus_current.grb \
+  --metadata-summary
+```
+
+OpenCPN workflow:
+
+1. Generate a current GRIB using the CLI or `currentgrib_pi`.
+2. Download a weather/wind GRIB in OpenCPN.
+3. Use the upgraded GRIB plugin's `Merge GRIBs...` utility to merge current and weather files.
+4. Run Weather Routing with currents enabled and overlapping current/weather time ranges.
 
 ## Reference comparison
 

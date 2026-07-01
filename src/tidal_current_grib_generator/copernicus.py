@@ -27,6 +27,8 @@ class CopernicusDownloadRequest:
     password: str
     dataset_id: str = COPERNICUS_NWS.dataset_id or ""
     variables: tuple[str, ...] = COPERNICUS_NWS.variables
+    minimum_depth: float | None = None
+    maximum_depth: float | None = None
     overwrite: bool = False
     dry_run: bool = False
 
@@ -55,6 +57,8 @@ class CopernicusDownloadRequest:
                 "password": self.password,
                 "dataset_id": self.dataset_id,
                 "variables": list(self.variables),
+                "minimum_depth": self.minimum_depth,
+                "maximum_depth": self.maximum_depth,
                 "overwrite": self.overwrite,
                 "dry_run": self.dry_run,
             }
@@ -112,6 +116,8 @@ def download_copernicus_subset(
         maximum_latitude=request.bbox.north,
         start_datetime=request.start,
         end_datetime=request.end,
+        minimum_depth=request.minimum_depth,
+        maximum_depth=request.maximum_depth,
         output_directory=output_dir,
         output_filename=request.output_filename,
         overwrite=request.overwrite,
