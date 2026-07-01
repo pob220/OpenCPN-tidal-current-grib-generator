@@ -79,6 +79,7 @@ class PyTMDTPXOSource(CurrentSource):
     interpolation_method: str = "linear"
     extrapolate: bool = False
     extrapolation_cutoff_km: float = 10.0
+    crop_buffer_degrees: float = 1.0
     infer_minor: bool = True
 
     def __post_init__(self) -> None:
@@ -104,42 +105,66 @@ class PyTMDTPXOSource(CurrentSource):
         _import_pytmd_compute()
 
     def get_current_grid(self, bbox: BoundingBox, time: datetime, grid: RegularGrid) -> CurrentGrid:
+        return next(iter(self.get_current_grids(bbox, [time], grid)))
+
+    def get_current_grids(self, bbox: BoundingBox, times: list[datetime], grid: RegularGrid) -> list[CurrentGrid]:
         self.validate_available()
+        if not times:
+            return []
         compute = _import_pytmd_compute()
 
         # pyTMD expects x=longitude, y=latitude in EPSG:4326 for crs=4326.
-        # With type="grid", tide_currents returns grid-shaped u/v velocity
-        # components in cm/s, not transports.
-        valid_time = np.array([time.astimezone(timezone.utc).replace(tzinfo=None)], dtype="datetime64[ns]")
+        # Use flattened point/drift mode instead of pyTMD grid mode. This
+        # avoids pyTMD 3.x trying to create 2-D coordinate DataArrays from 1-D
+        # project grid vectors, and keeps the return shape easy to validate.
+        lon2d, lat2d = np.meshgrid(grid.longitudes, grid.latitudes)
+        lon_points = lon2d.ravel()
+        lat_points = lat2d.ravel()
+        nt = len(times)
+        npoints = lon_points.size
+        valid_datetimes = [
+            np.datetime64(t.astimezone(timezone.utc).replace(tzinfo=None), "ns")
+            for t in times
+        ]
+        x = np.tile(lon_points, nt)
+        y = np.tile(lat_points, nt)
+        valid_time = np.repeat(np.asarray(valid_datetimes, dtype="datetime64[ns]"), npoints)
         result = compute.tide_currents(
-            grid.longitudes,
-            grid.latitudes,
+            x,
+            y,
             valid_time,
             directory=self.model_directory,
             model=None if self.definition_file else self.model_name,
             definition_file=self.definition_file,
             crs=4326,
             standard="datetime",
-            type="grid",
+            type="drift",
             method=self.interpolation_method,
             extrapolate=self.extrapolate,
             cutoff=self.extrapolation_cutoff_km,
             infer_minor=self.infer_minor,
+            chunks="auto",
             crop=True,
+            buffer=self.crop_buffer_degrees,
             bounds=[bbox.west, bbox.east, bbox.south, bbox.north],
         )
-        u_cm_s = _component_values(result, "u", grid.shape)
-        v_cm_s = _component_values(result, "v", grid.shape)
-        u_mps = u_cm_s / 100.0
-        v_mps = v_cm_s / 100.0
-        mask = np.isnan(u_mps) | np.isnan(v_mps)
-        return CurrentGrid(
-            time=time.astimezone(timezone.utc),
-            grid=grid,
-            u_mps=np.where(mask, 0.0, u_mps),
-            v_mps=np.where(mask, 0.0, v_mps),
-            mask=mask if mask.any() else None,
-        )
+        u_cm_s = _component_time_values(result, "u", (nt, grid.ny, grid.nx))
+        v_cm_s = _component_time_values(result, "v", (nt, grid.ny, grid.nx))
+        grids: list[CurrentGrid] = []
+        for index, time in enumerate(times):
+            u_mps = u_cm_s[index] / 100.0
+            v_mps = v_cm_s[index] / 100.0
+            mask = np.isnan(u_mps) | np.isnan(v_mps)
+            grids.append(
+                CurrentGrid(
+                    time=time.astimezone(timezone.utc),
+                    grid=grid,
+                    u_mps=np.where(mask, 0.0, u_mps),
+                    v_mps=np.where(mask, 0.0, v_mps),
+                    mask=mask if mask.any() else None,
+                )
+            )
+        return grids
 
     def inspect(self) -> dict[str, Any]:
         return inspect_pytmd_source(
@@ -186,6 +211,7 @@ def inspect_pytmd_source(
 
     constituents_u: list[str] = []
     constituents_v: list[str] = []
+    constituent_parse_errors: dict[str, str] = {}
     current_available = False
     try:
         import pyTMD.io
@@ -201,13 +227,29 @@ def inspect_pytmd_source(
             try:
                 target.extend(str(c) for c in model.parse_constituents(group=group))
             except Exception as exc:  # pragma: no cover - depends on local model layout
-                details.append(f"could not parse {group} constituents: {exc}")
+                constituent_parse_errors[group] = str(exc)
         details.append(f"model format: {getattr(model, 'format', 'unknown')}")
         projection = getattr(model, "projection", None)
         if projection:
             details.append(f"projection: {projection}")
     except Exception as exc:  # pragma: no cover - depends on pyTMD/model version
         details.append(f"pyTMD model inspection failed: {exc}")
+
+    if model_directory is not None:
+        if not constituents_u:
+            constituents_u = _scan_constituents_from_filenames(model_directory, "u")
+            if constituents_u:
+                details.append("u constituents discovered from filenames")
+            elif "u" in constituent_parse_errors:
+                details.append(f"could not parse u constituents: {constituent_parse_errors['u']}")
+        if not constituents_v:
+            constituents_v = _scan_constituents_from_filenames(model_directory, "v")
+            if not constituents_v:
+                constituents_v = _scan_constituents_from_filenames(model_directory, "h")
+            if constituents_v:
+                details.append("v constituents discovered from filenames")
+            elif "v" in constituent_parse_errors:
+                details.append(f"could not parse v constituents: {constituent_parse_errors['v']}")
 
     return SourceInspection(
         name="tpxo",
@@ -225,20 +267,59 @@ def inspect_pytmd_source(
 
 
 def _component_values(result: Any, component: str, expected_shape: tuple[int, int]) -> np.ndarray:
-    obj = result[component] if hasattr(result, "__getitem__") else getattr(result, component)
+    return _component_array(result, component, expected_shape)
+
+
+def _component_time_values(result: Any, component: str, expected_shape: tuple[int, int, int]) -> np.ndarray:
+    return _component_array(result, component, expected_shape)
+
+
+def _component_array(result: Any, component: str, expected_shape: tuple[int, ...]) -> np.ndarray:
+    obj = _component_object(result, component)
     values = _values_from_xarray_like(obj, component)
     values = np.ma.filled(np.ma.asarray(values, dtype=np.float64), np.nan)
     values = np.squeeze(values)
     if values.shape == expected_shape:
         return values
-    if values.shape == (expected_shape[1], expected_shape[0]):
+    if len(expected_shape) == 2 and values.shape == (expected_shape[1], expected_shape[0]):
+        # Some xarray/pyTMD paths expose dimensions as x,y. The project grid is
+        # always y,x == latitude,longitude, so transpose this one clear case.
         return values.T
+    if len(expected_shape) == 3 and values.shape == (expected_shape[0], expected_shape[1] * expected_shape[2]):
+        return values.reshape(expected_shape)
+    if len(expected_shape) == 3 and values.shape == (expected_shape[1] * expected_shape[2], expected_shape[0]):
+        return values.T.reshape(expected_shape)
+    expected_size = int(np.prod(expected_shape))
+    if values.ndim == 1 and values.size == expected_size:
+        # Point/drift mode returns values in the raveled meshgrid order
+        # produced by numpy.meshgrid(lon, lat), which reshapes to y,x.
+        return values.reshape(expected_shape)
     raise ValidationError(
-        f"pyTMD returned {component!r} with shape {values.shape}, expected {expected_shape}"
+        f"pyTMD returned {component!r} with shape {values.shape}, expected {expected_shape}; "
+        "cannot safely reshape tidal-current output"
     )
 
 
+def _component_object(result: Any, component: str) -> Any:
+    if isinstance(result, dict) and component in result:
+        return result[component]
+    if isinstance(result, (tuple, list)):
+        index = 0 if component == "u" else 1
+        if len(result) > index:
+            return result[index]
+    if hasattr(result, "__getitem__"):
+        try:
+            return result[component]
+        except Exception:
+            pass
+    if hasattr(result, component):
+        return getattr(result, component)
+    raise ValidationError(f"could not extract {component!r} component from pyTMD result")
+
+
 def _values_from_xarray_like(obj: Any, component: str) -> Any:
+    if isinstance(obj, (np.ndarray, np.ma.MaskedArray)):
+        return obj
     if hasattr(obj, "values"):
         return obj.values
     if hasattr(obj, "to_dataset"):
@@ -256,6 +337,18 @@ def _values_from_xarray_like(obj: Any, component: str) -> Any:
         if data_vars:
             return dataset[data_vars[0]].values
     raise ValidationError(f"could not extract {component!r} values from pyTMD result")
+
+
+def _scan_constituents_from_filenames(model_directory: Path, prefix: str) -> list[str]:
+    constituents: set[str] = set()
+    for path in model_directory.rglob(f"{prefix}_*.nc"):
+        stem = path.stem.lower()
+        if stem.startswith("grid_"):
+            continue
+        parts = stem.split("_")
+        if len(parts) >= 2 and parts[1]:
+            constituents.add(parts[1])
+    return sorted(constituents)
 
 
 PyTMDSource = PyTMDTPXOSource

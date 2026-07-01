@@ -8,6 +8,8 @@ import json
 import logging
 import getpass
 import os
+import tempfile
+import time as monotonic_time
 import sys
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -284,20 +286,62 @@ def cmd_generate(args: argparse.Namespace) -> int:
     if args.dry_run:
         return 0
 
-    grids = (source.get_current_grid(plan.bbox, time, plan.grid) for time in times)
+    grids = _current_grids_for_generation(source, plan.bbox, times, plan.grid, args.verbose)
     writer = EccodesGrib1CurrentWriter()
-    summary = writer.write(grids, output, progress_callback=_progress_callback(args.verbose))
-    scan = scan_grib_messages(summary.output)
+    tmp_path: Path | None = None
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(prefix=output.name + ".", suffix=".tmp", dir=output.parent, delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        summary = writer.write(grids, tmp_path, progress_callback=_progress_callback(args.verbose))
+        if summary.message_count != plan.message_count:
+            raise ValidationError(
+                f"wrote {summary.message_count} messages, expected {plan.message_count}; "
+                "discarding incomplete GRIB output"
+            )
+        scan = scan_grib_messages(summary.output)
+        if scan.message_count != plan.message_count:
+            raise ValidationError(
+                f"validated {scan.message_count} messages, expected {plan.message_count}; "
+                "discarding incomplete GRIB output"
+            )
+        os.replace(tmp_path, output)
+        tmp_path = None
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink()
     if args.json_summary:
-        result = _summary_json(plan, source, summary.output, dry_run=False)
+        result = _summary_json(plan, source, output, dry_run=False)
         result["written_messages"] = summary.message_count
         result["validated_messages"] = scan.message_count
         result["bytes"] = scan.byte_count
         print(json.dumps(result, indent=2, sort_keys=True))
     else:
-        print(f"wrote {summary.message_count} GRIB messages to {summary.output}")
+        print(f"wrote {summary.message_count} GRIB messages to {output}")
         print(f"validated GRIB stream: {scan.message_count} messages, {scan.byte_count} bytes")
     return 0
+
+
+def _current_grids_for_generation(source: Any, bbox: BoundingBox, times: list[Any], grid: Any, verbose: bool):
+    batch_method = getattr(source, "get_current_grids", None)
+    if callable(batch_method):
+        started = monotonic_time.perf_counter()
+        grids = batch_method(bbox, times, grid)
+        elapsed = monotonic_time.perf_counter() - started
+        if verbose:
+            print(f"computed {len(grids)} current grids in {elapsed:.2f}s", flush=True)
+        for index, current in enumerate(grids, start=1):
+            if verbose:
+                print(f"prepared timestep {index}/{len(times)}: {current.time.isoformat()}", flush=True)
+            yield current
+        return
+    for index, valid_time in enumerate(times, start=1):
+        started = monotonic_time.perf_counter()
+        current = source.get_current_grid(bbox, valid_time, grid)
+        elapsed = monotonic_time.perf_counter() - started
+        if verbose:
+            print(f"computed timestep {index}/{len(times)} {valid_time.isoformat()} in {elapsed:.2f}s", flush=True)
+        yield current
 
 
 def cmd_compare_reference(args: argparse.Namespace) -> int:
