@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tidal-current-grib-generator"
+version = "0.1.0"
+description = "Generate OpenCPN-compatible tidal/ocean-current GRIB files from model sources."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "tidal-current-grib-generator contributors" }]
+dependencies = [
+  "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+grib = ["eccodes>=1.6"]
+pytmd = ["pyTMD>=2.2"]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+tidal-current-grib = "tidal_current_grib_generator.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
