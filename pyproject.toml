@@ -16,8 +16,18 @@ dependencies = [
 
 [project.optional-dependencies]
 grib = ["eccodes>=1.6"]
-pytmd = ["pyTMD>=2.2"]
+tpxo = [
+  "pyTMD>=3.0",
+  "xarray>=2024.7",
+  "timescale>=0.0.6",
+]
 dev = ["pytest>=7.4"]
+all = [
+  "eccodes>=1.6",
+  "pyTMD>=3.0",
+  "xarray>=2024.7",
+  "timescale>=0.0.6",
+]
 
 [project.scripts]
 tidal-current-grib = "tidal_current_grib_generator.cli:main"

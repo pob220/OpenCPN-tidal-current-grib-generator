@@ -5,6 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from tidal_current_grib_generator.geo import BoundingBox, RegularGrid
 from tidal_current_grib_generator.model import CurrentGrid
@@ -29,6 +30,14 @@ class CurrentSource(ABC):
 
     def supports_time_range(self, start: datetime, end: datetime) -> bool:
         return bool(start <= end)
+
+    def inspect(self) -> dict[str, Any]:
+        description = self.describe()
+        return {
+            "name": description.name,
+            "summary": description.summary,
+            "data_notice": description.data_notice,
+        }
 
     @abstractmethod
     def get_current_grid(self, bbox: BoundingBox, time: datetime, grid: RegularGrid) -> CurrentGrid:

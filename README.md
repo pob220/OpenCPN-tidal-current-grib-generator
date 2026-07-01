@@ -31,6 +31,18 @@ python -m pip install -e '.[grib]'
 
 The Python package alone is not always enough; many systems also need the native ecCodes library installed through the OS package manager.
 
+TPXO/pyTMD support is optional:
+
+```bash
+python -m pip install -e '.[tpxo]'
+```
+
+For both GRIB writing and TPXO prediction:
+
+```bash
+python -m pip install -e '.[all,dev]'
+```
+
 ## Generate a synthetic current GRIB
 
 ```bash
@@ -64,9 +76,42 @@ Built-in sources:
 
 - `synthetic`: deterministic rotary tide-like test field.
 - `constant`: simple constant eastward current for tests.
-- `pytmd`: documented skeleton for future TPXO/pyTMD integration.
+- `tpxo` / `pytmd`: pyTMD-backed astronomical tidal-current prediction from local user-supplied model files.
 
 Do not scrape, embed, redistribute, or derive open output from proprietary Admiralty, UKHO, or TotalTide atlas data. Users may use their own legally obtained reference data for private validation.
+
+## Generate from local TPXO data
+
+TPXO files must be obtained separately under suitable licence terms. See [docs/tpxo_pytmd_setup.md](docs/tpxo_pytmd_setup.md).
+
+```bash
+tidal-current-grib inspect-source \
+  --source tpxo \
+  --model-dir /path/to/model/root \
+  --model-name TPXO10-atlas-v2-nc
+
+tidal-current-grib sample-point \
+  --source tpxo \
+  --model-dir /path/to/model/root \
+  --model-name TPXO10-atlas-v2-nc \
+  --lat 53.3 \
+  --lon -5.0 \
+  --time 2026-07-01T12:00:00Z
+
+tidal-current-grib generate \
+  --bbox -7.0 51.5 -4.0 55.5 \
+  --start 2026-07-01T00:00:00Z \
+  --hours 72 \
+  --step-hours 1 \
+  --grid-spacing-deg 0.0333333 \
+  --source tpxo \
+  --model-dir /path/to/model/root \
+  --model-name TPXO10-atlas-v2-nc \
+  --output irish_sea_tpxo_current.grb \
+  --metadata-summary
+```
+
+The pyTMD backend uses `pyTMD.compute.tide_currents`, which returns zonal and meridional tidal-current velocities in cm/s. The generator converts those to internal m/s u/v components before writing the same OpenCPN-compatible GRIB1 current fields as the synthetic source.
 
 ## Reference comparison
 

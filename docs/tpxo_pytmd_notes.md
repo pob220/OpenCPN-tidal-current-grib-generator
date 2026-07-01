@@ -2,7 +2,7 @@
 
 ## Summary
 
-`pyTMD` is a Python toolkit for tidal prediction and includes readers/prediction utilities for several tidal model formats, including TPXO-style models. A production TPXO source should use pyTMD to interpolate tidal-current harmonic constituents at each requested grid point and predict u/v current components for each UTC time.
+`pyTMD` is a Python toolkit for tidal prediction and includes readers/prediction utilities for several tidal model formats, including TPXO-style models. This project uses the documented pyTMD v3 high-level API `pyTMD.compute.tide_currents` for TPXO-style current prediction.
 
 Authoritative project references:
 
@@ -17,13 +17,13 @@ This project must not bundle TPXO data unless the licence explicitly allows it.
 
 ## Expected implementation shape
 
-A `PyTMDSource` should:
+A `PyTMDTPXOSource`:
 
 1. Accept a model directory and model identifier.
-2. Load the model metadata through pyTMD.
+2. Optionally accept a pyTMD JSON model definition file.
 3. Build arrays of longitude/latitude grid points from the requested regular grid.
-4. Interpolate current harmonic constituents for eastward and northward transport/current components.
-5. Predict currents at the requested UTC time.
+4. Call `pyTMD.compute.tide_currents` with `type="grid"`, `crs=4326`, and `standard="datetime"`.
+5. Convert pyTMD u/v velocity output from cm/s to m/s.
 6. Return a `CurrentGrid` with u/v components in metres per second and a missing-data mask where interpolation fails or the model has no ocean value.
 
 ## Coastal limitations
@@ -38,4 +38,4 @@ Admiralty, UKHO, TotalTide, or other proprietary atlas data must not be scraped,
 
 ## Current status
 
-The repository currently includes a `PyTMDSource` skeleton that verifies dependency availability and documents the intended adapter boundary. It intentionally does not implement prediction until the exact pyTMD APIs and model-file layout are tested with legally usable data.
+The repository includes a guarded pyTMD source implementation, but no real model fixture. Tests that require real model data should be run by users with legally obtained local TPXO/TPXO-atlas files.

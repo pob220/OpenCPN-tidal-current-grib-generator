@@ -11,10 +11,13 @@ from tidal_current_grib_generator.errors import TidalCurrentGribError, Validatio
 from tidal_current_grib_generator.geo import BoundingBox, build_regular_grid, build_time_sequence, parse_utc_datetime
 from tidal_current_grib_generator.grib.validation import scan_grib_messages
 from tidal_current_grib_generator.grib.writer import EccodesGrib1CurrentWriter
+from tidal_current_grib_generator.model import components_to_speed_direction
 from tidal_current_grib_generator.reference import compare_reference_csv
 from tidal_current_grib_generator.sources import create_source
+from tidal_current_grib_generator.sources.pytmd import inspect_pytmd_source
 
 LOGGER = logging.getLogger("tidal_current_grib_generator")
+DEFAULT_TPXO_MODEL = "TPXO10-atlas-v2-nc"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -29,7 +32,9 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--step-hours", type=int, default=1)
     generate.add_argument("--grid-spacing-deg", type=float, required=True)
     generate.add_argument("--source", default="synthetic")
-    generate.add_argument("--model-directory", type=Path)
+    generate.add_argument("--model-dir", "--model-directory", dest="model_directory", type=Path)
+    generate.add_argument("--model-name", default=DEFAULT_TPXO_MODEL)
+    generate.add_argument("--definition-file", type=Path)
     generate.add_argument("--output", type=Path, required=True)
     generate.add_argument("--format", choices=["grib1"], default="grib1")
     generate.add_argument("--units", choices=["knots", "mps"], default="mps")
@@ -40,12 +45,34 @@ def build_parser() -> argparse.ArgumentParser:
 
     compare = subparsers.add_parser("compare-reference", help="Compare source predictions to a CSV.")
     compare.add_argument("--source", required=True)
-    compare.add_argument("--model-directory", type=Path)
+    compare.add_argument("--model-dir", "--model-directory", dest="model_directory", type=Path)
+    compare.add_argument("--model-name", default=DEFAULT_TPXO_MODEL)
+    compare.add_argument("--definition-file", type=Path)
     compare.add_argument("--reference-csv", type=Path, required=True)
     compare.add_argument("--output", type=Path, required=True)
     compare.add_argument("--units", choices=["knots", "mps"], default="mps")
     compare.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     compare.set_defaults(func=cmd_compare_reference)
+
+    sample = subparsers.add_parser("sample-point", help="Sample current at one point and time.")
+    sample.add_argument("--source", required=True)
+    sample.add_argument("--model-dir", "--model-directory", dest="model_directory", type=Path)
+    sample.add_argument("--model-name", default=DEFAULT_TPXO_MODEL)
+    sample.add_argument("--definition-file", type=Path)
+    sample.add_argument("--lat", type=float, required=True)
+    sample.add_argument("--lon", type=float, required=True)
+    sample.add_argument("--time", required=True)
+    sample.add_argument("--units", choices=["knots", "mps"], default="mps")
+    sample.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    sample.set_defaults(func=cmd_sample_point)
+
+    inspect = subparsers.add_parser("inspect-source", help="Inspect source/model availability.")
+    inspect.add_argument("--source", required=True)
+    inspect.add_argument("--model-dir", "--model-directory", dest="model_directory", type=Path)
+    inspect.add_argument("--model-name", default=DEFAULT_TPXO_MODEL)
+    inspect.add_argument("--definition-file", type=Path)
+    inspect.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    inspect.set_defaults(func=cmd_inspect_source)
     return parser
 
 
@@ -54,7 +81,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
     start = parse_utc_datetime(args.start)
     grid = build_regular_grid(bbox, args.grid_spacing_deg)
     times = build_time_sequence(start, args.hours, args.step_hours)
-    source = create_source(args.source, units=args.units, model_directory=args.model_directory)
+    source = _source_from_args(args)
     output = args.output.expanduser()
     if output.exists() and output.is_dir():
         raise ValidationError("--output must be a file path, not a directory")
@@ -87,10 +114,66 @@ def cmd_generate(args: argparse.Namespace) -> int:
 
 
 def cmd_compare_reference(args: argparse.Namespace) -> int:
-    source = create_source(args.source, units=args.units, model_directory=args.model_directory)
+    source = _source_from_args(args)
     rows = compare_reference_csv(source, args.reference_csv, args.output)
     print(f"wrote {len(rows)} comparison rows to {args.output}")
     return 0
+
+
+def cmd_sample_point(args: argparse.Namespace) -> int:
+    source = _source_from_args(args)
+    lat = float(args.lat)
+    lon = float(args.lon)
+    if not -90.0 <= lat <= 90.0:
+        raise ValidationError("--lat must be within [-90, 90]")
+    if not -180.0 <= lon <= 180.0:
+        raise ValidationError("--lon must be within [-180, 180]")
+    time = parse_utc_datetime(args.time)
+    bbox = BoundingBox(lon, lat, lon + 0.01, lat + 0.01)
+    grid = build_regular_grid(bbox, 0.01)
+    current = source.get_current_grid(bbox, time, grid)
+    u = float(current.u_mps[0, 0])
+    v = float(current.v_mps[0, 0])
+    speed_knots, direction = components_to_speed_direction(u, v)
+    description = source.describe()
+    print(f"source: {description.name}")
+    print(f"summary: {description.summary}")
+    print(f"time: {time.isoformat().replace('+00:00', 'Z')}")
+    print(f"lat: {lat}")
+    print(f"lon: {lon}")
+    print(f"u_mps: {u:.6f}")
+    print(f"v_mps: {v:.6f}")
+    print(f"speed_knots: {speed_knots:.6f}")
+    print(f"direction_degrees_true_toward: {direction:.2f}")
+    print(f"data_notice: {description.data_notice}")
+    return 0
+
+
+def cmd_inspect_source(args: argparse.Namespace) -> int:
+    if args.source.strip().lower() in {"tpxo", "pytmd"}:
+        inspection = inspect_pytmd_source(
+            model_directory=args.model_directory,
+            model_name=args.model_name,
+            definition_file=args.definition_file,
+        ).as_dict()
+    else:
+        inspection = create_source(args.source, units="mps").inspect()
+    for key, value in inspection.items():
+        if isinstance(value, list):
+            print(f"{key}: {', '.join(value) if value else '(none)'}")
+        else:
+            print(f"{key}: {value}")
+    return 0
+
+
+def _source_from_args(args: argparse.Namespace):
+    return create_source(
+        args.source,
+        units=getattr(args, "units", "mps"),
+        model_directory=getattr(args, "model_directory", None),
+        model_name=getattr(args, "model_name", DEFAULT_TPXO_MODEL),
+        definition_file=getattr(args, "definition_file", None),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
