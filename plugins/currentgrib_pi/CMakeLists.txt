@@ -4,6 +4,9 @@ project(currentgrib_pi)
 set(PACKAGE_NAME currentgrib_pi)
 set(VERBOSE_NAME "Current GRIB Generator")
 set(TITLE_NAME "Current GRIB Generator")
+option(CURRENTGRIB_INSTALL_DEV_METADATA
+       "Install currentgrib_pi development metadata into the local OpenCPN private data directory"
+       ON)
 
 set(SRC
   src/currentgrib_pi.h
@@ -48,3 +51,15 @@ add_custom_command(
           "${CMAKE_CURRENT_SOURCE_DIR}/data/currentgrib.png"
           "${CMAKE_BINARY_DIR}/share/plugins/currentgrib_pi/data/currentgrib.png"
 )
+
+if (CURRENTGRIB_INSTALL_DEV_METADATA AND UNIX AND NOT APPLE AND DEFINED ENV{HOME})
+  add_custom_command(
+    TARGET ${PACKAGE_NAME}
+    POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$ENV{HOME}/.opencpn/plugins/install_data/imports"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/data/currentgrib_pi.xml"
+            "$ENV{HOME}/.opencpn/plugins/install_data/imports/currentgrib_pi.xml"
+  )
+endif()

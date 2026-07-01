@@ -24,17 +24,31 @@ from tidal_current_grib_generator.grib.writer import EccodesGrib1CurrentWriter
 from tidal_current_grib_generator.model import components_to_speed_direction
 from tidal_current_grib_generator.reference import compare_reference_csv
 from tidal_current_grib_generator.sources import create_source
-from tidal_current_grib_generator.sources.netcdf import NetCDFCurrentSource, inspect_netcdf
+from tidal_current_grib_generator.sources.netcdf import NetCDFCurrentSource, inspect_netcdf, netcdf_time_metadata
 from tidal_current_grib_generator.sources.pytmd import inspect_pytmd_source
 from tidal_current_grib_generator.providers import ProviderRegistry, select_best_provider_for_bbox
+from tidal_current_grib_generator.api import GenerateCurrentGribRequest, generate_current_grib_from_netcdf
+from tidal_current_grib_generator.security import redact_text
 
 LOGGER = logging.getLogger("tidal_current_grib_generator")
 DEFAULT_TPXO_MODEL = "TPXO10-atlas-v2-nc"
 
 
+class RedactingLogFilter(logging.Filter):
+    def __init__(self, sensitive_values: list[str]):
+        super().__init__()
+        self.sensitive_values = sensitive_values
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = redact_text(record.getMessage(), self.sensitive_values)
+        record.args = ()
+        return True
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tidal-current-grib")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging.")
+    parser.add_argument("--debug", action="store_true", help="Enable diagnostic debug logging, including third-party libraries.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     generate = subparsers.add_parser("generate", help="Generate a current GRIB.")
@@ -57,6 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--clip-bbox-to-source", action="store_true")
     generate.add_argument("--use-source-grid", action="store_true")
     generate.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    generate.add_argument("--debug", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     generate.set_defaults(func=cmd_generate)
 
     compare = subparsers.add_parser("compare-reference", help="Compare source predictions to a CSV.")
@@ -139,7 +154,33 @@ def build_parser() -> argparse.ArgumentParser:
     download.add_argument("--overwrite", action="store_true")
     download.add_argument("--json", action="store_true")
     download.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    download.add_argument("--debug", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     download.set_defaults(func=cmd_download_copernicus)
+
+    generate_copernicus = subparsers.add_parser(
+        "generate-copernicus",
+        help="Download a Copernicus Marine current subset and convert it to GRIB.",
+    )
+    generate_copernicus.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"))
+    generate_copernicus.add_argument("--start", required=True)
+    generate_copernicus_end = generate_copernicus.add_mutually_exclusive_group(required=True)
+    generate_copernicus_end.add_argument("--end")
+    generate_copernicus_end.add_argument("--hours", type=int)
+    generate_copernicus.add_argument("--step-hours", type=int, default=1)
+    generate_copernicus.add_argument("--grid-spacing-deg", type=float, default=0.03)
+    generate_copernicus.add_argument("--download-directory", type=Path, required=True)
+    generate_copernicus.add_argument("--download-filename")
+    generate_copernicus.add_argument("--output", type=Path, required=True)
+    generate_copernicus.add_argument("--username")
+    generate_copernicus.add_argument("--password-env", default="CURRENTGRIB_COPERNICUS_PASSWORD")
+    generate_copernicus.add_argument("--username-env", default="CURRENTGRIB_TEST_COPERNICUS_USERNAME")
+    generate_copernicus.add_argument("--overwrite", action="store_true")
+    generate_copernicus.add_argument("--dry-run", action="store_true")
+    generate_copernicus.add_argument("--json", action="store_true")
+    generate_copernicus.add_argument("--metadata-summary", action="store_true")
+    generate_copernicus.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    generate_copernicus.add_argument("--debug", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    generate_copernicus.set_defaults(func=cmd_generate_copernicus)
     return parser
 
 
@@ -374,13 +415,189 @@ def cmd_download_copernicus(args: argparse.Namespace) -> int:
     )
     result = download_copernicus_subset(
         request,
-        progress_callback=lambda step, details: LOGGER.info("%s %s", step, details),
+        progress_callback=_download_progress_callback(args.verbose),
     )
     if args.json:
         print(json.dumps(result.as_dict(), indent=2, sort_keys=True))
     else:
         print(f"downloaded NetCDF: {result.path}")
     return 0
+
+
+def cmd_generate_copernicus(args: argparse.Namespace) -> int:
+    start = parse_utc_datetime(args.start)
+    if args.hours is not None:
+        if args.hours <= 0:
+            raise ValidationError("--hours must be greater than zero")
+        end = start + timedelta(hours=args.hours)
+        hours = args.hours
+    else:
+        end = parse_utc_datetime(args.end)
+        seconds = int((end - start).total_seconds())
+        if seconds <= 0:
+            raise ValidationError("--end must be after --start")
+        if seconds % 3600:
+            raise ValidationError("--end must fall on an exact hour relative to --start")
+        hours = seconds // 3600
+    if args.step_hours <= 0:
+        raise ValidationError("--step-hours must be greater than zero")
+
+    username = args.username or os.environ.get(args.username_env)
+    if not username:
+        username = input("Copernicus username: ")
+    password = os.environ.get(args.password_env)
+    if not password:
+        password = getpass.getpass("Copernicus password: ")
+
+    bbox = BoundingBox.from_values(args.bbox)
+    download_filename = args.download_filename or (
+        f"copernicus_nws_currents_{start:%Y%m%dT%H%MZ}_{hours}h.nc"
+    )
+    download_request = CopernicusDownloadRequest(
+        bbox=bbox,
+        start=start,
+        end=end,
+        output_directory=args.download_directory,
+        output_filename=download_filename,
+        username=username,
+        password=password,
+        overwrite=args.overwrite,
+        dry_run=args.dry_run,
+    )
+    requested_end = end
+    requested_hours = hours
+    if args.metadata_summary:
+        print("checking inputs", flush=True)
+        print(
+            f"requested time range: start={start.isoformat()} end={requested_end.isoformat()} "
+            f"hours={requested_hours} step_hours={args.step_hours}",
+            flush=True,
+        )
+        print("downloading Copernicus NetCDF", flush=True)
+    download_result = download_copernicus_subset(
+        download_request,
+        progress_callback=_download_progress_callback(args.verbose),
+    )
+    if args.dry_run:
+        data = {"download": download_result.as_dict(), "dry_run": True}
+        print(json.dumps(data, indent=2, sort_keys=True) if args.json else f"planned NetCDF: {download_result.path}")
+        return 0
+
+    if args.metadata_summary:
+        print(f"downloaded NetCDF path: {download_result.path}", flush=True)
+        print("inspecting NetCDF", flush=True)
+    time_plan = _generation_time_plan_from_netcdf(download_result.path, start, requested_end, args.step_hours)
+    generation_start = time_plan["start"]
+    generation_end = time_plan["end"]
+    generation_hours = time_plan["hours"]
+    if args.metadata_summary:
+        print(
+            "source time range: "
+            f"first={time_plan['source_first_time'].isoformat()} "
+            f"last={time_plan['source_last_time'].isoformat()} "
+            f"count={time_plan['source_time_count']} "
+            f"step_hours={time_plan['source_step_hours']}",
+            flush=True,
+        )
+        if generation_start != start:
+            print(
+                "Requested start time adjusted from "
+                f"{start.isoformat()} to first available Copernicus time {generation_start.isoformat()}.",
+                flush=True,
+            )
+        print(
+            "adjusted generation time range: "
+            f"start={generation_start.isoformat()} end={generation_end.isoformat()} "
+            f"hours={generation_hours} count={time_plan['generation_time_count']}",
+            flush=True,
+        )
+        print("converting NetCDF to GRIB", flush=True)
+    grib_result = generate_current_grib_from_netcdf(
+        GenerateCurrentGribRequest(
+            bbox=bbox,
+            start=generation_start,
+            hours=generation_hours,
+            step_hours=args.step_hours,
+            output=args.output,
+            source="netcdf",
+            input_netcdf=download_result.path,
+            grid_spacing_deg=args.grid_spacing_deg,
+            clip_bbox_to_source=True,
+            use_source_grid=True,
+        ),
+        progress_callback=_generate_copernicus_progress_callback(args.verbose),
+    )
+    if args.metadata_summary:
+        print("validating GRIB stream", flush=True)
+    inspection = inspect_grib(grib_result.output)
+    result = {
+        "download": download_result.as_dict(),
+        "grib": grib_result.as_dict(),
+        "inspection": inspection,
+        "time_plan": _jsonable_time_plan(time_plan),
+    }
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(f"wrote current GRIB: {grib_result.output}", flush=True)
+        print(f"validated GRIB stream: {inspection.get('message_count')} messages", flush=True)
+        print("complete", flush=True)
+    return 0
+
+
+def _generation_time_plan_from_netcdf(
+    path: Path,
+    requested_start,
+    requested_end,
+    step_hours: int,
+) -> dict[str, Any]:
+    metadata = netcdf_time_metadata(path)
+    source_first = metadata["first_time"]
+    source_last = metadata["last_time"]
+    source_count = int(metadata["time_count"])
+    source_step = metadata["step_hours"]
+    if requested_end < source_first:
+        raise ValidationError(
+            f"requested time range ends before downloaded NetCDF begins: requested_end={requested_end.isoformat()}, "
+            f"source_first={source_first.isoformat()}"
+        )
+    if requested_start > source_last:
+        raise ValidationError(
+            f"requested start is after downloaded NetCDF ends: requested_start={requested_start.isoformat()}, "
+            f"source_last={source_last.isoformat()}"
+        )
+
+    times = [time for time in metadata["times"] if time >= requested_start and time <= source_last]
+    if not times:
+        raise ValidationError("downloaded NetCDF contains no usable times at or after requested start")
+    generation_start = times[0]
+    requested_limit = min(requested_end, source_last)
+    if requested_limit < generation_start:
+        requested_limit = source_last
+    elapsed_hours = int((requested_limit - generation_start).total_seconds() // 3600)
+    usable_steps = elapsed_hours // step_hours
+    generation_hours = usable_steps * step_hours
+    generation_end = generation_start + timedelta(hours=generation_hours)
+    generation_count = usable_steps + 1
+    if generation_count <= 0:
+        raise ValidationError("adjusted generation time range is empty")
+    return {
+        "source_first_time": source_first,
+        "source_last_time": source_last,
+        "source_time_count": source_count,
+        "source_step_hours": source_step,
+        "start": generation_start,
+        "end": generation_end,
+        "hours": generation_hours,
+        "generation_time_count": generation_count,
+    }
+
+
+def _jsonable_time_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    result = dict(plan)
+    for key in ("source_first_time", "source_last_time", "start", "end"):
+        result[key] = result[key].isoformat()
+    return result
 
 
 def _print_mapping(inspection: dict) -> None:
@@ -520,10 +737,59 @@ def _progress_callback(verbose: bool):
     return callback
 
 
+def _download_progress_callback(verbose: bool):
+    if not verbose:
+        return None
+
+    def callback(step: str, details: dict[str, Any]) -> None:
+        if step == "download complete":
+            print(f"download complete: {details.get('path', '')}", flush=True)
+        elif step:
+            print(step, flush=True)
+
+    return callback
+
+
+def _generate_copernicus_progress_callback(verbose: bool):
+    if not verbose:
+        return None
+
+    def callback(step: str, details: dict[str, Any]) -> None:
+        if step == "generating timestep":
+            index = int(details.get("index", 0))
+            valid_time = details.get("time", "")
+            print(f"wrote {index * 2} messages through valid time {valid_time}", flush=True)
+        elif step == "generating GRIB":
+            print(f"converting {details.get('steps')} time steps to GRIB", flush=True)
+        elif step == "validating GRIB":
+            print(f"validated generated stream: {details.get('messages')} messages", flush=True)
+
+    return callback
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING)
+    sensitive_values = [
+        os.environ.get("CURRENTGRIB_TEST_COPERNICUS_USERNAME", ""),
+        os.environ.get("CURRENTGRIB_TEST_COPERNICUS_PASSWORD", ""),
+        os.environ.get("CURRENTGRIB_COPERNICUS_PASSWORD", ""),
+        getattr(args, "username", "") or "",
+    ]
+    debug = bool(getattr(args, "debug", False))
+    verbose = bool(getattr(args, "verbose", False))
+    logging.basicConfig(level=logging.DEBUG if debug else logging.INFO if verbose else logging.WARNING, force=True)
+    redacting_filter = RedactingLogFilter(sensitive_values)
+    logging.getLogger().addFilter(redacting_filter)
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(redacting_filter)
+    noisy_loggers = ("urllib3", "botocore", "boto3", "s3transfer", "zarr", "findlibs", "fsspec")
+    if debug:
+        for noisy in noisy_loggers:
+            logging.getLogger(noisy).setLevel(logging.DEBUG)
+    else:
+        for noisy in noisy_loggers:
+            logging.getLogger(noisy).setLevel(logging.WARNING)
     try:
         return int(args.func(args))
     except TidalCurrentGribError as exc:

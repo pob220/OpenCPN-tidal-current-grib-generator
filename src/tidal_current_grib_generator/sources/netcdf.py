@@ -284,6 +284,53 @@ def inspect_netcdf(path: Path) -> dict[str, Any]:
         return result
 
 
+def netcdf_time_metadata(path: Path) -> dict[str, Any]:
+    """Return parsed UTC time-coordinate metadata for generation alignment."""
+
+    path = path.expanduser()
+    if not path.exists():
+        raise ValidationError(f"NetCDF file does not exist: {path}")
+    xr = _import_xarray()
+    with xr.open_dataset(path) as dataset:
+        spec = _detect_spec(dataset, None, None, None, None, None)
+        values = np.asarray(dataset[spec.time_name].values)
+        if values.size == 0:
+            raise ValidationError("NetCDF time coordinate is empty")
+        times = [_numpy_datetime_to_utc(value) for value in values]
+        times = sorted(times)
+        step_hours = None
+        if len(times) > 1:
+            deltas = [
+                (right - left).total_seconds() / 3600.0
+                for left, right in zip(times[:-1], times[1:])
+            ]
+            median = float(np.median(deltas))
+            max_deviation = float(np.max(np.abs(np.asarray(deltas, dtype=float) - median)))
+            step_hours = median
+            if max_deviation > max(1e-6, abs(median) * 1e-6):
+                raise ValidationError(
+                    "NetCDF time coordinate is not regular enough for automatic Copernicus generation "
+                    f"(median step {median:g} h, max deviation {max_deviation:g} h)"
+                )
+        return {
+            "first_time": times[0],
+            "last_time": times[-1],
+            "time_count": len(times),
+            "step_hours": step_hours,
+            "times": times,
+        }
+
+
+def _numpy_datetime_to_utc(value: Any) -> datetime:
+    scalar = np.asarray(value)
+    if np.issubdtype(scalar.dtype, np.datetime64):
+        text = np.datetime_as_string(scalar.astype("datetime64[us]"), unit="us", timezone="UTC")
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(timezone.utc)
+    parsed = np.datetime64(value, "us")
+    text = np.datetime_as_string(parsed, unit="us", timezone="UTC")
+    return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
 def _detect_spec(
     dataset: Any,
     u_name: str | None,

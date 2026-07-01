@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plugin version="1">
+    <name>Current GRIB Generator</name>
+    <version>0.1.0</version>
+    <release>0</release>
+    <summary>Generate ocean-current GRIB files for OpenCPN.</summary>
+    <api-version>1.18</api-version>
+    <open-source>true</open-source>
+    <is-imported>true</is-imported>
+    <author>tidal-current-grib-generator contributors</author>
+    <source>https://github.com/open-source/currentgrib_pi</source>
+    <info-url>https://github.com/open-source/currentgrib_pi</info-url>
+    <description>Development build of the OpenCPN Current GRIB Generator plugin. It invokes the local tidal-current-grib generator to create OpenCPN-compatible ocean-current GRIB files from synthetic or local NetCDF current data.</description>
+    <target>all</target>
+    <target-version></target-version>
+    <target-arch></target-arch>
+    <tarball-url></tarball-url>
+    <tarball-checksum></tarball-checksum>
+</plugin>

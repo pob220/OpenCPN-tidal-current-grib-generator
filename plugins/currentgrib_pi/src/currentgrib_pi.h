@@ -24,6 +24,9 @@ public:
   void OnToolbarToolCallback(int id) override;
 
 private:
+  void LoadIconBitmap();
+  wxString FindIconPath() const;
+
   wxWindow* m_parent;
   int m_toolId;
   wxBitmap m_icon;

@@ -26,3 +26,9 @@ The test download must be a very small area/time range. Test output directories 
 ## Implementation notes
 
 The Python helper uses the Copernicus Marine Toolbox Python API so credentials are passed in-process rather than exposed in process lists as command-line arguments. Progress details use redacted summaries.
+
+The OpenCPN plugin invokes the helper command for v1. For Copernicus generation it sets
+`CURRENTGRIB_COPERNICUS_PASSWORD` only for the duration of the worker subprocess and restores
+or unsets it immediately after the command exits. The password is not added to argv, log text,
+temporary files, or plugin settings. This is still a transient process environment handoff, not
+persistent password storage.

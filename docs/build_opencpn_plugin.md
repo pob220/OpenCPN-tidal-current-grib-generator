@@ -56,6 +56,18 @@ The build also copies `currentgrib.png` to development data locations used by Op
 ~/src/OpenCPN/build/share/plugins/currentgrib_pi/data/currentgrib.png
 ```
 
+On Linux development builds, CMake also installs imported plugin metadata to:
+
+```text
+~/.opencpn/plugins/install_data/imports/currentgrib_pi.xml
+```
+
+OpenCPN's plugin manager uses this metadata for non-system plugins. Without it, a locally loaded plugin can be opened as a shared library but still be pruned from `Options -> Plugins` when it is disabled/unloaded and has no catalog entry. Disable this copy step with:
+
+```sh
+cmake -S ~/src/OpenCPN -B ~/src/OpenCPN/build -DCURRENTGRIB_INSTALL_DEV_METADATA=OFF
+```
+
 ## Launch OpenCPN With the Development Plugin
 
 From the OpenCPN source tree:
@@ -66,6 +78,20 @@ OPENCPN_PLUGIN_DIRS=~/src/OpenCPN/build/plugins/currentgrib_pi ./build/opencpn
 ```
 
 Expected OpenCPN log lines should show that `libcurrentgrib_pi.so` was found and loaded, followed by the common name `Current GRIB Generator`.
+
+Useful log lines to grep for:
+
+```text
+currentgrib_pi: create_pi
+currentgrib_pi: constructor
+currentgrib_pi: GetCommonName
+currentgrib_pi: GetShortDescription
+currentgrib_pi: GetLongDescription
+currentgrib_pi: GetAPIVersionMajor -> 1
+currentgrib_pi: GetAPIVersionMinor -> 18
+currentgrib_pi: Init start
+currentgrib_pi: toolbar tool id=
+```
 
 ## Generator Executable Discovery
 
