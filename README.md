@@ -37,6 +37,12 @@ TPXO/pyTMD support is optional:
 python -m pip install -e '.[tpxo]'
 ```
 
+Local NetCDF current-file support is optional:
+
+```bash
+python -m pip install -e '.[netcdf]'
+```
+
 For both GRIB writing and TPXO prediction:
 
 ```bash
@@ -77,6 +83,7 @@ Built-in sources:
 - `synthetic`: deterministic rotary tide-like test field.
 - `constant`: simple constant eastward current for tests.
 - `tpxo` / `pytmd`: pyTMD-backed astronomical tidal-current prediction from local user-supplied model files.
+- `netcdf`: local NetCDF current files, including Copernicus Marine files with u/v current components.
 
 Do not scrape, embed, redistribute, or derive open output from proprietary Admiralty, UKHO, or TotalTide atlas data. Users may use their own legally obtained reference data for private validation.
 
@@ -112,6 +119,26 @@ tidal-current-grib generate \
 ```
 
 The pyTMD backend uses `pyTMD.compute.tide_currents`, which returns zonal and meridional tidal-current velocities in cm/s. The generator converts those to internal m/s u/v components before writing the same OpenCPN-compatible GRIB1 current fields as the synthetic source.
+
+## Generate from a local Copernicus Marine NetCDF file
+
+See [docs/copernicus_netcdf_setup.md](docs/copernicus_netcdf_setup.md).
+
+```bash
+tidal-current-grib inspect-netcdf \
+  --input-netcdf ~/OpenCPN/current-data/copernicus/irish_sea_copernicus_currents.nc
+
+tidal-current-grib generate \
+  --bbox -7.0 51.5 -4.0 55.5 \
+  --start 2026-07-01T00:00:00Z \
+  --hours 72 \
+  --step-hours 1 \
+  --grid-spacing-deg 0.0333333 \
+  --source netcdf \
+  --input-netcdf ~/OpenCPN/current-data/copernicus/irish_sea_copernicus_currents.nc \
+  --output irish_sea_copernicus_current.grb \
+  --metadata-summary
+```
 
 ## Reference comparison
 

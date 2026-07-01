@@ -21,11 +21,16 @@ tpxo = [
   "xarray>=2024.7",
   "timescale>=0.0.6",
 ]
+netcdf = [
+  "xarray>=2024.7",
+  "netCDF4>=1.6",
+]
 dev = ["pytest>=7.4"]
 all = [
   "eccodes>=1.6",
   "pyTMD>=3.0",
   "xarray>=2024.7",
+  "netCDF4>=1.6",
   "timescale>=0.0.6",
 ]
 

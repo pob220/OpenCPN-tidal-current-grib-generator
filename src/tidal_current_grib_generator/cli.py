@@ -14,6 +14,7 @@ from tidal_current_grib_generator.grib.writer import EccodesGrib1CurrentWriter
 from tidal_current_grib_generator.model import components_to_speed_direction
 from tidal_current_grib_generator.reference import compare_reference_csv
 from tidal_current_grib_generator.sources import create_source
+from tidal_current_grib_generator.sources.netcdf import inspect_netcdf
 from tidal_current_grib_generator.sources.pytmd import inspect_pytmd_source
 
 LOGGER = logging.getLogger("tidal_current_grib_generator")
@@ -35,6 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--model-dir", "--model-directory", dest="model_directory", type=Path)
     generate.add_argument("--model-name", default=DEFAULT_TPXO_MODEL)
     generate.add_argument("--definition-file", type=Path)
+    _add_netcdf_options(generate)
     generate.add_argument("--output", type=Path, required=True)
     generate.add_argument("--format", choices=["grib1"], default="grib1")
     generate.add_argument("--units", choices=["knots", "mps"], default="mps")
@@ -48,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--model-dir", "--model-directory", dest="model_directory", type=Path)
     compare.add_argument("--model-name", default=DEFAULT_TPXO_MODEL)
     compare.add_argument("--definition-file", type=Path)
+    _add_netcdf_options(compare)
     compare.add_argument("--reference-csv", type=Path, required=True)
     compare.add_argument("--output", type=Path, required=True)
     compare.add_argument("--units", choices=["knots", "mps"], default="mps")
@@ -59,6 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     sample.add_argument("--model-dir", "--model-directory", dest="model_directory", type=Path)
     sample.add_argument("--model-name", default=DEFAULT_TPXO_MODEL)
     sample.add_argument("--definition-file", type=Path)
+    _add_netcdf_options(sample)
     sample.add_argument("--lat", type=float, required=True)
     sample.add_argument("--lon", type=float, required=True)
     sample.add_argument("--time", required=True)
@@ -73,7 +77,25 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--definition-file", type=Path)
     inspect.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     inspect.set_defaults(func=cmd_inspect_source)
+
+    inspect_nc = subparsers.add_parser("inspect-netcdf", help="Inspect a local NetCDF current file.")
+    inspect_nc.add_argument("--input-netcdf", type=Path, required=True)
+    inspect_nc.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    inspect_nc.set_defaults(func=cmd_inspect_netcdf)
     return parser
+
+
+def _add_netcdf_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--input-netcdf", type=Path)
+    parser.add_argument("--u-variable")
+    parser.add_argument("--v-variable")
+    parser.add_argument("--lat-variable")
+    parser.add_argument("--lon-variable")
+    parser.add_argument("--time-variable")
+    parser.add_argument("--depth-index", type=int)
+    parser.add_argument("--depth-value", type=float)
+    parser.add_argument("--assume-units", choices=["mps", "cmps"])
+    parser.add_argument("--nearest-time", action="store_true")
 
 
 def cmd_generate(args: argparse.Namespace) -> int:
@@ -158,12 +180,26 @@ def cmd_inspect_source(args: argparse.Namespace) -> int:
         ).as_dict()
     else:
         inspection = create_source(args.source, units="mps").inspect()
+    _print_mapping(inspection)
+    return 0
+
+
+def cmd_inspect_netcdf(args: argparse.Namespace) -> int:
+    inspection = inspect_netcdf(args.input_netcdf)
+    _print_mapping(inspection)
+    return 0
+
+
+def _print_mapping(inspection: dict) -> None:
     for key, value in inspection.items():
         if isinstance(value, list):
             print(f"{key}: {', '.join(value) if value else '(none)'}")
+        elif isinstance(value, dict):
+            print(f"{key}:")
+            for nested_key, nested_value in value.items():
+                print(f"  {nested_key}: {nested_value}")
         else:
             print(f"{key}: {value}")
-    return 0
 
 
 def _source_from_args(args: argparse.Namespace):
@@ -173,6 +209,16 @@ def _source_from_args(args: argparse.Namespace):
         model_directory=getattr(args, "model_directory", None),
         model_name=getattr(args, "model_name", DEFAULT_TPXO_MODEL),
         definition_file=getattr(args, "definition_file", None),
+        input_netcdf=getattr(args, "input_netcdf", None),
+        u_variable=getattr(args, "u_variable", None),
+        v_variable=getattr(args, "v_variable", None),
+        lat_variable=getattr(args, "lat_variable", None),
+        lon_variable=getattr(args, "lon_variable", None),
+        time_variable=getattr(args, "time_variable", None),
+        depth_index=getattr(args, "depth_index", None),
+        depth_value=getattr(args, "depth_value", None),
+        assume_units=getattr(args, "assume_units", None),
+        nearest_time=getattr(args, "nearest_time", False),
     )
 
 
