@@ -22,6 +22,7 @@ public:
   wxString GetLongDescription() override;
   int GetToolbarToolCount() override;
   void OnToolbarToolCallback(int id) override;
+  void SetCurrentViewPort(PlugIn_ViewPort& vp) override;
 
 private:
   void LoadIconBitmap();
@@ -31,4 +32,6 @@ private:
   int m_toolId;
   wxBitmap m_icon;
   CurrentGribDialog* m_dialog;
+  bool m_hasCurrentViewPort{false};
+  PlugIn_ViewPort m_currentViewPort{};
 };

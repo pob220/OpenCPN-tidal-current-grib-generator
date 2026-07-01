@@ -37,6 +37,26 @@ wxString DefaultStartUtc() {
   return now.FormatISOCombined('T') + "Z";
 }
 
+wxString JsonEscape(const wxString& value) {
+  wxString escaped;
+  for (wxUniChar ch : value) {
+    if (ch == '\\') {
+      escaped += "\\\\";
+    } else if (ch == '"') {
+      escaped += "\\\"";
+    } else if (ch == '\n') {
+      escaped += "\\n";
+    } else if (ch == '\r') {
+      escaped += "\\r";
+    } else if (ch == '\t') {
+      escaped += "\\t";
+    } else {
+      escaped += ch;
+    }
+  }
+  return escaped;
+}
+
 bool IsExecutableFile(const wxString& path) {
   return wxFileName::FileExists(path);
 }
@@ -81,7 +101,7 @@ CurrentGribDialog::CurrentGribDialog(wxWindow* parent)
   m_south = new wxTextCtrl(scrolled, wxID_ANY, "50.5");
   m_east = new wxTextCtrl(scrolled, wxID_ANY, "-2.5");
   m_north = new wxTextCtrl(scrolled, wxID_ANY, "56.5");
-  wxString presets[] = {"Custom bbox", "Current chart area (not available)",
+  wxString presets[] = {"Custom bbox", "Current chart area",
                         "Irish Sea / North Channel example", "Tiny Copernicus connection test"};
   m_presetChoice = new wxChoice(scrolled, wxID_ANY, wxDefaultPosition, wxDefaultSize, WXSIZEOF(presets), presets);
   m_presetChoice->SetSelection(0);
@@ -183,6 +203,11 @@ CurrentGribDialog::~CurrentGribDialog() {
   }
 }
 
+void CurrentGribDialog::SetCurrentViewPort(const PlugIn_ViewPort& vp) {
+  m_currentViewPort = vp;
+  m_hasCurrentViewPort = vp.bValid;
+}
+
 void CurrentGribDialog::OnCheckDependencies(wxCommandEvent&) {
   wxString command = ShellQuote(m_generatorPath->GetValue()) + " check-dependencies --output-directory " +
                      ShellQuote(m_outputDir->GetPath());
@@ -247,9 +272,26 @@ void CurrentGribDialog::ApplyPreset(int selection) {
     return;
   }
   if (selection == 1) {
-    AppendLog("Current chart area is not available yet; enter bbox manually.");
-    wxMessageBox("Current chart area is not wired yet. Enter bbox manually or choose another preset.",
-                 "Preset not available", wxOK | wxICON_INFORMATION, this);
+    if (!m_hasCurrentViewPort) {
+      AppendLog("Current chart area is not available yet; enter bbox manually.");
+      wxMessageBox("OpenCPN has not provided a valid chart viewport yet. Pan or zoom the chart, then try again.",
+                   "Current chart area unavailable", wxOK | wxICON_INFORMATION, this);
+      m_presetChoice->SetSelection(0);
+      return;
+    }
+    if (m_currentViewPort.lon_min >= m_currentViewPort.lon_max ||
+        m_currentViewPort.lat_min >= m_currentViewPort.lat_max) {
+      AppendLog("Current chart area crosses an unsupported longitude boundary; enter bbox manually.");
+      wxMessageBox("The current chart area cannot be converted to a simple west/south/east/north bbox. Enter bbox manually.",
+                   "Current chart area unavailable", wxOK | wxICON_INFORMATION, this);
+      m_presetChoice->SetSelection(0);
+      return;
+    }
+    m_west->SetValue(wxString::Format("%.6f", m_currentViewPort.lon_min));
+    m_south->SetValue(wxString::Format("%.6f", m_currentViewPort.lat_min));
+    m_east->SetValue(wxString::Format("%.6f", m_currentViewPort.lon_max));
+    m_north->SetValue(wxString::Format("%.6f", m_currentViewPort.lat_max));
+    AppendLog("Applied current chart area preset.");
     m_presetChoice->SetSelection(0);
     return;
   }
@@ -462,7 +504,8 @@ void CurrentGribDialog::FinishCommand(long exit_code, bool launched) {
   if (exit_code == 0 && generation) {
     wxString message = "Generated current GRIB:\n" + OutputPath();
     if (m_openAfter->GetValue()) {
-      message += "\n\nAutomatic opening is not wired yet. Open this GRIB in the GRIB plugin, or merge it with a weather GRIB using GRIB -> Merge GRIBs.";
+      TryOpenGeneratedGrib();
+      message += "\n\nA request was sent to the GRIB plugin to open this file. If it does not appear, open this GRIB in the GRIB plugin, or merge it with a weather GRIB using GRIB -> Merge GRIBs.";
     } else if (m_showMergeInstructions->GetValue()) {
       message += "\n\nOpen this GRIB in the GRIB plugin, or merge it with a weather GRIB using GRIB -> Merge GRIBs.";
     }
@@ -482,6 +525,17 @@ void CurrentGribDialog::SetBusy(bool busy) {
   m_generateButton->Enable(!busy);
   m_cancelButton->Enable(busy);
   m_closeButton->Enable(true);
+}
+
+void CurrentGribDialog::TryOpenGeneratedGrib() {
+  wxString path = OutputPath();
+  if (!wxFileName::FileExists(path)) {
+    AppendLog("Generated GRIB does not exist; not sending GRIB open request.");
+    return;
+  }
+  wxString body = "{\"grib_file\":\"" + JsonEscape(path) + "\"}";
+  SendPluginMessage("GRIB_APPLY_JSON_CONFIG", body);
+  AppendLog("Sent GRIB plugin open request for: " + path);
 }
 
 wxString CurrentGribDialog::BuildGenerateCommand() const {

@@ -6,10 +6,13 @@
 #include <wx/timer.h>
 #include <wx/wx.h>
 
+#include "ocpn_plugin.h"
+
 class CurrentGribDialog : public wxDialog {
 public:
   explicit CurrentGribDialog(wxWindow* parent);
   ~CurrentGribDialog() override;
+  void SetCurrentViewPort(const PlugIn_ViewPort& vp);
 
 private:
   void OnCheckDependencies(wxCommandEvent& event);
@@ -30,6 +33,7 @@ private:
   void SetBusy(bool busy);
   void ApplyPreset(int selection);
   bool ConfirmLargeCopernicusRequest();
+  void TryOpenGeneratedGrib();
   wxString BuildGenerateCommand() const;
   wxString OutputPath() const;
   wxString FindDefaultGenerator() const;
@@ -64,6 +68,8 @@ private:
   bool m_processGeneration{false};
   bool m_processCancelled{false};
   long m_processPid{0};
+  bool m_hasCurrentViewPort{false};
+  PlugIn_ViewPort m_currentViewPort{};
   wxString m_currentCommand;
   wxString m_stdoutBuffer;
   wxString m_stderrBuffer;

@@ -32,7 +32,7 @@ int currentgrib_pi::Init() {
   m_toolId = InsertPlugInTool("", &m_icon, &m_icon, wxITEM_NORMAL,
                               "Ocean Current GRIB Generator", "", nullptr, -1, 0, this);
   wxLogMessage("currentgrib_pi: toolbar tool id=%d", m_toolId);
-  return WANTS_TOOLBAR_CALLBACK | INSTALLS_TOOLBAR_TOOL;
+  return WANTS_TOOLBAR_CALLBACK | INSTALLS_TOOLBAR_TOOL | WANTS_ONPAINT_VIEWPORT;
 }
 
 bool currentgrib_pi::DeInit() {
@@ -94,9 +94,16 @@ void currentgrib_pi::OnToolbarToolCallback(int) {
   if (!m_dialog) {
     wxLogMessage("currentgrib_pi: creating dialog");
     m_dialog = new CurrentGribDialog(m_parent);
+    if (m_hasCurrentViewPort) m_dialog->SetCurrentViewPort(m_currentViewPort);
   }
   m_dialog->Show();
   m_dialog->Raise();
+}
+
+void currentgrib_pi::SetCurrentViewPort(PlugIn_ViewPort& vp) {
+  m_currentViewPort = vp;
+  m_hasCurrentViewPort = vp.bValid;
+  if (m_dialog) m_dialog->SetCurrentViewPort(vp);
 }
 
 void currentgrib_pi::LoadIconBitmap() {
