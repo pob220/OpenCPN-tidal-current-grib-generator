@@ -42,10 +42,23 @@ bool IsCopernicusProvider(const wxString& provider) {
          provider.Contains("Copernicus Marine Global");
 }
 
+bool IsMarineIeProvider(const wxString& provider) {
+  return provider.Contains("Marine Institute Ireland");
+}
+
 wxString CopernicusProviderId(const wxString& provider) {
   if (provider.Contains("Copernicus Marine North-West Shelf")) return "copernicus_nws";
   if (provider.Contains("Copernicus Marine Global")) return "copernicus_global";
   return "auto";
+}
+
+wxString RemoteProviderId(const wxString& provider) {
+  if (IsMarineIeProvider(provider)) return "marine_ie_irish_sea";
+  return CopernicusProviderId(provider);
+}
+
+wxString MarineIeOutputFilename() {
+  return "marine_ie_irish_sea_current_" + wxDateTime::Now().ToUTC().Format("%Y%m%d_%H%M") + ".grb";
 }
 
 wxString JsonEscape(const wxString& value) {
@@ -113,7 +126,9 @@ CurrentGribDialog::CurrentGribDialog(wxWindow* parent)
   m_east = new wxTextCtrl(scrolled, wxID_ANY, "-2.5");
   m_north = new wxTextCtrl(scrolled, wxID_ANY, "56.5");
   wxString presets[] = {"Custom bbox", "Current chart area",
-                        "Irish Sea / North Channel example", "Tiny Copernicus connection test",
+                        "Irish Sea Marine Institute 3 day current GRIB",
+                        "Irish Sea / North Channel Copernicus example",
+                        "Tiny Copernicus connection test",
                         "Global Copernicus tiny connection test"};
   m_presetChoice = new wxChoice(scrolled, wxID_ANY, wxDefaultPosition, wxDefaultSize, WXSIZEOF(presets), presets);
   m_presetChoice->SetSelection(0);
@@ -126,12 +141,15 @@ CurrentGribDialog::CurrentGribDialog(wxWindow* parent)
   m_stepHours->SetValue(1);
 
   wxString providers[] = {"Auto", "Copernicus Marine North-West Shelf high-resolution currents",
-                          "Copernicus Marine Global currents", "Local NetCDF file", "Synthetic test source"};
+                          "Copernicus Marine Global currents",
+                          "Marine Institute Ireland Irish Sea currents, 3 day",
+                          "Local NetCDF file", "Synthetic test source"};
   m_provider = new wxChoice(scrolled, wxID_ANY, wxDefaultPosition, wxDefaultSize, WXSIZEOF(providers), providers);
   m_provider->SetSelection(1);
   m_username = new wxTextCtrl(scrolled, wxID_ANY);
   m_password = new wxTextCtrl(scrolled, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_PASSWORD);
   m_rememberUsername = new wxCheckBox(scrolled, wxID_ANY, "Remember username");
+  m_providerNote = new wxStaticText(scrolled, wxID_ANY, "");
   m_localNetcdf = new wxFilePickerCtrl(scrolled, wxID_ANY, "", "Select NetCDF file", "*.nc;*.nc4");
   m_outputDir = new wxDirPickerCtrl(scrolled, wxID_ANY, DefaultOutputDirectory());
   m_outputFile = new wxTextCtrl(scrolled, wxID_ANY, DefaultOutputFilename());
@@ -156,6 +174,7 @@ CurrentGribDialog::CurrentGribDialog(wxWindow* parent)
   addRow("Data source", m_provider);
   addRow("Copernicus username", m_username);
   addRow("Copernicus password", m_password);
+  addRow("Provider note", m_providerNote);
   addRow("Local NetCDF", m_localNetcdf);
   addRow("Output directory", m_outputDir);
   auto* outputFileSizer = new wxBoxSizer(wxHORIZONTAL);
@@ -197,6 +216,7 @@ CurrentGribDialog::CurrentGribDialog(wxWindow* parent)
   m_generateButton->Bind(wxEVT_BUTTON, &CurrentGribDialog::OnGenerate, this);
   outputBrowse->Bind(wxEVT_BUTTON, &CurrentGribDialog::OnBrowseOutput, this);
   m_presetChoice->Bind(wxEVT_CHOICE, &CurrentGribDialog::OnPresetChanged, this);
+  m_provider->Bind(wxEVT_CHOICE, &CurrentGribDialog::OnProviderChanged, this);
   m_cancelButton->Bind(wxEVT_BUTTON, &CurrentGribDialog::OnCancel, this);
   m_closeButton->Bind(wxEVT_BUTTON, &CurrentGribDialog::OnClose, this);
   Bind(wxEVT_CLOSE_WINDOW, &CurrentGribDialog::OnDialogClose, this);
@@ -204,6 +224,7 @@ CurrentGribDialog::CurrentGribDialog(wxWindow* parent)
   Bind(wxEVT_END_PROCESS, &CurrentGribDialog::OnProcessTerminated, this);
 
   AppendLog("Generated current GRIBs are model data for planning and experimentation, not official navigation products.");
+  UpdateProviderUi();
   SetBusy(false);
 }
 
@@ -235,13 +256,14 @@ void CurrentGribDialog::OnGenerate(wxCommandEvent&) {
     wxMessageBox(message, "Missing NetCDF file", wxOK | wxICON_WARNING, this);
     return;
   }
-  if (IsCopernicusProvider(provider) && (m_username->GetValue().empty() || m_password->GetValue().empty())) {
+  bool autoMarine = provider == "Auto" && AutoWouldUseMarineIe();
+  if (IsCopernicusProvider(provider) && !autoMarine && (m_username->GetValue().empty() || m_password->GetValue().empty())) {
     wxString message = "Enter your Copernicus Marine username and password for this operation. The password is held in memory only and is not passed on the command line.";
     AppendLog(message);
     wxMessageBox(message, "Missing Copernicus credentials", wxOK | wxICON_WARNING, this);
     return;
   }
-  if (IsCopernicusProvider(provider) && !ConfirmLargeCopernicusRequest()) {
+  if (IsCopernicusProvider(provider) && !autoMarine && !ConfirmLargeCopernicusRequest()) {
     AppendLog("Generation cancelled before launch.");
     return;
   }
@@ -250,7 +272,7 @@ void CurrentGribDialog::OnGenerate(wxCommandEvent&) {
   if (!output.DirExists()) {
     output.Mkdir(wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL);
   }
-  if (IsCopernicusProvider(provider)) {
+  if (IsCopernicusProvider(provider) && !autoMarine) {
     wxFileName downloadDir;
     downloadDir.AssignDir(m_outputDir->GetPath());
     downloadDir.AppendDir("currentgrib_downloads");
@@ -259,7 +281,8 @@ void CurrentGribDialog::OnGenerate(wxCommandEvent&) {
     }
   }
   AppendLog("Starting generation...");
-  StartCommand(command, m_password->GetValue(), true);
+  wxString childPassword = (IsCopernicusProvider(provider) && !autoMarine) ? m_password->GetValue() : "";
+  StartCommand(command, childPassword, true);
 }
 
 void CurrentGribDialog::OnBrowseOutput(wxCommandEvent&) {
@@ -274,6 +297,10 @@ void CurrentGribDialog::OnBrowseOutput(wxCommandEvent&) {
 
 void CurrentGribDialog::OnPresetChanged(wxCommandEvent& event) {
   ApplyPreset(event.GetSelection());
+}
+
+void CurrentGribDialog::OnProviderChanged(wxCommandEvent&) {
+  UpdateProviderUi();
 }
 
 void CurrentGribDialog::ApplyPreset(int selection) {
@@ -306,6 +333,19 @@ void CurrentGribDialog::ApplyPreset(int selection) {
     return;
   }
   if (selection == 2) {
+    m_west->SetValue("-6.994");
+    m_south->SetValue("51.506");
+    m_east->SetValue("-4.006");
+    m_north->SetValue("55.494");
+    m_durationHours->SetValue(72);
+    m_stepHours->SetValue(1);
+    m_provider->SetSelection(3);
+    m_outputFile->SetValue(MarineIeOutputFilename());
+    UpdateProviderUi();
+    AppendLog("Applied Irish Sea Marine Institute 3 day current GRIB preset.");
+    return;
+  }
+  if (selection == 3) {
     m_west->SetValue("-8.5");
     m_south->SetValue("50.5");
     m_east->SetValue("-2.5");
@@ -315,10 +355,11 @@ void CurrentGribDialog::ApplyPreset(int selection) {
     m_stepHours->SetValue(1);
     m_provider->SetSelection(1);
     m_outputFile->SetValue("plugin_copernicus_live_current_test.grb");
+    UpdateProviderUi();
     AppendLog("Applied Irish Sea / North Channel example preset.");
     return;
   }
-  if (selection == 3) {
+  if (selection == 4) {
     m_west->SetValue("-5.5");
     m_south->SetValue("53.0");
     m_east->SetValue("-5.0");
@@ -328,10 +369,11 @@ void CurrentGribDialog::ApplyPreset(int selection) {
     m_stepHours->SetValue(1);
     m_provider->SetSelection(1);
     m_outputFile->SetValue("plugin_copernicus_live_tiny_test.grb");
+    UpdateProviderUi();
     AppendLog("Applied Tiny Copernicus connection test preset.");
     return;
   }
-  if (selection == 4) {
+  if (selection == 5) {
     m_west->SetValue("-40.5");
     m_south->SetValue("30.0");
     m_east->SetValue("-40.0");
@@ -341,8 +383,36 @@ void CurrentGribDialog::ApplyPreset(int selection) {
     m_stepHours->SetValue(1);
     m_provider->SetSelection(2);
     m_outputFile->SetValue("plugin_copernicus_global_tiny_test.grb");
+    UpdateProviderUi();
     AppendLog("Applied Global Copernicus tiny connection test preset.");
   }
+}
+
+bool CurrentGribDialog::AutoWouldUseMarineIe() const {
+  double west = 0.0;
+  double south = 0.0;
+  double east = 0.0;
+  double north = 0.0;
+  bool parsed = m_west->GetValue().ToDouble(&west) && m_south->GetValue().ToDouble(&south) &&
+                m_east->GetValue().ToDouble(&east) && m_north->GetValue().ToDouble(&north);
+  return parsed && west >= -6.994 && east <= -4.006 && south >= 51.506 && north <= 55.494 &&
+         m_durationHours->GetValue() <= 72;
+}
+
+void CurrentGribDialog::UpdateProviderUi() {
+  wxString provider = m_provider->GetStringSelection();
+  bool marine = IsMarineIeProvider(provider);
+  m_username->Enable(!marine);
+  m_password->Enable(!marine);
+  m_rememberUsername->Enable(!marine);
+  if (marine) {
+    m_providerNote->SetLabel("Downloads a ready-made 3-day Irish Sea current GRIB from Marine Institute Ireland. No Copernicus account required.");
+  } else if (provider == "Auto") {
+    m_providerNote->SetLabel("Auto prefers Marine Institute Ireland inside its Irish Sea coverage for up to 72 hours, then Copernicus NWS, then Copernicus Global.");
+  } else {
+    m_providerNote->SetLabel("");
+  }
+  Layout();
 }
 
 bool CurrentGribDialog::ConfirmLargeCopernicusRequest() {
@@ -563,21 +633,24 @@ void CurrentGribDialog::TryOpenGeneratedGrib() {
 
 wxString CurrentGribDialog::BuildGenerateCommand() const {
   wxString provider = m_provider->GetStringSelection();
-  if (IsCopernicusProvider(provider)) {
+  if (IsCopernicusProvider(provider) || IsMarineIeProvider(provider)) {
     wxFileName downloadDir;
     downloadDir.AssignDir(m_outputDir->GetPath());
     downloadDir.AppendDir("currentgrib_downloads");
-    return ShellQuote(m_generatorPath->GetValue()) + " generate-copernicus --bbox " +
+    wxString command = ShellQuote(m_generatorPath->GetValue()) + " generate-provider --provider " +
+           RemoteProviderId(provider) + " --bbox " +
            ShellQuote(m_west->GetValue()) + " " + ShellQuote(m_south->GetValue()) + " " +
            ShellQuote(m_east->GetValue()) + " " + ShellQuote(m_north->GetValue()) +
-           " --provider " + CopernicusProviderId(provider) +
            " --start " + ShellQuote(m_startUtc->GetValue()) +
            " --hours " + wxString::Format("%d", m_durationHours->GetValue()) +
            " --step-hours " + wxString::Format("%d", m_stepHours->GetValue()) +
            " --download-directory " + ShellQuote(downloadDir.GetPath()) +
-           " --output " + ShellQuote(OutputPath()) +
-           " --username " + ShellQuote(m_username->GetValue()) +
-           " --overwrite --metadata-summary --verbose";
+           " --output " + ShellQuote(OutputPath());
+    if (!m_username->GetValue().empty()) {
+      command += " --username " + ShellQuote(m_username->GetValue());
+    }
+    command += " --overwrite --metadata-summary --verbose";
+    return command;
   }
   wxString source = "synthetic";
   wxString extra;

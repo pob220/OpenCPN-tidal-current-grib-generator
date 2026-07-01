@@ -15,6 +15,14 @@ class GribScanResult:
     byte_count: int
 
 
+@dataclass(frozen=True)
+class GribNormalizeResult:
+    message_count: int
+    raw_byte_count: int
+    clean_byte_count: int
+    skipped_byte_count: int
+
+
 def scan_grib_messages(path: Path) -> GribScanResult:
     """Validate that each message starts with GRIB and ends with 7777."""
 
@@ -42,6 +50,55 @@ def scan_grib_messages(path: Path) -> GribScanResult:
         offset += length
         count += 1
     return GribScanResult(message_count=count, byte_count=len(data))
+
+
+def normalize_grib_stream(input_path: Path, output_path: Path) -> GribNormalizeResult:
+    """Extract complete GRIB messages from a provider file with wrappers/padding.
+
+    Generated files should keep using `scan_grib_messages`, which requires a strict
+    contiguous stream. This helper is for imported/provider files where harmless
+    non-GRIB bytes may appear before, between, or after valid messages.
+    """
+
+    data = input_path.read_bytes()
+    offset = 0
+    skipped = 0
+    count = 0
+    clean = bytearray()
+    while offset < len(data):
+        marker = data.find(b"GRIB", offset)
+        if marker < 0:
+            skipped += len(data) - offset
+            break
+        skipped += marker - offset
+        if marker + 8 > len(data):
+            raise ValidationError(f"truncated GRIB header at byte offset {marker}")
+        edition = data[marker + 7]
+        if edition == 1:
+            length = int.from_bytes(data[marker + 4 : marker + 7], "big")
+        elif edition == 2:
+            if marker + 16 > len(data):
+                raise ValidationError(f"truncated GRIB2 header at byte offset {marker}")
+            length = int.from_bytes(data[marker + 8 : marker + 16], "big")
+        else:
+            raise ValidationError(f"unsupported GRIB edition {edition} at byte offset {marker}")
+        if length <= 0 or marker + length > len(data):
+            raise ValidationError(f"invalid GRIB message length {length} at byte offset {marker}")
+        if data[marker + length - 4 : marker + length] != b"7777":
+            raise ValidationError(f"GRIB terminator not found for message at byte offset {marker}")
+        clean.extend(data[marker : marker + length])
+        count += 1
+        offset = marker + length
+    if count == 0:
+        raise ValidationError(f"no complete GRIB messages found in {input_path}")
+    output_path.write_bytes(bytes(clean))
+    scan_grib_messages(output_path)
+    return GribNormalizeResult(
+        message_count=count,
+        raw_byte_count=len(data),
+        clean_byte_count=len(clean),
+        skipped_byte_count=skipped,
+    )
 
 
 def inspect_grib(path: Path) -> dict[str, Any]:

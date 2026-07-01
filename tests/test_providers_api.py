@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import ftplib
 import logging
 import os
 import sys
@@ -13,6 +14,11 @@ from tidal_current_grib_generator.cli import main
 from tidal_current_grib_generator.copernicus import CopernicusDownloadRequest, download_copernicus_subset
 from tidal_current_grib_generator.dependencies import check_dependencies
 from tidal_current_grib_generator.geo import BoundingBox
+from tidal_current_grib_generator.marine_ie import (
+    _download_ftp,
+    download_marine_ie_irish_sea_grib,
+    validate_direct_current_grib,
+)
 from tidal_current_grib_generator.providers import ProviderRegistry, select_best_provider_for_bbox
 from tidal_current_grib_generator.security import REDACTED, redact_mapping
 from tidal_current_grib_generator.sources.netcdf import _regular_spacing
@@ -21,6 +27,35 @@ from tidal_current_grib_generator.sources.netcdf import _regular_spacing
 def test_provider_selection_prefers_nws_for_irish_sea():
     bbox = BoundingBox(-8.5, 50.5, -2.5, 56.5)
     provider = select_best_provider_for_bbox(bbox, registry=ProviderRegistry())
+    assert provider is not None
+    assert provider.id == "copernicus_nws"
+
+
+def test_provider_registry_includes_marine_ie_provider():
+    provider = ProviderRegistry().get("marine_ie_irish_sea")
+    assert provider.implemented is True
+    assert provider.provider_type == "direct_current_grib"
+    assert provider.nominal_duration_hours == 72
+    assert provider.default_step_hours == 1
+
+
+def test_provider_selection_prefers_marine_ie_inside_coverage_for_72h():
+    bbox = BoundingBox(-6.0, 52.0, -5.0, 54.0)
+    provider = select_best_provider_for_bbox(bbox, duration_hours=72, registry=ProviderRegistry())
+    assert provider is not None
+    assert provider.id == "marine_ie_irish_sea"
+
+
+def test_provider_selection_skips_marine_ie_for_longer_duration():
+    bbox = BoundingBox(-6.0, 52.0, -5.0, 54.0)
+    provider = select_best_provider_for_bbox(bbox, duration_hours=73, registry=ProviderRegistry())
+    assert provider is not None
+    assert provider.id == "copernicus_nws"
+
+
+def test_provider_selection_skips_marine_ie_outside_coverage():
+    bbox = BoundingBox(-8.5, 50.5, -2.5, 56.5)
+    provider = select_best_provider_for_bbox(bbox, duration_hours=72, registry=ProviderRegistry())
     assert provider is not None
     assert provider.id == "copernicus_nws"
 
@@ -161,6 +196,251 @@ def test_download_copernicus_cli_accepts_hours(monkeypatch, tmp_path: Path, caps
     assert rc == 0
     assert calls["kwargs"]["end_datetime"].isoformat() == "2026-07-01T05:00:00+00:00"
     assert "secret" not in capsys.readouterr().out
+
+
+def test_generate_provider_downloads_marine_ie_with_mock(monkeypatch, tmp_path: Path, capsys):
+    calls = {}
+
+    class FakeResult:
+        output = tmp_path / "marine.grb"
+        inspection = {
+            "message_count": 2,
+            "byte_count": 24,
+            "current_component_counts": {"u_49": 1, "v_50": 1},
+        }
+
+        def as_dict(self):
+            return {"output": str(self.output), "inspection": self.inspection}
+
+    def fake_download(output, overwrite=False, progress_callback=None):
+        calls["output"] = output
+        calls["overwrite"] = overwrite
+        if progress_callback:
+            progress_callback("download complete", {"output": str(output), "message_count": 2, "byte_count": 24})
+        return FakeResult()
+
+    monkeypatch.setattr("tidal_current_grib_generator.cli.download_marine_ie_irish_sea_grib", fake_download)
+    rc = main(
+        [
+            "generate-provider",
+            "--provider",
+            "marine_ie_irish_sea",
+            "--output",
+            str(tmp_path / "marine.grb"),
+            "--overwrite",
+            "--metadata-summary",
+            "--verbose",
+        ]
+    )
+    assert rc == 0
+    assert calls["output"] == tmp_path / "marine.grb"
+    assert calls["overwrite"] is True
+    output = capsys.readouterr().out
+    assert "Marine Institute Ireland Irish Sea currents" in output
+    assert "validated GRIB stream: 2 messages" in output
+
+
+def test_generate_provider_auto_selects_marine_ie(monkeypatch, tmp_path: Path, capsys):
+    class FakeResult:
+        output = tmp_path / "marine.grb"
+        inspection = {"message_count": 2, "byte_count": 24}
+
+        def as_dict(self):
+            return {"output": str(self.output), "inspection": self.inspection}
+
+    monkeypatch.setattr(
+        "tidal_current_grib_generator.cli.download_marine_ie_irish_sea_grib",
+        lambda output, overwrite=False, progress_callback=None: FakeResult(),
+    )
+    rc = main(
+        [
+            "generate-provider",
+            "--provider",
+            "auto",
+            "--bbox",
+            "-6.0",
+            "52.0",
+            "-5.0",
+            "54.0",
+            "--hours",
+            "72",
+            "--output",
+            str(tmp_path / "marine.grb"),
+            "--metadata-summary",
+        ]
+    )
+    assert rc == 0
+    assert "selected provider: marine_ie_irish_sea" in capsys.readouterr().out
+
+
+def test_direct_grib_validation_rejects_bad_stream(tmp_path: Path):
+    path = tmp_path / "bad.grb"
+    path.write_bytes(b"not grib")
+    with pytest.raises(Exception):
+        validate_direct_current_grib(path)
+
+
+def test_direct_grib_validation_accepts_mock_current_stream(monkeypatch, tmp_path: Path):
+    path = tmp_path / "mock.grb"
+    path.write_bytes(b"GRIB" + (12).to_bytes(3, "big") + bytes([1]) + b"7777")
+    monkeypatch.setattr(
+        "tidal_current_grib_generator.marine_ie.inspect_grib",
+        lambda p: {
+            "message_count": 1,
+            "byte_count": 12,
+            "edition_counts": {1: 1},
+            "stream_valid": True,
+            "eccodes_available": True,
+            "current_component_counts": {"u_49": 1, "v_50": 1},
+        },
+    )
+    inspection = validate_direct_current_grib(path)
+    assert inspection["current_component_counts"] == {"u_49": 1, "v_50": 1}
+
+
+def test_marine_ie_provider_normalizes_raw_download(monkeypatch, tmp_path: Path):
+    message = b"GRIB" + (12).to_bytes(3, "big") + b"\x01" + b"7777"
+
+    def fake_download(file_obj, timeout_seconds):
+        file_obj.write(b"header" + message + b"\r\r\n" + message + b"tail")
+
+    monkeypatch.setattr("tidal_current_grib_generator.marine_ie._download_ftp", fake_download)
+    monkeypatch.setattr(
+        "tidal_current_grib_generator.marine_ie.inspect_grib",
+        lambda p: {
+            "message_count": 2,
+            "byte_count": 24,
+            "edition_counts": {1: 2},
+            "stream_valid": True,
+            "eccodes_available": True,
+            "current_component_counts": {"u_49": 1, "v_50": 1},
+        },
+    )
+    output = tmp_path / "marine.grb"
+    result = download_marine_ie_irish_sea_grib(output, overwrite=True)
+    assert output.read_bytes() == message + message
+    assert result.inspection["raw_byte_count"] == len(b"header" + message + b"\r\r\n" + message + b"tail")
+    assert result.inspection["clean_byte_count"] == 24
+    assert result.inspection["skipped_byte_count"] == len(b"header\r\r\ntail")
+    assert result.inspection["extracted_message_count"] == 2
+
+
+def test_marine_ie_provider_removes_temp_output_on_validation_failure(monkeypatch, tmp_path: Path):
+    def fake_download(file_obj, timeout_seconds):
+        file_obj.write(b"not grib")
+
+    monkeypatch.setattr("tidal_current_grib_generator.marine_ie._download_ftp", fake_download)
+    output = tmp_path / "marine.grb"
+    with pytest.raises(Exception):
+        download_marine_ie_irish_sea_grib(output, overwrite=True)
+    assert not output.exists()
+
+
+class FakeMarineFTP:
+    instances = []
+
+    def __init__(self, *args, **kwargs):
+        self.cwd_calls = []
+        self.retr_calls = []
+        self.payload = b"payload"
+        self.base_pwd = "/D:/SFTPDATA/OSS"
+        self.fail_cwd = set()
+        self.fail_retr = set()
+        self.login_failed = False
+        FakeMarineFTP.instances.append(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def connect(self, host, port, timeout=None):
+        self.host = host
+        self.port = port
+
+    def login(self, user, password):
+        if self.login_failed:
+            raise ftplib.error_perm("530 login incorrect")
+
+    def set_pasv(self, enabled):
+        self.passive = enabled
+
+    def pwd(self):
+        return self.base_pwd
+
+    def cwd(self, path):
+        self.cwd_calls.append(path)
+        if path in self.fail_cwd:
+            raise ftplib.error_perm(f"550 {path}")
+
+    def retrbinary(self, command, callback):
+        self.retr_calls.append(command)
+        if command in self.fail_retr:
+            raise ftplib.error_perm(f"550 {command}")
+        callback(self.payload)
+
+
+def test_marine_ie_ftp_relative_cwd_success(monkeypatch):
+    FakeMarineFTP.instances = []
+    monkeypatch.setattr("tidal_current_grib_generator.marine_ie.ftplib.FTP", FakeMarineFTP)
+    sink = bytearray()
+    _download_ftp(types.SimpleNamespace(write=sink.extend), 60)
+    ftp = FakeMarineFTP.instances[0]
+    assert ftp.passive is True
+    assert ftp.cwd_calls == ["OSS/modelling/GRIB_Files"]
+    assert ftp.retr_calls == ["RETR irish_sea_ms.grb"]
+    assert sink == b"payload"
+
+
+def test_marine_ie_ftp_absolute_cwd_not_used_when_relative_succeeds(monkeypatch):
+    FakeMarineFTP.instances = []
+    monkeypatch.setattr("tidal_current_grib_generator.marine_ie.ftplib.FTP", FakeMarineFTP)
+    _download_ftp(types.SimpleNamespace(write=lambda data: None), 60)
+    ftp = FakeMarineFTP.instances[0]
+    assert "/OSS/modelling/GRIB_Files" not in ftp.cwd_calls
+    assert "/" not in ftp.cwd_calls
+
+
+def test_marine_ie_ftp_fallback_resets_to_base_not_slash(monkeypatch):
+    FakeMarineFTP.instances = []
+
+    class FallbackFTP(FakeMarineFTP):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.fail_cwd = {"OSS/modelling/GRIB_Files"}
+
+    monkeypatch.setattr("tidal_current_grib_generator.marine_ie.ftplib.FTP", FallbackFTP)
+    sink = bytearray()
+    _download_ftp(types.SimpleNamespace(write=sink.extend), 60)
+    ftp = FakeMarineFTP.instances[0]
+    assert ftp.cwd_calls == ["OSS/modelling/GRIB_Files", "/D:/SFTPDATA/OSS"]
+    assert "/" not in ftp.cwd_calls
+    assert ftp.retr_calls == ["RETR OSS/modelling/GRIB_Files/irish_sea_ms.grb"]
+    assert sink == b"payload"
+
+
+def test_marine_ie_ftp_retrieval_failure_reports_strategies(monkeypatch):
+    FakeMarineFTP.instances = []
+
+    class FailingFTP(FakeMarineFTP):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.fail_retr = {
+                "RETR irish_sea_ms.grb",
+                "RETR OSS/modelling/GRIB_Files/irish_sea_ms.grb",
+            }
+
+        def cwd(self, path):
+            super().cwd(path)
+            if path in {"OSS", "modelling", "GRIB_Files"}:
+                return
+
+    monkeypatch.setattr("tidal_current_grib_generator.marine_ie.ftplib.FTP", FailingFTP)
+    with pytest.raises(Exception, match="relative cwd OSS/modelling/GRIB_Files"):
+        _download_ftp(types.SimpleNamespace(write=lambda data: None), 60)
+    ftp = FakeMarineFTP.instances[0]
+    assert "/" not in ftp.cwd_calls
 
 
 def test_download_copernicus_cli_accepts_end(monkeypatch, tmp_path: Path):

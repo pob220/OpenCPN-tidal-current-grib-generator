@@ -24,6 +24,10 @@ class Provider:
     minimum_depth: float | None = None
     maximum_depth: float | None = None
     source_grid_regularity_tolerance: float = 1e-5
+    provider_type: str = "model"
+    nominal_duration_hours: int | None = None
+    max_duration_hours: int | None = None
+    source_url: str | None = None
 
     def supports_bbox(self, bbox: BoundingBox) -> bool:
         if self.coverage is None:
@@ -72,6 +76,22 @@ COPERNICUS_GLOBAL = Provider(
     source_grid_regularity_tolerance=5e-5,
 )
 
+MARINE_IE_IRISH_SEA = Provider(
+    id="marine_ie_irish_sea",
+    label="Marine Institute Ireland Irish Sea currents",
+    coverage=BoundingBox(-6.994, 51.506, -4.006, 55.494),
+    dataset_id=None,
+    variables=("49", "50"),
+    implemented=True,
+    resolution="ready-made Irish Sea current GRIB",
+    description="Ready-made OpenCPN-compatible Irish Sea current GRIB from Marine Institute Ireland.",
+    default_step_hours=1,
+    provider_type="direct_current_grib",
+    nominal_duration_hours=72,
+    max_duration_hours=72,
+    source_url="ftp://ftp.marine.ie/OSS/modelling/GRIB_Files/irish_sea_ms.grb",
+)
+
 LOCAL_NETCDF = Provider(
     id="local_netcdf",
     label="Local NetCDF file",
@@ -99,7 +119,7 @@ class ProviderRegistry:
     def __init__(self) -> None:
         self.providers = {
             provider.id: provider
-            for provider in (COPERNICUS_NWS, COPERNICUS_GLOBAL, LOCAL_NETCDF, SYNTHETIC)
+            for provider in (MARINE_IE_IRISH_SEA, COPERNICUS_NWS, COPERNICUS_GLOBAL, LOCAL_NETCDF, SYNTHETIC)
         }
 
     def get(self, provider_id: str) -> Provider:
@@ -113,10 +133,19 @@ def select_best_provider_for_bbox(
     bbox: BoundingBox,
     start: datetime | None = None,
     end: datetime | None = None,
+    duration_hours: int | None = None,
     registry: ProviderRegistry | None = None,
 ) -> Provider | None:
-    _ = (start, end)
+    if duration_hours is None and start is not None and end is not None:
+        duration_hours = int((end - start).total_seconds() // 3600)
     registry = registry or ProviderRegistry()
+    marine_ie = registry.get("marine_ie_irish_sea")
+    if (
+        marine_ie.implemented
+        and marine_ie.supports_bbox(bbox)
+        and (duration_hours is None or marine_ie.max_duration_hours is None or duration_hours <= marine_ie.max_duration_hours)
+    ):
+        return marine_ie
     nws = registry.get("copernicus_nws")
     if nws.implemented and nws.supports_bbox(bbox):
         return nws
@@ -133,10 +162,13 @@ def select_copernicus_provider(
 ) -> Provider:
     registry = registry or ProviderRegistry()
     if provider_id == "auto":
-        provider = select_best_provider_for_bbox(bbox, registry=registry)
-        if provider is None or not provider.id.startswith("copernicus_"):
-            raise ValueError("no implemented Copernicus provider supports the requested bbox")
-        return provider
+        nws = registry.get("copernicus_nws")
+        if nws.implemented and nws.supports_bbox(bbox):
+            return nws
+        global_provider = registry.get("copernicus_global")
+        if global_provider.implemented and global_provider.supports_bbox(bbox):
+            return global_provider
+        raise ValueError("no implemented Copernicus provider supports the requested bbox")
     provider = registry.get(provider_id)
     if not provider.id.startswith("copernicus_"):
         raise ValueError(f"{provider_id} is not a Copernicus provider")

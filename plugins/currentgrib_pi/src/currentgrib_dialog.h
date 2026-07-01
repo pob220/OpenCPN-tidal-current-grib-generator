@@ -19,6 +19,7 @@ private:
   void OnGenerate(wxCommandEvent& event);
   void OnBrowseOutput(wxCommandEvent& event);
   void OnPresetChanged(wxCommandEvent& event);
+  void OnProviderChanged(wxCommandEvent& event);
   void OnCancel(wxCommandEvent& event);
   void OnClose(wxCommandEvent& event);
   void OnDialogClose(wxCloseEvent& event);
@@ -33,6 +34,8 @@ private:
   void SetBusy(bool busy);
   void ApplyPreset(int selection);
   bool ConfirmLargeCopernicusRequest();
+  bool AutoWouldUseMarineIe() const;
+  void UpdateProviderUi();
   void TryOpenGeneratedGrib();
   wxString BuildGenerateCommand() const;
   wxString OutputPath() const;
@@ -52,6 +55,7 @@ private:
   wxTextCtrl* m_username;
   wxTextCtrl* m_password;
   wxCheckBox* m_rememberUsername;
+  wxStaticText* m_providerNote;
   wxFilePickerCtrl* m_localNetcdf;
   wxDirPickerCtrl* m_outputDir;
   wxTextCtrl* m_outputFile;

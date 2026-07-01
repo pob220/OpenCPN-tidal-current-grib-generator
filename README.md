@@ -91,11 +91,18 @@ Built-in sources:
 - `tpxo` / `pytmd`: pyTMD-backed astronomical tidal-current prediction from local user-supplied model files.
 - `netcdf`: local NetCDF current files, including Copernicus Marine files with u/v current components.
 
-Copernicus live-download providers:
+Remote providers:
 
+- `marine_ie_irish_sea`: Marine Institute Ireland ready-made Irish Sea current GRIB, about 3 days, no Copernicus login required.
 - `copernicus_nws`: North-West Shelf high-resolution currents for the UK/Ireland/North Sea/English Channel/Celtic Sea area, using `NWSHELF_ANALYSISFORECAST_PHY_004_013` / `cmems_mod_nws_phy-cur_anfc_1.5km-2D_PT1H-i`.
 - `copernicus_global`: lower-resolution rest-of-world currents, using `GLOBAL_ANALYSISFORECAST_PHY_001_024` / `cmems_mod_glo_phy_anfc_0.083deg_PT1H-m`.
-- `auto`: selects NWS when the bbox is inside NWS coverage, otherwise Global.
+- `auto`: selects Marine Institute Ireland inside its Irish Sea coverage for up to 72 hours, then NWS, otherwise Global.
+
+| Provider | Best for | Data type | Duration | Login |
+| --- | --- | --- | --- | --- |
+| Marine Institute Ireland Irish Sea currents | Irish Sea/North Channel where covered | ready-made current GRIB | about 3 days | no Copernicus login |
+| Copernicus NWS | UK/Ireland/North Sea/English Channel/Celtic Sea area | NetCDF model currents converted to GRIB | user selected | Copernicus login |
+| Copernicus Global | rest-of-world | NetCDF model currents converted to GRIB | user selected | Copernicus login |
 
 Register for a Copernicus Marine account at <https://data.marine.copernicus.eu/register>. Users are responsible for complying with Copernicus Marine terms.
 
@@ -183,6 +190,19 @@ tidal-current-grib generate-copernicus \
   --output ~/.opencpn/grib/generated/irish_sea_copernicus_current.grb \
   --metadata-summary
 ```
+
+## Download a ready-made Marine Institute Ireland current GRIB
+
+```bash
+tidal-current-grib generate-provider \
+  --provider marine_ie_irish_sea \
+  --output ~/.opencpn/grib/generated/marine_ie_irish_sea_current.grb \
+  --overwrite \
+  --metadata-summary \
+  --verbose
+```
+
+The downloaded file is already an OpenCPN-compatible current GRIB. The command validates the GRIB stream before moving it to the output path.
 
 Global fallback example:
 

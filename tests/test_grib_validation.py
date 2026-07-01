@@ -5,7 +5,7 @@ import pytest
 from tidal_current_grib_generator.errors import ValidationError
 from tidal_current_grib_generator.geo import BoundingBox, build_regular_grid, parse_utc_datetime
 from tidal_current_grib_generator.grib.read import sample_current_components
-from tidal_current_grib_generator.grib.validation import inspect_grib, scan_grib_messages
+from tidal_current_grib_generator.grib.validation import inspect_grib, normalize_grib_stream, scan_grib_messages
 from tidal_current_grib_generator.grib.writer import EccodesGrib1CurrentWriter
 from tidal_current_grib_generator.sources.synthetic import ConstantCurrentSource
 
@@ -34,6 +34,36 @@ def test_grib_message_scan_rejects_bad_terminator(tmp_path: Path):
     path.write_bytes(b"GRIB" + (12).to_bytes(3, "big") + b"\x01" + b"xxxx")
     with pytest.raises(ValidationError):
         scan_grib_messages(path)
+
+
+def test_strict_scan_rejects_junk_between_messages(tmp_path: Path):
+    message = b"GRIB" + (12).to_bytes(3, "big") + b"\x01" + b"7777"
+    path = tmp_path / "junk.grb"
+    path.write_bytes(message + b"\r\r\n" + message)
+    with pytest.raises(ValidationError, match="GRIB marker not found"):
+        scan_grib_messages(path)
+
+
+def test_normalize_grib_stream_accepts_junk_between_messages(tmp_path: Path):
+    message = b"GRIB" + (12).to_bytes(3, "big") + b"\x01" + b"7777"
+    raw = tmp_path / "raw.grb"
+    clean = tmp_path / "clean.grb"
+    raw.write_bytes(b"wrapper" + message + b"\r\r\n" + message + b"tail")
+    result = normalize_grib_stream(raw, clean)
+    assert result.message_count == 2
+    assert result.raw_byte_count == len(raw.read_bytes())
+    assert result.clean_byte_count == 24
+    assert result.skipped_byte_count == len(b"wrapper\r\r\ntail")
+    assert clean.read_bytes() == message + message
+    assert scan_grib_messages(clean).message_count == 2
+
+
+def test_normalize_grib_stream_rejects_truncated_message(tmp_path: Path):
+    raw = tmp_path / "truncated.grb"
+    clean = tmp_path / "clean.grb"
+    raw.write_bytes(b"junk" + b"GRIB" + (100).to_bytes(3, "big") + b"\x01" + b"short")
+    with pytest.raises(ValidationError, match="invalid GRIB message length"):
+        normalize_grib_stream(raw, clean)
 
 
 def test_eccodes_writer_round_trip_if_available(tmp_path: Path):

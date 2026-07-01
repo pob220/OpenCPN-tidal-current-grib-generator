@@ -22,6 +22,7 @@ from tidal_current_grib_generator.grib.validation import inspect_grib, scan_grib
 from tidal_current_grib_generator.grib.read import sample_current_components
 from tidal_current_grib_generator.grib.writer import EccodesGrib1CurrentWriter
 from tidal_current_grib_generator.model import components_to_speed_direction
+from tidal_current_grib_generator.marine_ie import download_marine_ie_irish_sea_grib
 from tidal_current_grib_generator.reference import compare_reference_csv
 from tidal_current_grib_generator.sources import create_source
 from tidal_current_grib_generator.sources.netcdf import NetCDFCurrentSource, inspect_netcdf, netcdf_time_metadata
@@ -140,6 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     providers = subparsers.add_parser("providers", help="List or auto-select providers.")
     providers.add_argument("--bbox", nargs=4, type=float, metavar=("W", "S", "E", "N"))
+    providers.add_argument("--hours", type=int, help="Requested duration for auto provider selection.")
     providers.add_argument("--json", action="store_true")
     providers.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     providers.set_defaults(func=cmd_providers)
@@ -203,6 +205,37 @@ def build_parser() -> argparse.ArgumentParser:
     generate_copernicus.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     generate_copernicus.add_argument("--debug", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     generate_copernicus.set_defaults(func=cmd_generate_copernicus)
+
+    generate_provider = subparsers.add_parser(
+        "generate-provider",
+        help="Generate/download using a named provider, including direct-current GRIB providers.",
+    )
+    generate_provider.add_argument(
+        "--provider",
+        choices=["auto", "marine_ie_irish_sea", "copernicus_nws", "copernicus_global"],
+        required=True,
+    )
+    generate_provider.add_argument("--bbox", nargs=4, type=float, metavar=("W", "S", "E", "N"))
+    generate_provider.add_argument("--start")
+    generate_provider_end = generate_provider.add_mutually_exclusive_group()
+    generate_provider_end.add_argument("--end")
+    generate_provider_end.add_argument("--hours", type=int)
+    generate_provider.add_argument("--step-hours", type=int)
+    generate_provider.add_argument("--grid-spacing-deg", type=float, default=0.03)
+    generate_provider.add_argument("--source-grid-regularity-tolerance", type=float)
+    generate_provider.add_argument("--download-directory", type=Path)
+    generate_provider.add_argument("--download-filename")
+    generate_provider.add_argument("--output", type=Path, required=True)
+    generate_provider.add_argument("--username")
+    generate_provider.add_argument("--password-env", default="CURRENTGRIB_COPERNICUS_PASSWORD")
+    generate_provider.add_argument("--username-env", default="CURRENTGRIB_TEST_COPERNICUS_USERNAME")
+    generate_provider.add_argument("--overwrite", action="store_true")
+    generate_provider.add_argument("--dry-run", action="store_true")
+    generate_provider.add_argument("--json", action="store_true")
+    generate_provider.add_argument("--metadata-summary", action="store_true")
+    generate_provider.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    generate_provider.add_argument("--debug", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    generate_provider.set_defaults(func=cmd_generate_provider)
     return parser
 
 
@@ -398,7 +431,7 @@ def cmd_providers(args: argparse.Namespace) -> int:
     data: dict[str, Any] = {"providers": [provider.as_dict() for provider in registry.list()]}
     if args.bbox:
         bbox = BoundingBox.from_values(args.bbox)
-        selected = select_best_provider_for_bbox(bbox, registry=registry)
+        selected = select_best_provider_for_bbox(bbox, duration_hours=args.hours, registry=registry)
         data["selected"] = selected.as_dict() if selected else None
     if args.json:
         print(json.dumps(data, indent=2, sort_keys=True))
@@ -408,6 +441,82 @@ def cmd_providers(args: argparse.Namespace) -> int:
         if "selected" in data:
             print(f"selected: {data['selected']['id'] if data['selected'] else '(none)'}")
     return 0
+
+
+def cmd_generate_provider(args: argparse.Namespace) -> int:
+    provider_id = args.provider
+    if provider_id == "auto":
+        if not args.bbox:
+            raise ValidationError("--bbox is required when --provider auto is used")
+        selected = select_best_provider_for_bbox(
+            BoundingBox.from_values(args.bbox),
+            duration_hours=args.hours,
+            registry=ProviderRegistry(),
+        )
+        if selected is None:
+            raise ValidationError("no implemented provider supports the requested bbox")
+        provider_id = selected.id
+        if args.metadata_summary:
+            print(f"selected provider: {provider_id} ({selected.label})", flush=True)
+
+    if provider_id == "marine_ie_irish_sea":
+        if args.dry_run:
+            data = {
+                "provider": provider_id,
+                "output": str(args.output.expanduser()),
+                "dry_run": True,
+                "operation": "download ready-made current GRIB",
+            }
+            print(json.dumps(data, indent=2, sort_keys=True) if args.json else f"planned output: {args.output}")
+            return 0
+        if args.metadata_summary:
+            print("checking inputs", flush=True)
+            print("selected provider: marine_ie_irish_sea (Marine Institute Ireland Irish Sea currents)", flush=True)
+            print("downloading ready-made current GRIB", flush=True)
+        result = download_marine_ie_irish_sea_grib(
+            args.output,
+            overwrite=args.overwrite,
+            progress_callback=_direct_grib_progress_callback(args.verbose),
+        )
+        if args.metadata_summary:
+            print("validating GRIB stream", flush=True)
+        if args.json:
+            print(json.dumps(result.as_dict(), indent=2, sort_keys=True))
+        else:
+            inspection = result.inspection
+            print(f"wrote current GRIB: {result.output}", flush=True)
+            if inspection.get("raw_byte_count") is not None:
+                print(f"raw downloaded size: {inspection.get('raw_byte_count')} bytes", flush=True)
+                print(f"cleaned GRIB size: {inspection.get('clean_byte_count')} bytes", flush=True)
+                print(f"skipped non-GRIB bytes: {inspection.get('skipped_byte_count')}", flush=True)
+            print(f"validated GRIB stream: {inspection.get('message_count')} messages", flush=True)
+            if inspection.get("edition_counts"):
+                print(f"edition counts: {inspection.get('edition_counts')}", flush=True)
+            if inspection.get("parameter_counts"):
+                print(f"parameter counts: {inspection.get('parameter_counts')}", flush=True)
+            if inspection.get("current_component_counts"):
+                print(f"current components: {inspection.get('current_component_counts')}", flush=True)
+            if inspection.get("first_valid_time") or inspection.get("last_valid_time"):
+                print(
+                    f"valid time range: {inspection.get('first_valid_time')} to {inspection.get('last_valid_time')}",
+                    flush=True,
+                )
+            print("complete", flush=True)
+        return 0
+
+    if provider_id in {"copernicus_nws", "copernicus_global"}:
+        if not args.bbox:
+            raise ValidationError("--bbox is required for Copernicus providers")
+        if not args.start:
+            raise ValidationError("--start is required for Copernicus providers")
+        if args.hours is None and args.end is None:
+            raise ValidationError("one of --hours or --end is required for Copernicus providers")
+        if args.download_directory is None:
+            raise ValidationError("--download-directory is required for Copernicus providers")
+        args.provider = provider_id
+        return cmd_generate_copernicus(args)
+
+    raise ValidationError(f"unsupported provider for generate-provider: {provider_id}")
 
 
 def _select_copernicus_provider(provider_id: str, bbox: BoundingBox) -> Provider:
@@ -815,6 +924,24 @@ def _generate_copernicus_progress_callback(verbose: bool):
             print(f"converting {details.get('steps')} time steps to GRIB", flush=True)
         elif step == "validating GRIB":
             print(f"validated generated stream: {details.get('messages')} messages", flush=True)
+
+    return callback
+
+
+def _direct_grib_progress_callback(verbose: bool):
+    if not verbose:
+        return None
+
+    def callback(step: str, details: dict[str, Any]) -> None:
+        if step == "downloading Marine Institute GRIB":
+            print("downloading Marine Institute Ireland current GRIB", flush=True)
+        elif step == "download complete":
+            print(
+                f"downloaded GRIB: {details.get('output')} "
+                f"({details.get('message_count')} messages, {details.get('byte_count')} bytes cleaned, "
+                f"{details.get('raw_byte_count')} bytes raw, {details.get('skipped_byte_count')} skipped)",
+                flush=True,
+            )
 
     return callback
 
