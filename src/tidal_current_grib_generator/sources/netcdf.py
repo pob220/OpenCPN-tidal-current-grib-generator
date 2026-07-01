@@ -62,6 +62,8 @@ class NetCDFCurrentSource(CurrentSource):
     depth_value: float | None = None
     assume_units: str | None = None
     nearest_time: bool = False
+    coverage_tolerance_deg: float = 0.02
+    use_source_grid: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "input_netcdf", self.input_netcdf.expanduser())
@@ -92,7 +94,7 @@ class NetCDFCurrentSource(CurrentSource):
                 self.lon_variable,
                 self.time_variable,
             )
-            _assert_spatial_coverage(dataset, spec, bbox)
+            _assert_spatial_coverage(dataset, spec, bbox, self.coverage_tolerance_deg)
             data_u = _select_depth(dataset[spec.u_name], dataset, spec, self.depth_index, self.depth_value)
             data_v = _select_depth(dataset[spec.v_name], dataset, spec, self.depth_index, self.depth_value)
             data_u = _select_time(data_u, spec.time_name, time, self.nearest_time)
@@ -100,12 +102,26 @@ class NetCDFCurrentSource(CurrentSource):
             data_u = _prepare_spatial(data_u, spec)
             data_v = _prepare_spatial(data_v, spec)
             target_lons = _target_longitudes_for_source(grid.longitudes, dataset[spec.lon_name].values)
-            interp_kwargs = {
-                spec.lat_name: grid.latitudes,
-                spec.lon_name: target_lons,
-            }
-            u_interp = data_u.interp(interp_kwargs)
-            v_interp = data_v.interp(interp_kwargs)
+            if self.use_source_grid:
+                selection = {spec.lat_name: grid.latitudes, spec.lon_name: target_lons}
+                data_u = data_u.sel(selection)
+                data_v = data_v.sel(selection)
+            interpolation_used = _grid_differs_from_source(
+                grid.latitudes,
+                target_lons,
+                np.asarray(data_u[spec.lat_name].values, dtype=float),
+                np.asarray(data_u[spec.lon_name].values, dtype=float),
+            )
+            if interpolation_used:
+                interp_kwargs = {
+                    spec.lat_name: grid.latitudes,
+                    spec.lon_name: target_lons,
+                }
+                u_interp = data_u.interp(interp_kwargs)
+                v_interp = data_v.interp(interp_kwargs)
+            else:
+                u_interp = data_u
+                v_interp = data_v
             u_values = _array_values(u_interp, grid.shape)
             v_values = _array_values(v_interp, grid.shape)
             u_values = _convert_units(u_values, data_u.attrs.get("units"), self.assume_units, spec.u_name)
@@ -121,6 +137,104 @@ class NetCDFCurrentSource(CurrentSource):
 
     def inspect(self) -> dict[str, Any]:
         return inspect_netcdf(self.input_netcdf)
+
+    def source_bounds(self) -> BoundingBox:
+        self.validate_available()
+        xr = _import_xarray()
+        with xr.open_dataset(self.input_netcdf) as dataset:
+            spec = _detect_spec(
+                dataset,
+                self.u_variable,
+                self.v_variable,
+                self.lat_variable,
+                self.lon_variable,
+                self.time_variable,
+            )
+            lat_min, lat_max = _coord_range(dataset[spec.lat_name].values)
+            lon_min, lon_max = _coord_range(_display_longitudes(dataset[spec.lon_name].values))
+            return BoundingBox(lon_min, lat_min, lon_max, lat_max)
+
+    def clip_bbox_to_source(self, bbox: BoundingBox) -> BoundingBox:
+        source = self.source_bounds()
+        clipped = BoundingBox(
+            max(bbox.west, source.west),
+            max(bbox.south, source.south),
+            min(bbox.east, source.east),
+            min(bbox.north, source.north),
+        )
+        clipped.validate()
+        return clipped
+
+    def build_source_grid(self, bbox: BoundingBox) -> RegularGrid:
+        self.validate_available()
+        xr = _import_xarray()
+        with xr.open_dataset(self.input_netcdf) as dataset:
+            spec = _detect_spec(
+                dataset,
+                self.u_variable,
+                self.v_variable,
+                self.lat_variable,
+                self.lon_variable,
+                self.time_variable,
+            )
+            _assert_spatial_coverage(dataset, spec, bbox, self.coverage_tolerance_deg)
+            lats = np.asarray(dataset[spec.lat_name].values, dtype=float)
+            lons = _display_longitudes(dataset[spec.lon_name].values)
+            lats = np.sort(lats[(lats >= bbox.south) & (lats <= bbox.north)])
+            lons = np.sort(lons[(lons >= bbox.west) & (lons <= bbox.east)])
+            if lats.size < 2 or lons.size < 2:
+                raise ValidationError("source grid selection must contain at least two latitude and longitude points")
+            lat_spacing = _regular_spacing(lats, "latitude")
+            lon_spacing = _regular_spacing(lons, "longitude")
+            return RegularGrid(
+                latitudes=lats,
+                longitudes=lons,
+                spacing_deg=float(max(abs(lat_spacing), abs(lon_spacing))),
+                latitude_spacing_deg=float(abs(lat_spacing)),
+                longitude_spacing_deg=float(abs(lon_spacing)),
+            )
+
+    def metadata(self, bbox: BoundingBox, grid: RegularGrid) -> dict[str, Any]:
+        data = inspect_netcdf(self.input_netcdf)
+        source_bounds = self.source_bounds()
+        detected_u = data.get("detected_u_variable")
+        detected_v = data.get("detected_v_variable")
+        units = data.get("variable_units", {})
+        source_lats = None
+        source_lons = None
+        interpolation_used = True
+        try:
+            xr = _import_xarray()
+            with xr.open_dataset(self.input_netcdf) as dataset:
+                spec = _detect_spec(
+                    dataset,
+                    self.u_variable,
+                    self.v_variable,
+                    self.lat_variable,
+                    self.lon_variable,
+                    self.time_variable,
+                )
+                source_lats = np.asarray(dataset[spec.lat_name].values, dtype=float)
+                source_lons = _display_longitudes(dataset[spec.lon_name].values)
+                interpolation_used = _grid_differs_from_source(grid.latitudes, grid.longitudes, source_lats, source_lons)
+        except Exception:
+            interpolation_used = not self.use_source_grid
+        return {
+            "input_file": str(self.input_netcdf),
+            "source_bounds": {
+                "west": source_bounds.west,
+                "south": source_bounds.south,
+                "east": source_bounds.east,
+                "north": source_bounds.north,
+            },
+            "u_variable": detected_u,
+            "v_variable": detected_v,
+            "units": {
+                "u": units.get(detected_u, "") if detected_u else "",
+                "v": units.get(detected_v, "") if detected_v else "",
+            },
+            "interpolation_used": interpolation_used,
+        }
 
 
 @dataclass(frozen=True)
@@ -195,19 +309,29 @@ def _first_present(names: Any, candidates: tuple[str, ...], label: str) -> str:
     raise ValidationError(f"could not auto-detect {label}; provide it explicitly")
 
 
-def _assert_spatial_coverage(dataset: Any, spec: _NetCDFSpec, bbox: BoundingBox) -> None:
+def _assert_spatial_coverage(
+    dataset: Any,
+    spec: _NetCDFSpec,
+    bbox: BoundingBox,
+    tolerance_deg: float = 0.02,
+) -> None:
     lat_values = np.asarray(dataset[spec.lat_name].values, dtype=float)
     lon_values = np.asarray(dataset[spec.lon_name].values, dtype=float)
-    source_west, source_east = _coord_range(lon_values)
+    source_west, source_east = _coord_range(_display_longitudes(lon_values))
     west, east = _target_longitudes_for_source(np.asarray([bbox.west, bbox.east]), lon_values)
     lat_min, lat_max = _coord_range(lat_values)
-    if bbox.south < lat_min or bbox.north > lat_max:
+    if bbox.south < lat_min - tolerance_deg or bbox.north > lat_max + tolerance_deg:
         raise ValidationError(
-            f"requested bbox latitude range [{bbox.south}, {bbox.north}] is outside source [{lat_min}, {lat_max}]"
+            "requested bbox latitude range "
+            f"[{bbox.south}, {bbox.north}] is outside source [{lat_min}, {lat_max}] "
+            f"with tolerance {tolerance_deg} deg; use --clip-bbox-to-source or an inset bbox"
         )
-    if float(west) < source_west or float(east) > source_east:
+    display_west, display_east = _display_longitudes(np.asarray([west, east], dtype=float))
+    if float(display_west) < source_west - tolerance_deg or float(display_east) > source_east + tolerance_deg:
         raise ValidationError(
-            f"requested bbox longitude range [{bbox.west}, {bbox.east}] is outside source [{source_west}, {source_east}]"
+            "requested bbox longitude range "
+            f"[{bbox.west}, {bbox.east}] is outside source [{source_west}, {source_east}] "
+            f"with tolerance {tolerance_deg} deg; use --clip-bbox-to-source or an inset bbox"
         )
 
 
@@ -280,6 +404,13 @@ def _target_longitudes_for_source(longitudes: np.ndarray, source_longitudes: np.
     return longitudes
 
 
+def _display_longitudes(longitudes: Any) -> np.ndarray:
+    values = np.asarray(longitudes, dtype=float)
+    if np.nanmin(values) >= 0.0 and np.nanmax(values) > 180.0:
+        return ((values + 180.0) % 360.0) - 180.0
+    return values
+
+
 def _convert_units(values: np.ndarray, units_attr: Any, assume_units: str | None, variable: str) -> np.ndarray:
     units = _normalize_units(assume_units or str(units_attr or ""))
     if units == "mps":
@@ -308,6 +439,27 @@ def _array_values(data: Any, expected_shape: tuple[int, int]) -> np.ndarray:
     if values.shape == (expected_shape[1], expected_shape[0]):
         return values.T
     raise ValidationError(f"interpolated NetCDF data has shape {values.shape}, expected {expected_shape}")
+
+
+def _grid_differs_from_source(
+    target_lats: np.ndarray,
+    target_lons: np.ndarray,
+    source_lats: np.ndarray,
+    source_lons: np.ndarray,
+) -> bool:
+    if target_lats.size != source_lats.size or target_lons.size != source_lons.size:
+        return True
+    return not (np.allclose(target_lats, np.sort(source_lats)) and np.allclose(target_lons, np.sort(source_lons)))
+
+
+def _regular_spacing(values: np.ndarray, label: str) -> float:
+    diffs = np.diff(np.asarray(values, dtype=float))
+    if diffs.size == 0:
+        raise ValidationError(f"{label} coordinate has too few points")
+    spacing = float(np.median(diffs))
+    if not np.allclose(diffs, spacing, rtol=1e-5, atol=1e-8):
+        raise ValidationError(f"{label} coordinate is not regular enough for GRIB output")
+    return spacing
 
 
 def _coord_range(values: Any) -> tuple[float, float]:

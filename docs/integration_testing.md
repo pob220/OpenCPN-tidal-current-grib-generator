@@ -63,3 +63,21 @@
 6. Use OpenCPN GRIB plugin `Merge GRIBs...` to merge current and weather files.
 7. Confirm Weather Routing uses current data where spatial coverage and time ranges overlap.
 8. Compare selected points against independent references if you have legal access to those references.
+
+## GRIB inspection
+
+Inspect generated or merged files:
+
+```bash
+tidal-current-grib inspect-grib tpxo_current.grb
+```
+
+For Copernicus/NetCDF-generated files, compare selected source points with generated GRIB values when ecCodes is installed:
+
+```bash
+tidal-current-grib validate-generated \
+  --input-netcdf ~/OpenCPN/current-data/copernicus/irish_sea_bristol_channel_north_channel_currents_20260701_72h.nc \
+  --generated-grib irish_sea_bristol_channel_north_channel_copernicus_current.grb \
+  --points examples/reference_points.example.csv \
+  --output validation.csv
+```

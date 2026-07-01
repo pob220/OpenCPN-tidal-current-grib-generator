@@ -45,6 +45,14 @@ class RegularGrid:
     latitudes: np.ndarray
     longitudes: np.ndarray
     spacing_deg: float
+    latitude_spacing_deg: float | None = None
+    longitude_spacing_deg: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.latitude_spacing_deg is None:
+            object.__setattr__(self, "latitude_spacing_deg", self.spacing_deg)
+        if self.longitude_spacing_deg is None:
+            object.__setattr__(self, "longitude_spacing_deg", self.spacing_deg)
 
     @property
     def ny(self) -> int:
@@ -96,7 +104,13 @@ def build_regular_grid(bbox: BoundingBox, spacing_deg: float) -> RegularGrid:
     latitudes = bbox.south + np.arange(ny, dtype=float) * spacing_deg
     longitudes[-1] = bbox.east
     latitudes[-1] = bbox.north
-    return RegularGrid(latitudes=latitudes, longitudes=longitudes, spacing_deg=spacing_deg)
+    return RegularGrid(
+        latitudes=latitudes,
+        longitudes=longitudes,
+        spacing_deg=spacing_deg,
+        latitude_spacing_deg=spacing_deg,
+        longitude_spacing_deg=spacing_deg,
+    )
 
 
 def build_time_sequence(start: datetime, hours: int, step_hours: int) -> list[datetime]:

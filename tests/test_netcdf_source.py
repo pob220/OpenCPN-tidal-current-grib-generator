@@ -147,3 +147,78 @@ def test_cli_netcdf_dry_run(tmp_path: Path, capsys):
     )
     assert rc == 0
     assert "source: netcdf" in capsys.readouterr().out
+
+
+def test_netcdf_coverage_tolerance_allows_near_outside(tmp_path: Path):
+    pytest.importorskip("xarray")
+    path = tmp_path / "currents.nc"
+    _write_fixture(path)
+    source = create_source("netcdf", input_netcdf=path, coverage_tolerance_deg=0.02)
+    bbox = BoundingBox(-7.01, 51.49, -6.0, 52.5)
+    grid = build_regular_grid(bbox, 0.5)
+    current = source.get_current_grid(bbox, parse_utc_datetime("2026-07-01T00:00:00Z"), grid)
+    assert current.mask is not None
+
+
+def test_netcdf_far_outside_still_fails(tmp_path: Path):
+    pytest.importorskip("xarray")
+    path = tmp_path / "currents.nc"
+    _write_fixture(path)
+    source = create_source("netcdf", input_netcdf=path, coverage_tolerance_deg=0.02)
+    bbox = BoundingBox(-7.5, 51.5, -6.0, 52.5)
+    grid = build_regular_grid(bbox, 0.5)
+    with pytest.raises(ValidationError, match="--clip-bbox-to-source"):
+        source.get_current_grid(bbox, parse_utc_datetime("2026-07-01T00:00:00Z"), grid)
+
+
+def test_netcdf_clip_bbox_to_source(tmp_path: Path):
+    pytest.importorskip("xarray")
+    path = tmp_path / "currents.nc"
+    _write_fixture(path)
+    source = create_source("netcdf", input_netcdf=path)
+    clipped = source.clip_bbox_to_source(BoundingBox(-7.1, 51.4, -6.0, 52.5))
+    assert clipped.west == pytest.approx(-7.0)
+    assert clipped.south == pytest.approx(51.5)
+
+
+def test_netcdf_source_grid_mode(tmp_path: Path):
+    pytest.importorskip("xarray")
+    path = tmp_path / "currents.nc"
+    _write_fixture(path)
+    source = create_source("netcdf", input_netcdf=path, use_source_grid=True)
+    grid = source.build_source_grid(BoundingBox(-7.0, 51.5, -6.0, 52.5))
+    assert grid.shape == (3, 3)
+    assert grid.latitude_spacing_deg == pytest.approx(0.5)
+    assert grid.longitude_spacing_deg == pytest.approx(0.5)
+
+
+def test_cli_json_summary_for_netcdf_dry_run(tmp_path: Path, capsys):
+    path = tmp_path / "currents.nc"
+    rc = main(
+        [
+            "generate",
+            "--bbox",
+            "-7.0",
+            "51.5",
+            "-6.0",
+            "52.5",
+            "--start",
+            "2026-07-01T00:00:00Z",
+            "--hours",
+            "1",
+            "--step-hours",
+            "1",
+            "--grid-spacing-deg",
+            "0.5",
+            "--source",
+            "netcdf",
+            "--input-netcdf",
+            str(path),
+            "--output",
+            str(tmp_path / "out.grb"),
+            "--dry-run",
+            "--json-summary",
+        ]
+    )
+    assert rc == 0
+    assert '"source": "netcdf"' in capsys.readouterr().out

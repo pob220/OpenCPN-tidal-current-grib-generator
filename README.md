@@ -126,19 +126,31 @@ See [docs/copernicus_netcdf_setup.md](docs/copernicus_netcdf_setup.md).
 
 ```bash
 tidal-current-grib inspect-netcdf \
-  --input-netcdf ~/OpenCPN/current-data/copernicus/irish_sea_copernicus_currents.nc
+  --input-netcdf ~/OpenCPN/current-data/copernicus/irish_sea_bristol_channel_north_channel_currents_20260701_72h.nc
 
 tidal-current-grib generate \
-  --bbox -7.0 51.5 -4.0 55.5 \
+  --bbox -8.5 50.5 -2.5 56.5 \
   --start 2026-07-01T00:00:00Z \
   --hours 72 \
   --step-hours 1 \
-  --grid-spacing-deg 0.0333333 \
+  --grid-spacing-deg 0.03 \
   --source netcdf \
-  --input-netcdf ~/OpenCPN/current-data/copernicus/irish_sea_copernicus_currents.nc \
-  --output irish_sea_copernicus_current.grb \
+  --input-netcdf ~/OpenCPN/current-data/copernicus/irish_sea_bristol_channel_north_channel_currents_20260701_72h.nc \
+  --clip-bbox-to-source \
+  --use-source-grid \
+  --output irish_sea_bristol_channel_north_channel_copernicus_current.grb \
   --metadata-summary
 ```
+
+Useful diagnostics:
+
+```bash
+tidal-current-grib inspect-grib irish_sea_bristol_channel_north_channel_copernicus_current.grb
+
+tidal-current-grib generate ... --json-summary --dry-run
+```
+
+`--coverage-tolerance-deg` allows small differences between requested bbox edges and source coordinate centres. `--clip-bbox-to-source` clips the output bbox to source coordinates. `--use-source-grid` writes on the native NetCDF coordinate centres to avoid unnecessary interpolation.
 
 ## Reference comparison
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import numpy as np
 
@@ -45,18 +45,24 @@ class EccodesGrib1CurrentWriter:
     V_CURRENT_PARAM = 50
     MISSING_VALUE = 9999.0
 
-    def write(self, grids: Iterable[CurrentGrid], output: Path) -> GribWriteSummary:
+    def write(
+        self,
+        grids: Iterable[CurrentGrid],
+        output: Path,
+        progress_callback: Callable[[int, CurrentGrid], None] | None = None,
+    ) -> GribWriteSummary:
         eccodes = _import_eccodes()
         output = output.expanduser().resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
-        current_grids = list(grids)
-        if not current_grids:
+        grid_iter = iter(grids)
+        first_grid = next(grid_iter, None)
+        if first_grid is None:
             raise ValidationError("no current grids were provided for GRIB writing")
-        reference_time = self._reference_time(current_grids[0].time)
+        reference_time = self._reference_time(first_grid.time)
 
         message_count = 0
         with output.open("wb") as handle:
-            for current in current_grids:
+            for current in _with_first(first_grid, grid_iter):
                 for parameter, values in (
                     (self.U_CURRENT_PARAM, current.u_mps),
                     (self.V_CURRENT_PARAM, current.v_mps),
@@ -67,6 +73,8 @@ class EccodesGrib1CurrentWriter:
                     finally:
                         eccodes.codes_release(gid)
                     message_count += 1
+                if progress_callback is not None:
+                    progress_callback(message_count, current)
         return GribWriteSummary(message_count=message_count, output=output)
 
     def _create_message(
@@ -106,8 +114,8 @@ class EccodesGrib1CurrentWriter:
             eccodes.codes_set(gid, "longitudeOfFirstGridPointInDegrees", float(grid.longitudes[0]))
             eccodes.codes_set(gid, "latitudeOfLastGridPointInDegrees", float(grid.latitudes[-1]))
             eccodes.codes_set(gid, "longitudeOfLastGridPointInDegrees", float(grid.longitudes[-1]))
-            eccodes.codes_set(gid, "iDirectionIncrementInDegrees", float(grid.spacing_deg))
-            eccodes.codes_set(gid, "jDirectionIncrementInDegrees", float(grid.spacing_deg))
+            eccodes.codes_set(gid, "iDirectionIncrementInDegrees", float(grid.longitude_spacing_deg))
+            eccodes.codes_set(gid, "jDirectionIncrementInDegrees", float(grid.latitude_spacing_deg))
             eccodes.codes_set(gid, "iScansNegatively", 0)
             eccodes.codes_set(gid, "jScansPositively", 1)
             eccodes.codes_set(gid, "jPointsAreConsecutive", 0)
@@ -128,3 +136,8 @@ class EccodesGrib1CurrentWriter:
     @staticmethod
     def _reference_time(valid_time: datetime) -> datetime:
         return valid_time.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+
+
+def _with_first(first: CurrentGrid, rest: Iterable[CurrentGrid]) -> Iterable[CurrentGrid]:
+    yield first
+    yield from rest
