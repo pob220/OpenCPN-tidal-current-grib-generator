@@ -7,6 +7,7 @@ import types
 import pytest
 
 from tidal_current_grib_generator.api import default_output_filename
+from tidal_current_grib_generator.cli import main
 from tidal_current_grib_generator.copernicus import CopernicusDownloadRequest, download_copernicus_subset
 from tidal_current_grib_generator.dependencies import check_dependencies
 from tidal_current_grib_generator.geo import BoundingBox
@@ -88,6 +89,151 @@ def test_copernicus_download_uses_python_api_without_logging_password(monkeypatc
     assert calls["kwargs"]["password"] == "secret"
     assert all(details.get("password") != "secret" for details in seen)
     assert "secret" not in str(result.as_dict())
+
+
+def test_download_copernicus_cli_accepts_hours(monkeypatch, tmp_path: Path, capsys):
+    calls = {}
+
+    class FakeResponse:
+        def model_dump(self, mode="json"):
+            return {"ok": True}
+
+    def fake_subset(**kwargs):
+        calls["kwargs"] = kwargs
+        return FakeResponse()
+
+    monkeypatch.setitem(sys.modules, "copernicusmarine", types.SimpleNamespace(subset=fake_subset))
+    monkeypatch.setattr("tidal_current_grib_generator.copernicus.copernicusmarine_available", lambda: True)
+    monkeypatch.setenv("CURRENTGRIB_TEST_COPERNICUS_USERNAME", "user")
+    monkeypatch.setenv("CURRENTGRIB_TEST_COPERNICUS_PASSWORD", "secret")
+    rc = main(
+        [
+            "download-copernicus",
+            "--bbox",
+            "-8.5",
+            "50.5",
+            "-2.5",
+            "56.5",
+            "--start",
+            "2026-07-01T00:00:00Z",
+            "--hours",
+            "5",
+            "--output-directory",
+            str(tmp_path),
+            "--output-filename",
+            "subset.nc",
+            "--dry-run",
+            "--json",
+        ]
+    )
+    assert rc == 0
+    assert calls["kwargs"]["end_datetime"].isoformat() == "2026-07-01T05:00:00+00:00"
+    assert "secret" not in capsys.readouterr().out
+
+
+def test_download_copernicus_cli_accepts_end(monkeypatch, tmp_path: Path):
+    calls = {}
+
+    class FakeResponse:
+        def model_dump(self, mode="json"):
+            return {"ok": True}
+
+    def fake_subset(**kwargs):
+        calls["kwargs"] = kwargs
+        return FakeResponse()
+
+    monkeypatch.setitem(sys.modules, "copernicusmarine", types.SimpleNamespace(subset=fake_subset))
+    monkeypatch.setattr("tidal_current_grib_generator.copernicus.copernicusmarine_available", lambda: True)
+    monkeypatch.setenv("CURRENTGRIB_TEST_COPERNICUS_USERNAME", "user")
+    monkeypatch.setenv("CURRENTGRIB_TEST_COPERNICUS_PASSWORD", "secret")
+    rc = main(
+        [
+            "download-copernicus",
+            "--bbox",
+            "-8.5",
+            "50.5",
+            "-2.5",
+            "56.5",
+            "--start",
+            "2026-07-01T00:00:00Z",
+            "--end",
+            "2026-07-01T03:00:00Z",
+            "--output-directory",
+            str(tmp_path),
+            "--output-filename",
+            "subset.nc",
+            "--dry-run",
+        ]
+    )
+    assert rc == 0
+    assert calls["kwargs"]["end_datetime"].isoformat() == "2026-07-01T03:00:00+00:00"
+
+
+def test_download_copernicus_cli_rejects_nonpositive_hours(tmp_path: Path, capsys):
+    rc = main(
+        [
+            "download-copernicus",
+            "--bbox",
+            "-8.5",
+            "50.5",
+            "-2.5",
+            "56.5",
+            "--start",
+            "2026-07-01T00:00:00Z",
+            "--hours",
+            "0",
+            "--output-directory",
+            str(tmp_path),
+            "--output-filename",
+            "subset.nc",
+        ]
+    )
+    assert rc == 2
+    assert "--hours must be greater than zero" in capsys.readouterr().err
+
+
+def test_download_copernicus_cli_requires_end_or_hours(tmp_path: Path):
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "download-copernicus",
+                "--bbox",
+                "-8.5",
+                "50.5",
+                "-2.5",
+                "56.5",
+                "--start",
+                "2026-07-01T00:00:00Z",
+                "--output-directory",
+                str(tmp_path),
+                "--output-filename",
+                "subset.nc",
+            ]
+        )
+
+
+def test_download_copernicus_cli_rejects_end_and_hours(tmp_path: Path):
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "download-copernicus",
+                "--bbox",
+                "-8.5",
+                "50.5",
+                "-2.5",
+                "56.5",
+                "--start",
+                "2026-07-01T00:00:00Z",
+                "--end",
+                "2026-07-01T03:00:00Z",
+                "--hours",
+                "3",
+                "--output-directory",
+                str(tmp_path),
+                "--output-filename",
+                "subset.nc",
+            ]
+        )
 
 
 @pytest.mark.skipif(

@@ -4,6 +4,7 @@
 #include <wx/filename.h>
 #include <wx/process.h>
 #include <wx/stdpaths.h>
+#include <wx/utils.h>
 
 namespace {
 
@@ -24,6 +25,10 @@ wxString DefaultOutputFilename() {
   return "current_grib_" + wxDateTime::Now().ToUTC().Format("%Y%m%d_%H%M") + ".grb";
 }
 
+bool IsExecutableFile(const wxString& path) {
+  return wxFileName::FileExists(path);
+}
+
 }  // namespace
 
 CurrentGribDialog::CurrentGribDialog(wxWindow* parent)
@@ -33,6 +38,7 @@ CurrentGribDialog::CurrentGribDialog(wxWindow* parent)
   auto* grid = new wxFlexGridSizer(2, 8, 8);
   grid->AddGrowableCol(1, 1);
 
+  m_generatorPath = new wxTextCtrl(this, wxID_ANY, FindDefaultGenerator());
   m_west = new wxTextCtrl(this, wxID_ANY, "-8.5");
   m_south = new wxTextCtrl(this, wxID_ANY, "50.5");
   m_east = new wxTextCtrl(this, wxID_ANY, "-2.5");
@@ -64,6 +70,7 @@ CurrentGribDialog::CurrentGribDialog(wxWindow* parent)
     grid->Add(new wxStaticText(this, wxID_ANY, label), 0, wxALIGN_CENTER_VERTICAL);
     grid->Add(control, 1, wxEXPAND);
   };
+  addRow("Generator executable", m_generatorPath);
   addRow("West longitude", m_west);
   addRow("South latitude", m_south);
   addRow("East longitude", m_east);
@@ -106,24 +113,38 @@ CurrentGribDialog::CurrentGribDialog(wxWindow* parent)
 }
 
 void CurrentGribDialog::OnCheckDependencies(wxCommandEvent&) {
-  wxString command = "tidal-current-grib check-dependencies --output-directory " +
+  wxString command = ShellQuote(m_generatorPath->GetValue()) + " check-dependencies --output-directory " +
                      ShellQuote(m_outputDir->GetPath()) + " --json";
   AppendLog("Running dependency check...");
-  AppendLog(command);
-  wxExecute(command, wxEXEC_ASYNC);
+  RunCommandAndLog(command);
 }
 
 void CurrentGribDialog::OnGenerate(wxCommandEvent&) {
+  wxString provider = m_provider->GetStringSelection();
+  if (provider.Contains("Copernicus")) {
+    AppendLog("Copernicus download is intentionally stubbed in this plugin scaffold.");
+    AppendLog("Use tidal-current-grib download-copernicus from a trusted shell, or select Local NetCDF after downloading.");
+    AppendLog("No password was passed to a command line or logged.");
+    return;
+  }
   wxString command = BuildGenerateCommand();
   AppendLog("Starting generation...");
-  AppendLog(command);
-  AppendLog("Passwords are not included in this command. Copernicus download orchestration will pass credentials through the Python API in a future worker.");
-  wxExecute(command, wxEXEC_ASYNC);
+  RunCommandAndLog(command);
 }
 
-void CurrentGribDialog::OnClose(wxCommandEvent&) { EndModal(wxID_CANCEL); }
+void CurrentGribDialog::OnClose(wxCommandEvent&) { Hide(); }
 
 void CurrentGribDialog::AppendLog(const wxString& message) { m_log->AppendText(message + "\n"); }
+
+void CurrentGribDialog::RunCommandAndLog(const wxString& command) {
+  AppendLog("Command: " + Redact(command));
+  wxArrayString output;
+  wxArrayString errors;
+  long rc = wxExecute(command, output, errors, wxEXEC_SYNC);
+  for (const auto& line : output) AppendLog(Redact(line));
+  for (const auto& line : errors) AppendLog(Redact("stderr: " + line));
+  AppendLog(wxString::Format("Exit status: %ld", rc));
+}
 
 wxString CurrentGribDialog::BuildGenerateCommand() const {
   wxFileName output(m_outputDir->GetPath(), m_outputFile->GetValue());
@@ -139,11 +160,27 @@ wxString CurrentGribDialog::BuildGenerateCommand() const {
     extra = " --input-netcdf " + ShellQuote("downloaded_copernicus_current.nc") +
             " --clip-bbox-to-source --use-source-grid";
   }
-  return "tidal-current-grib generate --bbox " + m_west->GetValue() + " " +
-         m_south->GetValue() + " " + m_east->GetValue() + " " + m_north->GetValue() +
+  return ShellQuote(m_generatorPath->GetValue()) + " generate --bbox " + ShellQuote(m_west->GetValue()) + " " +
+         ShellQuote(m_south->GetValue()) + " " + ShellQuote(m_east->GetValue()) + " " + ShellQuote(m_north->GetValue()) +
          " --start " + ShellQuote(m_startUtc->GetValue()) +
          " --hours " + wxString::Format("%d", m_durationHours->GetValue()) +
          " --step-hours " + wxString::Format("%d", m_stepHours->GetValue()) +
          " --grid-spacing-deg 0.03 --source " + source + extra +
          " --output " + ShellQuote(output.GetFullPath()) + " --metadata-summary";
+}
+
+wxString CurrentGribDialog::FindDefaultGenerator() const {
+  wxString path;
+  if (wxGetEnv("TIDAL_CURRENT_GRIB", &path) && IsExecutableFile(path)) return path;
+  if (wxFindFileInPath(&path, wxGetenv("PATH"), "tidal-current-grib")) return path;
+  wxString home = wxGetHomeDir();
+  wxString dev = home + "/src/tidal-current-grib-generator/.venv/bin/tidal-current-grib";
+  if (IsExecutableFile(dev)) return dev;
+  return "tidal-current-grib";
+}
+
+wxString CurrentGribDialog::Redact(const wxString& text) const {
+  wxString redacted(text);
+  if (!m_password->GetValue().empty()) redacted.Replace(m_password->GetValue(), "<redacted>");
+  return redacted;
 }

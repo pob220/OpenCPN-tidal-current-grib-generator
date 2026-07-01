@@ -13,8 +13,12 @@ private:
   void OnGenerate(wxCommandEvent& event);
   void OnClose(wxCommandEvent& event);
   void AppendLog(const wxString& message);
+  void RunCommandAndLog(const wxString& command);
   wxString BuildGenerateCommand() const;
+  wxString FindDefaultGenerator() const;
+  wxString Redact(const wxString& text) const;
 
+  wxTextCtrl* m_generatorPath;
   wxTextCtrl* m_west;
   wxTextCtrl* m_south;
   wxTextCtrl* m_east;

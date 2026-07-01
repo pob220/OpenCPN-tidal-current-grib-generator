@@ -10,6 +10,7 @@ import getpass
 import os
 import sys
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -126,7 +127,9 @@ def build_parser() -> argparse.ArgumentParser:
     download = subparsers.add_parser("download-copernicus", help="Download a Copernicus Marine current subset.")
     download.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"))
     download.add_argument("--start", required=True)
-    download.add_argument("--end", required=True)
+    end_group = download.add_mutually_exclusive_group(required=True)
+    end_group.add_argument("--end")
+    end_group.add_argument("--hours", type=int)
     download.add_argument("--output-directory", type=Path, required=True)
     download.add_argument("--output-filename", required=True)
     download.add_argument("--username")
@@ -345,6 +348,13 @@ def cmd_providers(args: argparse.Namespace) -> int:
 
 
 def cmd_download_copernicus(args: argparse.Namespace) -> int:
+    start = parse_utc_datetime(args.start)
+    if args.hours is not None:
+        if args.hours <= 0:
+            raise ValidationError("--hours must be greater than zero")
+        end = start + timedelta(hours=args.hours)
+    else:
+        end = parse_utc_datetime(args.end)
     username = args.username or os.environ.get(args.username_env)
     if not username:
         username = input("Copernicus username: ")
@@ -353,8 +363,8 @@ def cmd_download_copernicus(args: argparse.Namespace) -> int:
         password = getpass.getpass("Copernicus password: ")
     request = CopernicusDownloadRequest(
         bbox=BoundingBox.from_values(args.bbox),
-        start=parse_utc_datetime(args.start),
-        end=parse_utc_datetime(args.end),
+        start=start,
+        end=end,
         output_directory=args.output_directory,
         output_filename=args.output_filename,
         username=username,
