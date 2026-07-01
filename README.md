@@ -150,7 +150,7 @@ tidal-current-grib inspect-grib irish_sea_bristol_channel_north_channel_copernic
 tidal-current-grib generate ... --json-summary --dry-run
 ```
 
-`--coverage-tolerance-deg` allows small differences between requested bbox edges and source coordinate centres. `--clip-bbox-to-source` clips the output bbox to source coordinates. `--use-source-grid` writes on the native NetCDF coordinate centres to avoid unnecessary interpolation.
+`--coverage-tolerance-deg` allows small differences between requested bbox edges and source coordinate centres. `--clip-bbox-to-source` clips the output bbox to source coordinates. `--use-source-grid` writes on the native NetCDF coordinate centres to avoid unnecessary interpolation. `--source-grid-regularity-tolerance` controls how much float precision noise is allowed before native-grid mode falls back to an error.
 
 ## Reference comparison
 

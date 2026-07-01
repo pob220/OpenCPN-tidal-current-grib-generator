@@ -121,6 +121,7 @@ def _add_netcdf_options(parser: argparse.ArgumentParser, include_input: bool = T
     parser.add_argument("--assume-units", choices=["mps", "cmps"])
     parser.add_argument("--nearest-time", action="store_true")
     parser.add_argument("--coverage-tolerance-deg", type=float, default=0.02)
+    parser.add_argument("--source-grid-regularity-tolerance", type=float, default=1e-5)
 
 
 def cmd_generate(args: argparse.Namespace) -> int:
@@ -316,6 +317,7 @@ def _source_from_args(args: argparse.Namespace):
         nearest_time=getattr(args, "nearest_time", False),
         coverage_tolerance_deg=getattr(args, "coverage_tolerance_deg", 0.02),
         use_source_grid=getattr(args, "use_source_grid", False),
+        source_grid_regularity_tolerance=getattr(args, "source_grid_regularity_tolerance", 1e-5),
     )
 
 

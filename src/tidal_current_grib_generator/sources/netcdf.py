@@ -64,6 +64,7 @@ class NetCDFCurrentSource(CurrentSource):
     nearest_time: bool = False
     coverage_tolerance_deg: float = 0.02
     use_source_grid: bool = False
+    source_grid_regularity_tolerance: float = 1e-5
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "input_netcdf", self.input_netcdf.expanduser())
@@ -184,8 +185,8 @@ class NetCDFCurrentSource(CurrentSource):
             lons = np.sort(lons[(lons >= bbox.west) & (lons <= bbox.east)])
             if lats.size < 2 or lons.size < 2:
                 raise ValidationError("source grid selection must contain at least two latitude and longitude points")
-            lat_spacing = _regular_spacing(lats, "latitude")
-            lon_spacing = _regular_spacing(lons, "longitude")
+            lat_spacing = _regular_spacing(lats, "latitude", self.source_grid_regularity_tolerance)
+            lon_spacing = _regular_spacing(lons, "longitude", self.source_grid_regularity_tolerance)
             return RegularGrid(
                 latitudes=lats,
                 longitudes=lons,
@@ -452,13 +453,23 @@ def _grid_differs_from_source(
     return not (np.allclose(target_lats, np.sort(source_lats)) and np.allclose(target_lons, np.sort(source_lons)))
 
 
-def _regular_spacing(values: np.ndarray, label: str) -> float:
+def _regular_spacing(values: np.ndarray, label: str, tolerance: float = 1e-5) -> float:
     diffs = np.diff(np.asarray(values, dtype=float))
     if diffs.size == 0:
         raise ValidationError(f"{label} coordinate has too few points")
     spacing = float(np.median(diffs))
-    if not np.allclose(diffs, spacing, rtol=1e-5, atol=1e-8):
-        raise ValidationError(f"{label} coordinate is not regular enough for GRIB output")
+    max_abs_deviation = float(np.max(np.abs(diffs - spacing)))
+    relative_deviation = max_abs_deviation / max(abs(spacing), 1e-12)
+    allowed = max(float(tolerance), abs(spacing) * float(tolerance))
+    if max_abs_deviation > allowed:
+        raise ValidationError(
+            f"{label} coordinate is not regular enough for GRIB output: "
+            f"median spacing={spacing:.12g} deg, min spacing={float(np.min(diffs)):.12g}, "
+            f"max spacing={float(np.max(diffs)):.12g}, max deviation={max_abs_deviation:.12g} deg "
+            f"(relative {relative_deviation:.6g}), tolerance={tolerance:.12g}. "
+            "Omit --use-source-grid to interpolate to a regular output grid, or increase "
+            "--source-grid-regularity-tolerance if this is expected coordinate precision noise."
+        )
     return spacing
 
 

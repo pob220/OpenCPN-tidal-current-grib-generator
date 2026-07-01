@@ -7,14 +7,25 @@ from tidal_current_grib_generator.cli import main
 from tidal_current_grib_generator.errors import MissingDependencyError, ValidationError
 from tidal_current_grib_generator.geo import BoundingBox, build_regular_grid, parse_utc_datetime
 from tidal_current_grib_generator.sources import create_source
-from tidal_current_grib_generator.sources.netcdf import inspect_netcdf, xarray_is_available
+from tidal_current_grib_generator.sources.netcdf import _regular_spacing, inspect_netcdf, xarray_is_available
 
 
-def _write_fixture(path: Path, units: str = "m/s", include_v: bool = True) -> None:
+def _write_fixture(
+    path: Path,
+    units: str = "m/s",
+    include_v: bool = True,
+    noisy_coordinates: bool = False,
+    irregular_coordinates: bool = False,
+) -> None:
     xr = pytest.importorskip("xarray")
     times = np.array(["2026-07-01T00:00:00", "2026-07-01T01:00:00"], dtype="datetime64[ns]")
-    latitudes = np.array([51.5, 52.0, 52.5])
-    longitudes = np.array([-7.0, -6.5, -6.0])
+    latitudes = np.array([51.5, 52.0, 52.5], dtype=np.float32)
+    longitudes = np.array([-7.0, -6.5, -6.0], dtype=np.float32)
+    if noisy_coordinates:
+        latitudes = np.array([51.5, 52.000006, 52.5], dtype=np.float32)
+        longitudes = np.array([-7.0, -6.499999, -6.0], dtype=np.float32)
+    if irregular_coordinates:
+        latitudes = np.array([51.5, 52.1, 52.5], dtype=np.float32)
     u = np.ones((2, 3, 3), dtype=float)
     v = np.full((2, 3, 3), 2.0, dtype=float)
     data_vars = {
@@ -48,6 +59,18 @@ def test_netcdf_missing_dependency_or_missing_file(tmp_path: Path):
     existing.write_bytes(b"")
     with pytest.raises(MissingDependencyError):
         inspect_netcdf(existing)
+
+
+def test_regular_spacing_accepts_observed_copernicus_precision_noise():
+    coords = np.array([50.5, 50.5135193, 50.5270271, 50.5405388], dtype=float)
+    spacing = _regular_spacing(coords, "latitude", tolerance=1e-5)
+    assert spacing == pytest.approx(0.0135117, abs=1e-5)
+
+
+def test_regular_spacing_rejects_irregular_values():
+    coords = np.array([50.5, 50.55, 50.9], dtype=float)
+    with pytest.raises(ValidationError, match="not regular enough"):
+        _regular_spacing(coords, "latitude", tolerance=1e-5)
 
 
 def test_inspect_netcdf_fixture(tmp_path: Path):
@@ -190,6 +213,25 @@ def test_netcdf_source_grid_mode(tmp_path: Path):
     assert grid.shape == (3, 3)
     assert grid.latitude_spacing_deg == pytest.approx(0.5)
     assert grid.longitude_spacing_deg == pytest.approx(0.5)
+
+
+def test_netcdf_source_grid_accepts_float32_coordinate_noise(tmp_path: Path):
+    pytest.importorskip("xarray")
+    path = tmp_path / "currents.nc"
+    _write_fixture(path, noisy_coordinates=True)
+    source = create_source("netcdf", input_netcdf=path, use_source_grid=True)
+    grid = source.build_source_grid(BoundingBox(-7.0, 51.5, -6.0, 52.5))
+    assert grid.shape == (3, 3)
+    assert grid.latitude_spacing_deg == pytest.approx(0.5, abs=1e-5)
+
+
+def test_netcdf_source_grid_rejects_genuinely_irregular_coordinates(tmp_path: Path):
+    pytest.importorskip("xarray")
+    path = tmp_path / "currents.nc"
+    _write_fixture(path, irregular_coordinates=True)
+    source = create_source("netcdf", input_netcdf=path, use_source_grid=True)
+    with pytest.raises(ValidationError, match="Omit --use-source-grid"):
+        source.build_source_grid(BoundingBox(-7.0, 51.5, -6.0, 52.5))
 
 
 def test_cli_json_summary_for_netcdf_dry_run(tmp_path: Path, capsys):

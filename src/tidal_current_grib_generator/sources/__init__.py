@@ -29,6 +29,7 @@ def create_source(
     nearest_time: bool = False,
     coverage_tolerance_deg: float = 0.02,
     use_source_grid: bool = False,
+    source_grid_regularity_tolerance: float = 1e-5,
 ) -> CurrentSource:
     normalized = name.strip().lower()
     if normalized == "synthetic":
@@ -59,6 +60,7 @@ def create_source(
             nearest_time=nearest_time,
             coverage_tolerance_deg=coverage_tolerance_deg,
             use_source_grid=use_source_grid,
+            source_grid_regularity_tolerance=source_grid_regularity_tolerance,
         )
     raise UnsupportedSourceError(f"unsupported source {name!r}; choose synthetic, constant, tpxo, or netcdf")
 

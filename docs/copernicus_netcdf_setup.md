@@ -20,6 +20,7 @@ Successful medium-area OpenCPN test:
 
 - Requested bbox: `-8.5 50.5 -2.5 56.5`
 - Downloaded coordinate centres: approximately `-8.484848.. -2.515151..`, `50.5..56.5`
+- Observed native spacing: latitude about `0.0135135` degrees, longitude about `0.0303030` degrees
 - Time range: `2026-07-01T00:00:00` to `2026-07-04T00:00:00`
 - Downloaded variable names observed in the NetCDF file: `uo`, `vo`
 
@@ -88,6 +89,14 @@ tidal-current-grib generate \
   --output irish_sea_bristol_channel_north_channel_copernicus_native_current.grb \
   --metadata-summary
 ```
+
+`--use-source-grid` accepts small float32/NetCDF coordinate precision noise. If a product has larger coordinate jitter, inspect the file first and only then consider increasing:
+
+```bash
+--source-grid-regularity-tolerance 0.00001
+```
+
+If the coordinate grid is genuinely irregular, omit `--use-source-grid` and generate on a regular output grid using `--grid-spacing-deg`.
 
 If the requested GRIB grid or times differ from the source grid, the NetCDF source uses xarray spatial interpolation. Exact source times are required by default. Add `--nearest-time` only when selecting the nearest available source time is acceptable.
 
