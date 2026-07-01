@@ -16,6 +16,9 @@ These APIs are the best current boundary for a future GUI or OpenCPN plugin. The
 - `NetCDFCurrentSource`: local NetCDF current files, including Copernicus products.
 - `PyTMDTPXOSource`: TPXO/pyTMD local model source.
 - `SyntheticRotaryTideSource`: deterministic test data.
+- `ProviderRegistry` and `select_best_provider_for_bbox`: source/provider selection.
+- `CopernicusDownloadRequest` and `download_copernicus_subset`: live Copernicus download using the Python API.
+- `GenerateCurrentGribRequest` and `generate_current_grib_from_netcdf`: GUI-friendly generation boundary.
 
 GUI code should call source inspection methods before generation to show coverage, variables, units, and time ranges.
 

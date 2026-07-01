@@ -25,9 +25,13 @@ netcdf = [
   "xarray>=2024.7",
   "netCDF4>=1.6",
 ]
+copernicus = [
+  "copernicusmarine>=2.0",
+]
 dev = ["pytest>=7.4"]
 all = [
   "eccodes>=1.6",
+  "copernicusmarine>=2.0",
   "pyTMD>=3.0",
   "xarray>=2024.7",
   "netCDF4>=1.6",

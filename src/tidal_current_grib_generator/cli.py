@@ -6,12 +6,16 @@ import argparse
 import csv
 import json
 import logging
+import getpass
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from tidal_current_grib_generator.errors import TidalCurrentGribError, ValidationError
+from tidal_current_grib_generator.copernicus import CopernicusDownloadRequest, download_copernicus_subset
+from tidal_current_grib_generator.dependencies import check_dependencies
 from tidal_current_grib_generator.geo import BoundingBox, build_regular_grid, build_time_sequence, parse_utc_datetime
 from tidal_current_grib_generator.grib.validation import inspect_grib, scan_grib_messages
 from tidal_current_grib_generator.grib.read import sample_current_components
@@ -21,6 +25,7 @@ from tidal_current_grib_generator.reference import compare_reference_csv
 from tidal_current_grib_generator.sources import create_source
 from tidal_current_grib_generator.sources.netcdf import NetCDFCurrentSource, inspect_netcdf
 from tidal_current_grib_generator.sources.pytmd import inspect_pytmd_source
+from tidal_current_grib_generator.providers import ProviderRegistry, select_best_provider_for_bbox
 
 LOGGER = logging.getLogger("tidal_current_grib_generator")
 DEFAULT_TPXO_MODEL = "TPXO10-atlas-v2-nc"
@@ -105,6 +110,33 @@ def build_parser() -> argparse.ArgumentParser:
     _add_netcdf_options(validate, include_input=False)
     validate.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     validate.set_defaults(func=cmd_validate_generated)
+
+    deps = subparsers.add_parser("check-dependencies", help="Check runtime dependencies.")
+    deps.add_argument("--output-directory", type=Path)
+    deps.add_argument("--json", action="store_true")
+    deps.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    deps.set_defaults(func=cmd_check_dependencies)
+
+    providers = subparsers.add_parser("providers", help="List or auto-select providers.")
+    providers.add_argument("--bbox", nargs=4, type=float, metavar=("W", "S", "E", "N"))
+    providers.add_argument("--json", action="store_true")
+    providers.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    providers.set_defaults(func=cmd_providers)
+
+    download = subparsers.add_parser("download-copernicus", help="Download a Copernicus Marine current subset.")
+    download.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"))
+    download.add_argument("--start", required=True)
+    download.add_argument("--end", required=True)
+    download.add_argument("--output-directory", type=Path, required=True)
+    download.add_argument("--output-filename", required=True)
+    download.add_argument("--username")
+    download.add_argument("--password-env", default="CURRENTGRIB_TEST_COPERNICUS_PASSWORD")
+    download.add_argument("--username-env", default="CURRENTGRIB_TEST_COPERNICUS_USERNAME")
+    download.add_argument("--dry-run", action="store_true")
+    download.add_argument("--overwrite", action="store_true")
+    download.add_argument("--json", action="store_true")
+    download.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    download.set_defaults(func=cmd_download_copernicus)
     return parser
 
 
@@ -283,6 +315,61 @@ def cmd_validate_generated(args: argparse.Namespace) -> int:
         print(f"wrote {len(rows)} validation rows to {args.output}")
     else:
         print(json.dumps(rows, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_check_dependencies(args: argparse.Namespace) -> int:
+    status = check_dependencies(args.output_directory).as_dict()
+    if args.json:
+        print(json.dumps(status, indent=2, sort_keys=True))
+    else:
+        _print_mapping(status)
+    return 0
+
+
+def cmd_providers(args: argparse.Namespace) -> int:
+    registry = ProviderRegistry()
+    data: dict[str, Any] = {"providers": [provider.as_dict() for provider in registry.list()]}
+    if args.bbox:
+        bbox = BoundingBox.from_values(args.bbox)
+        selected = select_best_provider_for_bbox(bbox, registry=registry)
+        data["selected"] = selected.as_dict() if selected else None
+    if args.json:
+        print(json.dumps(data, indent=2, sort_keys=True))
+    else:
+        for provider in data["providers"]:
+            print(f"{provider['id']}: {provider['label']} ({'implemented' if provider['implemented'] else 'stub'})")
+        if "selected" in data:
+            print(f"selected: {data['selected']['id'] if data['selected'] else '(none)'}")
+    return 0
+
+
+def cmd_download_copernicus(args: argparse.Namespace) -> int:
+    username = args.username or os.environ.get(args.username_env)
+    if not username:
+        username = input("Copernicus username: ")
+    password = os.environ.get(args.password_env)
+    if not password:
+        password = getpass.getpass("Copernicus password: ")
+    request = CopernicusDownloadRequest(
+        bbox=BoundingBox.from_values(args.bbox),
+        start=parse_utc_datetime(args.start),
+        end=parse_utc_datetime(args.end),
+        output_directory=args.output_directory,
+        output_filename=args.output_filename,
+        username=username,
+        password=password,
+        overwrite=args.overwrite,
+        dry_run=args.dry_run,
+    )
+    result = download_copernicus_subset(
+        request,
+        progress_callback=lambda step, details: LOGGER.info("%s %s", step, details),
+    )
+    if args.json:
+        print(json.dumps(result.as_dict(), indent=2, sort_keys=True))
+    else:
+        print(f"downloaded NetCDF: {result.path}")
     return 0
 
 

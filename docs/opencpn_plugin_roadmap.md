@@ -1,6 +1,6 @@
 # OpenCPN plugin roadmap
 
-The long-term target is an OpenCPN Ocean Currents Generator plugin, while keeping this repository useful as a standalone generator and testable Python library.
+The long-term target is an OpenCPN Ocean Currents Generator plugin, likely named `currentgrib_pi`, while keeping this repository useful as a standalone generator and testable Python library.
 
 ## Architecture
 
