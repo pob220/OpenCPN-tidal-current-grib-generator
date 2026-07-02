@@ -22,7 +22,7 @@ from tidal_current_grib_generator.copernicus import CopernicusDownloadRequest, d
 from tidal_current_grib_generator.dependencies import check_dependencies
 from tidal_current_grib_generator.geo import BoundingBox, build_regular_grid, build_time_sequence, parse_utc_datetime
 from tidal_current_grib_generator.grib.validation import inspect_grib, scan_grib_messages
-from tidal_current_grib_generator.grib.merge import merge_grib_files
+from tidal_current_grib_generator.grib.merge import merge_grib_files, merge_grib_streams
 from tidal_current_grib_generator.grib.read import sample_current_components
 from tidal_current_grib_generator.grib.writer import EccodesGrib1CurrentWriter
 from tidal_current_grib_generator.model import components_to_speed_direction
@@ -43,9 +43,12 @@ from tidal_current_grib_generator.security import redact_text
 from tidal_current_grib_generator.weather import (
     ECMWF_SOURCE_LABEL,
     ECMWFWeatherRequest,
+    GFSWaveRequest,
     GFSWeatherRequest,
+    gfs_cycle_candidates,
     generate_gfs_weather_grib,
     generate_ecmwf_weather_grib,
+    generate_gfs_wave_grib,
     list_weather_providers,
 )
 
@@ -173,12 +176,13 @@ def build_parser() -> argparse.ArgumentParser:
     weather_providers.set_defaults(func=cmd_weather_providers)
 
     generate_weather = subparsers.add_parser("generate-weather", help="Download/generate a weather GRIB.")
-    generate_weather.add_argument("--provider", choices=["gfs", "ecmwf_ifs_open", "dwd_icon_eu"], required=True)
+    generate_weather.add_argument("--provider", choices=["gfs", "gfs_wave", "ecmwf_ifs_open", "dwd_icon_eu"], required=True)
     generate_weather.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"))
     generate_weather.add_argument("--date", help="GFS cycle date YYYYMMDD for explicit cycles.")
     generate_weather.add_argument("--cycle", required=True, help="auto or explicit cycle 00, 06, 12, 18.")
     generate_weather.add_argument("--hours", type=int, required=True)
     generate_weather.add_argument("--step-hours", type=int, default=3)
+    generate_weather.add_argument("--weather-preset", choices=["minimal", "routing", "marine"], default="routing")
     generate_weather.add_argument("--output", type=Path, required=True)
     generate_weather.add_argument("--overwrite", action="store_true")
     generate_weather.add_argument("--dry-run", action="store_true")
@@ -196,6 +200,55 @@ def build_parser() -> argparse.ArgumentParser:
     merge_gribs.add_argument("--json", action="store_true")
     merge_gribs.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     merge_gribs.set_defaults(func=cmd_merge_gribs)
+
+    environment = subparsers.add_parser("generate-environment-grib", help="Generate a ready merged weather/current GRIB.")
+    environment.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"))
+    environment.add_argument("--start", help="UTC start time for generated current sources; defaults to weather cycle if weather is generated.")
+    environment.add_argument("--date", help="Weather cycle date YYYYMMDD for explicit cycles.")
+    environment.add_argument("--cycle", default="auto", help="auto or explicit cycle 00, 06, 12, 18.")
+    environment.add_argument("--hours", type=int, required=True)
+    environment.add_argument("--step-hours", type=int, default=3)
+    environment.add_argument(
+        "--weather-provider",
+        choices=["none", "existing-file", "gfs", "ecmwf_ifs_open", "dwd_icon_eu"],
+        default="gfs",
+    )
+    environment.add_argument("--weather-file", type=Path)
+    environment.add_argument("--weather-preset", choices=["minimal", "routing", "marine"], default="routing")
+    environment.add_argument("--include-waves", action="store_true")
+    environment.add_argument("--wave-step-hours", type=int)
+    environment.add_argument(
+        "--current-source",
+        choices=[
+            "none",
+            "existing-file",
+            "tpxo-cache",
+            "tpxo",
+            "marine_ie_irish_sea",
+            "copernicus_nws",
+            "copernicus_global",
+            "auto",
+        ],
+        default="existing-file",
+    )
+    environment.add_argument("--current-file", type=Path)
+    environment.add_argument("--input-cache", type=Path)
+    environment.add_argument("--auto-prepare-tpxo-cache", action="store_true")
+    environment.add_argument("--model-dir", "--model-directory", dest="model_directory", type=Path)
+    environment.add_argument("--model-name", default=DEFAULT_TPXO_MODEL)
+    environment.add_argument("--definition-file", type=Path)
+    environment.add_argument("--grid-spacing-deg", type=float, default=0.05)
+    environment.add_argument("--download-directory", type=Path)
+    environment.add_argument("--username")
+    environment.add_argument("--password-env", default="CURRENTGRIB_COPERNICUS_PASSWORD")
+    environment.add_argument("--username-env", default="CURRENTGRIB_TEST_COPERNICUS_USERNAME")
+    environment.add_argument("--output", type=Path, required=True)
+    environment.add_argument("--overwrite", action="store_true")
+    environment.add_argument("--keep-intermediate", action="store_true")
+    environment.add_argument("--metadata-summary", action="store_true")
+    environment.add_argument("--json", action="store_true")
+    environment.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    environment.set_defaults(func=cmd_generate_environment_grib)
 
     download = subparsers.add_parser("download-copernicus", help="Download a Copernicus Marine current subset.")
     download.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"))
@@ -868,8 +921,22 @@ def cmd_generate_weather(args: argparse.Namespace) -> int:
             date=args.date,
             overwrite=args.overwrite,
             dry_run=args.dry_run,
+            preset=args.weather_preset,
         )
         generate_func = generate_gfs_weather_grib
+    elif args.provider == "gfs_wave":
+        source_label = "NOAA GFS Wave forecast via NOMADS"
+        request = GFSWaveRequest(
+            bbox=bbox,
+            output=args.output,
+            hours=args.hours,
+            step_hours=args.step_hours,
+            cycle=args.cycle,
+            date=args.date,
+            overwrite=args.overwrite,
+            dry_run=args.dry_run,
+        )
+        generate_func = generate_gfs_wave_grib
     elif args.provider == "ecmwf_ifs_open":
         source_label = ECMWF_SOURCE_LABEL
         request = ECMWFWeatherRequest(
@@ -881,6 +948,7 @@ def cmd_generate_weather(args: argparse.Namespace) -> int:
             date=args.date,
             overwrite=args.overwrite,
             dry_run=args.dry_run,
+            preset=args.weather_preset,
         )
         generate_func = generate_ecmwf_weather_grib
     elif args.provider == "dwd_icon_eu":
@@ -953,6 +1021,562 @@ def cmd_merge_gribs(args: argparse.Namespace) -> int:
                 flush=True,
             )
     return 0
+
+
+def cmd_generate_environment_grib(args: argparse.Namespace) -> int:
+    bbox = BoundingBox.from_values(args.bbox)
+    output = args.output.expanduser()
+    if output.exists() and output.is_dir():
+        raise ValidationError("--output must be a file path, not a directory")
+    if output.exists() and not args.overwrite:
+        raise ValidationError(f"output already exists: {output}; use --overwrite to replace it")
+    if args.weather_provider == "none" and args.current_source == "none":
+        raise ValidationError("at least one of weather or current must be enabled")
+    if args.include_waves and args.weather_provider not in {"gfs"}:
+        raise ValidationError("--include-waves is currently supported only with --weather-provider gfs")
+    wave_step_hours = args.wave_step_hours if args.wave_step_hours is not None else 3
+    if args.include_waves and (wave_step_hours < 3 or wave_step_hours % 3 != 0):
+        warnings_for_validation = (
+            f"requested wave step {wave_step_hours}h is not supported by the GFS Wave provider; using 3h"
+        )
+        wave_step_hours = 3
+    else:
+        warnings_for_validation = None
+
+    temp_parent = output.parent
+    temp_parent.mkdir(parents=True, exist_ok=True)
+    temp_dir_obj = None
+    if args.keep_intermediate:
+        temp_dir = Path(tempfile.mkdtemp(prefix=output.stem + ".intermediate.", dir=temp_parent))
+    else:
+        temp_dir_obj = tempfile.TemporaryDirectory(prefix=output.stem + ".intermediate.", dir=temp_parent)
+        temp_dir = Path(temp_dir_obj.name)
+
+    inputs: list[tuple[str, Path]] = []
+    intermediates: dict[str, str] = {}
+    warnings: list[str] = []
+    if warnings_for_validation:
+        warnings.append(warnings_for_validation)
+    weather_cycle_time: str | None = None
+    try:
+        if args.metadata_summary:
+            print("generating environmental GRIB", flush=True)
+            print(f"bbox: {bbox.west},{bbox.south},{bbox.east},{bbox.north}", flush=True)
+            print(f"hours: {args.hours}", flush=True)
+            print(f"step_hours: {args.step_hours}", flush=True)
+            print(f"weather_provider: {args.weather_provider}", flush=True)
+            print(f"weather_preset: {args.weather_preset}", flush=True)
+            print(f"include_waves: {bool(args.include_waves)}", flush=True)
+            if args.include_waves:
+                print(f"wave_step_hours: {wave_step_hours}", flush=True)
+                if args.step_hours != wave_step_hours:
+                    print(
+                        f"Wave fields will be included every {wave_step_hours} hours; "
+                        f"weather/current fields remain every {args.step_hours} hour"
+                        f"{'' if args.step_hours == 1 else 's'}.",
+                        flush=True,
+                    )
+            print(f"current_source: {args.current_source}", flush=True)
+            print(f"output: {output}", flush=True)
+
+        current_source = _resolve_environment_current_source(args.current_source, bbox, args.hours)
+        if current_source != args.current_source and args.metadata_summary:
+            print(f"selected current provider: {current_source}", flush=True)
+
+        if current_source == "existing-file":
+            if args.current_file is None:
+                raise ValidationError("--current-file is required with --current-source existing-file")
+            current_path = args.current_file.expanduser()
+            scan_grib_messages(current_path)
+            inputs.append(("current", current_path))
+            intermediates["current"] = str(current_path)
+        elif current_source in {
+            "tpxo-cache",
+            "tpxo",
+            "marine_ie_irish_sea",
+            "copernicus_nws",
+            "copernicus_global",
+        }:
+            # Generated after weather so an omitted --start can align to the
+            # selected weather cycle, while merge order still puts current first.
+            pass
+
+        if args.weather_provider == "existing-file":
+            if args.weather_file is None:
+                raise ValidationError("--weather-file is required with --weather-provider existing-file")
+            weather_path = args.weather_file.expanduser()
+            scan_grib_messages(weather_path)
+            inputs.append(("weather", weather_path))
+            intermediates["weather"] = str(weather_path)
+        elif args.weather_provider in {"gfs", "ecmwf_ifs_open"}:
+            weather_output = temp_dir / f"weather_{args.weather_provider}.grb2"
+            if args.weather_provider == "gfs":
+                if args.metadata_summary:
+                    print("generating GFS atmosphere weather GRIB", flush=True)
+                if args.include_waves and args.cycle == "auto":
+                    weather_result, wave_result = _generate_gfs_environment_with_waves(
+                        bbox=bbox,
+                        weather_output=weather_output,
+                        wave_output=temp_dir / "weather_gfs_wave.grb2",
+                        hours=args.hours,
+                        step_hours=args.step_hours,
+                        wave_step_hours=wave_step_hours,
+                        preset=args.weather_preset,
+                        metadata_summary=args.metadata_summary,
+                        verbose=args.verbose,
+                    )
+                else:
+                    weather_result = generate_gfs_weather_grib(
+                        GFSWeatherRequest(
+                            bbox=bbox,
+                            output=weather_output,
+                            hours=args.hours,
+                            step_hours=args.step_hours,
+                            cycle=args.cycle,
+                            date=args.date,
+                            overwrite=True,
+                            preset=args.weather_preset,
+                        ),
+                        progress_callback=_weather_progress_callback(args.verbose or args.metadata_summary),
+                    )
+                    wave_result = None
+            else:
+                if args.metadata_summary:
+                    print("generating ECMWF Open Data weather GRIB", flush=True)
+                    print("warning: ECMWF Open Data output is not spatially cropped yet; files may be large.", flush=True)
+                warnings.append("ECMWF Open Data output is not spatially cropped yet; files may be large.")
+                weather_result = generate_ecmwf_weather_grib(
+                    ECMWFWeatherRequest(
+                        bbox=bbox,
+                        output=weather_output,
+                        hours=args.hours,
+                        step_hours=args.step_hours,
+                        cycle=args.cycle,
+                        date=args.date,
+                        overwrite=True,
+                        preset=args.weather_preset,
+                    ),
+                    progress_callback=_weather_progress_callback(args.verbose or args.metadata_summary),
+                )
+                warnings.extend(weather_result.warnings or [])
+            weather_cycle_time = weather_result.cycle.cycle_time
+            inputs.append(("weather", weather_output))
+            intermediates["weather"] = str(weather_output)
+
+            if args.include_waves:
+                wave_output = temp_dir / "weather_gfs_wave.grb2"
+                if wave_result is None:
+                    if args.metadata_summary:
+                        print("generating GFS Wave GRIB", flush=True)
+                    wave_result = generate_gfs_wave_grib(
+                        GFSWaveRequest(
+                            bbox=bbox,
+                            output=wave_output,
+                            hours=args.hours,
+                            step_hours=wave_step_hours,
+                            cycle=weather_result.cycle.cycle if weather_result.cycle.cycle != "auto" else args.cycle,
+                            date=weather_result.cycle.date if weather_result.cycle.date != "auto" else args.date,
+                            overwrite=True,
+                        ),
+                        progress_callback=_weather_progress_callback(args.verbose or args.metadata_summary),
+                    )
+                inputs.append(("waves", wave_output))
+                intermediates["waves"] = str(wave_output)
+        elif args.weather_provider == "dwd_icon_eu":
+            raise ValidationError("DWD ICON-EU provider is not implemented yet")
+
+        if current_source in {
+            "tpxo-cache",
+            "tpxo",
+            "marine_ie_irish_sea",
+            "copernicus_nws",
+            "copernicus_global",
+        }:
+            current_output = temp_dir / f"current_{current_source}.grb"
+            current_start = _environment_current_start(args.start, weather_cycle_time)
+            _generate_environment_current_source(
+                args,
+                current_source=current_source,
+                bbox=bbox,
+                start=current_start,
+                output=current_output,
+                temp_dir=temp_dir,
+            )
+            inputs.insert(0, ("current", current_output))
+            intermediates["current"] = str(current_output)
+
+        if not inputs:
+            raise ValidationError("no GRIB inputs were generated or selected")
+        if args.metadata_summary:
+            print("merging environmental GRIB streams", flush=True)
+            print("order: current first, weather second, waves third", flush=True)
+        result = merge_grib_streams(inputs, output, overwrite=True)
+        data = {
+            "output": str(output),
+            "intermediate_files": intermediates,
+            "input_message_counts": result.input_message_counts,
+            "output_message_count": result.output_message_count,
+            "byte_count": result.byte_count,
+            "inspection": result.inspection,
+            "warnings": warnings,
+            "intermediate_directory": str(temp_dir) if args.keep_intermediate else None,
+        }
+        if args.json:
+            print(json.dumps(data, indent=2, sort_keys=True))
+        else:
+            print(f"wrote environmental GRIB: {output}", flush=True)
+            for label, count in result.input_message_counts.items():
+                print(f"{label} messages: {count}", flush=True)
+            print(f"output messages: {result.output_message_count}", flush=True)
+            print(f"validated GRIB stream: {result.output_message_count} messages, {result.byte_count} bytes", flush=True)
+            inspection = result.inspection
+            if inspection.get("edition_counts"):
+                print(f"edition counts: {inspection.get('edition_counts')}", flush=True)
+            if inspection.get("short_name_counts"):
+                print(f"short name counts: {inspection.get('short_name_counts')}", flush=True)
+            if inspection.get("current_component_counts"):
+                print(f"current components: {inspection.get('current_component_counts')}", flush=True)
+            if inspection.get("first_valid_time") or inspection.get("last_valid_time"):
+                print(
+                    f"valid time range: {inspection.get('first_valid_time')} to {inspection.get('last_valid_time')}",
+                    flush=True,
+                )
+            if args.keep_intermediate:
+                print(f"kept intermediate directory: {temp_dir}", flush=True)
+            for warning in warnings:
+                print(f"warning: {warning}", flush=True)
+    finally:
+        if temp_dir_obj is not None:
+            temp_dir_obj.cleanup()
+    return 0
+
+
+def _environment_current_start(start_text: str | None, weather_cycle_time: str | None) -> str:
+    if start_text:
+        return parse_utc_datetime(start_text).isoformat().replace("+00:00", "Z")
+    if weather_cycle_time and weather_cycle_time != "autoTauto00Z":
+        raw = weather_cycle_time
+        if raw.endswith("Z") and "T" in raw:
+            return f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}T{raw[9:11]}:00:00Z"
+    now = monotonic_time_datetime_utc_hour()
+    return now.isoformat().replace("+00:00", "Z")
+
+
+def _generate_gfs_environment_with_waves(
+    *,
+    bbox: BoundingBox,
+    weather_output: Path,
+    wave_output: Path,
+    hours: int,
+    step_hours: int,
+    wave_step_hours: int,
+    preset: str,
+    metadata_summary: bool,
+    verbose: bool,
+):
+    progress = _weather_progress_callback(verbose or metadata_summary)
+    probe = GFSWeatherRequest(
+        bbox=bbox,
+        output=weather_output,
+        hours=hours,
+        step_hours=step_hours,
+        cycle="auto",
+        overwrite=True,
+        preset=preset,
+    )
+    errors: list[str] = []
+    for candidate in gfs_cycle_candidates(probe):
+        date = candidate.date
+        cycle = candidate.cycle
+        if metadata_summary:
+            print(f"checking combined GFS atmosphere/wave cycle {candidate.cycle_time}", flush=True)
+        try:
+            weather_output.unlink(missing_ok=True)
+            wave_output.unlink(missing_ok=True)
+            weather_result = generate_gfs_weather_grib(
+                GFSWeatherRequest(
+                    bbox=bbox,
+                    output=weather_output,
+                    hours=hours,
+                    step_hours=step_hours,
+                    cycle=cycle,
+                    date=date,
+                    overwrite=True,
+                    preset=preset,
+                ),
+                progress_callback=progress,
+            )
+            wave_result = generate_gfs_wave_grib(
+                GFSWaveRequest(
+                    bbox=bbox,
+                    output=wave_output,
+                    hours=hours,
+                    step_hours=wave_step_hours,
+                    cycle=cycle,
+                    date=date,
+                    overwrite=True,
+                ),
+                progress_callback=progress,
+            )
+            if metadata_summary:
+                print(f"selected GFS cycle {candidate.cycle_time}", flush=True)
+            return weather_result, wave_result
+        except ValidationError as exc:
+            weather_output.unlink(missing_ok=True)
+            wave_output.unlink(missing_ok=True)
+            errors.append(f"{candidate.cycle_time}: {exc}")
+            if metadata_summary:
+                print(f"GFS cycle {candidate.cycle_time} incomplete; trying previous cycle", flush=True)
+    raise ValidationError(
+        "No complete GFS cycle was available for the requested atmosphere and wave hours. "
+        "Try a shorter duration or explicit older cycle. Tried: " + "; ".join(errors)
+    )
+
+
+def monotonic_time_datetime_utc_hour():
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+
+
+def _resolve_environment_current_source(current_source: str, bbox: BoundingBox, hours: int) -> str:
+    if current_source != "auto":
+        return current_source
+    selected = select_best_provider_for_bbox(bbox, duration_hours=hours, registry=ProviderRegistry())
+    if selected is None:
+        raise ValidationError("no current provider supports the requested bbox/duration")
+    if selected.id not in {"marine_ie_irish_sea", "copernicus_nws", "copernicus_global"}:
+        raise ValidationError(f"auto selected unsupported environmental current provider: {selected.id}")
+    return selected.id
+
+
+def _generate_environment_current_source(
+    args: argparse.Namespace,
+    *,
+    current_source: str,
+    bbox: BoundingBox,
+    start: str,
+    output: Path,
+    temp_dir: Path,
+) -> None:
+    if current_source == "tpxo-cache":
+        if args.input_cache is None:
+            raise ValidationError("--input-cache is required with --current-source tpxo-cache")
+        cache_path = args.input_cache.expanduser()
+        cache_status = _environment_tpxo_cache_status(
+            cache_path,
+            bbox=bbox,
+            grid_spacing_deg=args.grid_spacing_deg,
+            model_name=args.model_name,
+        )
+        if cache_status != "usable":
+            if not args.auto_prepare_tpxo_cache:
+                raise ValidationError(
+                    f"TPXO cache is {cache_status}: {cache_path}. "
+                    "Use --auto-prepare-tpxo-cache with --model-dir, --model-name, and --grid-spacing-deg to prepare/update it."
+                )
+            if args.model_directory is None:
+                raise ValidationError("--model-dir is required to auto-prepare a TPXO cache")
+            if args.metadata_summary:
+                if cache_status == "missing":
+                    print(f"TPXO cache missing; preparing cache: {cache_path}", flush=True)
+                else:
+                    print(f"TPXO cache {cache_status}; updating cache: {cache_path}", flush=True)
+            started = monotonic_time.perf_counter()
+            prepared = prepare_tpxo_cache(
+                bbox=bbox,
+                grid_spacing_deg=args.grid_spacing_deg,
+                model_directory=args.model_directory,
+                model_name=args.model_name,
+                output=cache_path,
+                definition_file=args.definition_file,
+                verbose=args.verbose,
+            )
+            if args.metadata_summary:
+                print(
+                    f"prepared TPXO cache in {prepared.preparation_seconds:.2f}s "
+                    f"({monotonic_time.perf_counter() - started:.2f}s total): {cache_path}",
+                    flush=True,
+                )
+        elif args.metadata_summary:
+            print(f"Using TPXO cache: {cache_path}", flush=True)
+        if args.metadata_summary:
+            print(f"generating TPXO cache current from {start}", flush=True)
+        current_args = _environment_generate_namespace(
+            bbox=None,
+            start=start,
+            hours=args.hours,
+            step_hours=args.step_hours,
+            grid_spacing_deg=None,
+            source="tpxo-cache",
+            output=output,
+            input_cache=cache_path,
+            model_directory=None,
+            model_name=DEFAULT_TPXO_MODEL,
+            definition_file=None,
+            metadata_summary=args.metadata_summary,
+            verbose=args.verbose,
+        )
+        cmd_generate(current_args)
+        return
+
+    if current_source == "tpxo":
+        if args.model_directory is None:
+            raise ValidationError("--model-dir is required with --current-source tpxo")
+        if not args.model_name:
+            raise ValidationError("--model-name is required with --current-source tpxo")
+        if args.metadata_summary:
+            print(f"generating direct TPXO current from {start}", flush=True)
+        current_args = _environment_generate_namespace(
+            bbox=[bbox.west, bbox.south, bbox.east, bbox.north],
+            start=start,
+            hours=args.hours,
+            step_hours=args.step_hours,
+            grid_spacing_deg=args.grid_spacing_deg,
+            source="tpxo",
+            output=output,
+            input_cache=None,
+            model_directory=args.model_directory,
+            model_name=args.model_name,
+            definition_file=args.definition_file,
+            metadata_summary=args.metadata_summary,
+            verbose=args.verbose,
+        )
+        cmd_generate(current_args)
+        return
+
+    if current_source == "marine_ie_irish_sea":
+        if args.metadata_summary:
+            print("downloading Marine.ie Irish Sea current GRIB", flush=True)
+            print("warning: Marine.ie is the latest provider model run; valid time range depends on provider run time.", flush=True)
+        download_marine_ie_irish_sea_grib(
+            output,
+            overwrite=True,
+            progress_callback=_direct_grib_progress_callback(args.verbose),
+        )
+        return
+
+    if current_source in {"copernicus_nws", "copernicus_global"}:
+        download_dir = args.download_directory.expanduser() if args.download_directory else temp_dir / "current_downloads"
+        if args.metadata_summary:
+            print(f"generating Copernicus current provider: {current_source}", flush=True)
+        copernicus_args = argparse.Namespace(
+            bbox=[bbox.west, bbox.south, bbox.east, bbox.north],
+            provider=current_source,
+            start=start,
+            end=None,
+            hours=args.hours,
+            step_hours=args.step_hours,
+            grid_spacing_deg=0.03,
+            source_grid_regularity_tolerance=None,
+            download_directory=download_dir,
+            download_filename=None,
+            output=output,
+            username=args.username,
+            password_env=args.password_env,
+            username_env=args.username_env,
+            overwrite=True,
+            dry_run=False,
+            json=False,
+            metadata_summary=args.metadata_summary,
+            verbose=args.verbose,
+            debug=False,
+        )
+        cmd_generate_copernicus(copernicus_args)
+        return
+
+    raise ValidationError(f"unsupported environmental current source: {current_source}")
+
+
+def _environment_tpxo_cache_status(
+    path: Path,
+    *,
+    bbox: BoundingBox,
+    grid_spacing_deg: float,
+    model_name: str,
+) -> str:
+    if not path.exists():
+        return "missing"
+    try:
+        inspection = validate_tpxo_cache(path)
+    except ValidationError:
+        return "invalid"
+    cached_bbox = inspection.get("bbox") or {}
+    try:
+        cache_bbox = BoundingBox(
+            float(cached_bbox["west"]),
+            float(cached_bbox["south"]),
+            float(cached_bbox["east"]),
+            float(cached_bbox["north"]),
+        )
+    except Exception:
+        return "invalid"
+    if (
+        abs(cache_bbox.west - bbox.west) > 1e-10
+        or abs(cache_bbox.south - bbox.south) > 1e-10
+        or abs(cache_bbox.east - bbox.east) > 1e-10
+        or abs(cache_bbox.north - bbox.north) > 1e-10
+    ):
+        return "does not match requested bbox"
+    if abs(float(inspection.get("grid_spacing_deg", -1.0)) - grid_spacing_deg) > 1e-12:
+        return "does not match requested grid spacing"
+    if str(inspection.get("model_name", "")) != model_name:
+        return "does not match requested model"
+    if inspection.get("stale"):
+        return "stale"
+    return "usable"
+
+
+def _environment_generate_namespace(
+    *,
+    bbox: list[float] | None,
+    start: str,
+    hours: int,
+    step_hours: int,
+    grid_spacing_deg: float | None,
+    source: str,
+    output: Path,
+    input_cache: Path | None,
+    model_directory: Path | None,
+    model_name: str,
+    definition_file: Path | None,
+    metadata_summary: bool,
+    verbose: bool,
+) -> argparse.Namespace:
+    return argparse.Namespace(
+        bbox=bbox,
+        start=start,
+        hours=hours,
+        step_hours=step_hours,
+        grid_spacing_deg=grid_spacing_deg,
+        source=source,
+        model_directory=model_directory,
+        model_name=model_name,
+        definition_file=definition_file,
+        input_cache=input_cache,
+        tpxo_workers=1,
+        input_netcdf=None,
+        u_variable=None,
+        v_variable=None,
+        lat_variable=None,
+        lon_variable=None,
+        time_variable=None,
+        depth_index=None,
+        depth_value=None,
+        assume_units=None,
+        nearest_time=False,
+        coverage_tolerance_deg=0.02,
+        source_grid_regularity_tolerance=1e-5,
+        clip_bbox_to_source=False,
+        use_source_grid=False,
+        output=output,
+        format="grib1",
+        units="mps",
+        dry_run=False,
+        metadata_summary=metadata_summary,
+        json_summary=False,
+        verbose=verbose,
+    )
 
 
 def cmd_generate_provider(args: argparse.Namespace) -> int:
@@ -1457,11 +2081,29 @@ def _weather_progress_callback(verbose: bool):
     def callback(step: str, details: dict[str, Any]) -> None:
         if step == "checking GFS cycle":
             print(f"checking GFS cycle {details.get('cycle')} f{int(details.get('hour', 0)):03d}", flush=True)
+        elif step == "GFS cycle incomplete":
+            print(f"GFS cycle {details.get('cycle')} incomplete: {details.get('error')}; trying previous cycle", flush=True)
+        elif step == "selected GFS cycle":
+            print(f"selected GFS cycle {details.get('cycle')}", flush=True)
         elif step == "downloading GFS forecast hour":
             print(f"downloading GFS {details.get('cycle')} f{int(details.get('hour', 0)):03d}", flush=True)
         elif step == "downloaded GFS forecast hour":
             print(
                 f"downloaded GFS {details.get('cycle')} f{int(details.get('hour', 0)):03d}: "
+                f"{details.get('bytes')} bytes",
+                flush=True,
+            )
+        elif step == "checking GFS Wave cycle":
+            print(f"checking GFS Wave cycle {details.get('cycle')} f{int(details.get('hour', 0)):03d}", flush=True)
+        elif step == "GFS Wave cycle incomplete":
+            print(f"GFS Wave cycle {details.get('cycle')} incomplete: {details.get('error')}; trying previous cycle", flush=True)
+        elif step == "selected GFS Wave cycle":
+            print(f"selected GFS Wave cycle {details.get('cycle')}", flush=True)
+        elif step == "downloading GFS Wave forecast hour":
+            print(f"downloading GFS Wave {details.get('cycle')} f{int(details.get('hour', 0)):03d}", flush=True)
+        elif step == "downloaded GFS Wave forecast hour":
+            print(
+                f"downloaded GFS Wave {details.get('cycle')} f{int(details.get('hour', 0)):03d}: "
                 f"{details.get('bytes')} bytes",
                 flush=True,
             )

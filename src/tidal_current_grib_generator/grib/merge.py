@@ -22,6 +22,7 @@ class MergeGribsResult:
     output_message_count: int
     byte_count: int
     inspection: dict[str, Any]
+    input_message_counts: dict[str, int] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -33,6 +34,10 @@ class MergeGribsResult:
             "output_message_count": self.output_message_count,
             "byte_count": self.byte_count,
             "inspection": self.inspection,
+            "input_message_counts": self.input_message_counts or {
+                "current": self.current_message_count,
+                "weather": self.weather_message_count,
+            },
         }
 
 
@@ -49,18 +54,76 @@ def merge_grib_files(current: Path, weather: Path, output: Path, *, overwrite: b
     if output.exists() and not overwrite:
         raise ValidationError(f"output already exists: {output}; use --overwrite to replace it")
 
-    current_scan = scan_grib_messages(current)
-    weather_scan = scan_grib_messages(weather)
-    expected_messages = current_scan.message_count + weather_scan.message_count
+    result = merge_grib_streams(
+        [("current", current), ("weather", weather)],
+        output,
+        overwrite=overwrite,
+    )
+    return MergeGribsResult(
+        current=current,
+        weather=weather,
+        output=output,
+        current_message_count=result.input_message_counts.get("current", 0),
+        weather_message_count=result.input_message_counts.get("weather", 0),
+        output_message_count=result.output_message_count,
+        byte_count=result.byte_count,
+        inspection=result.inspection,
+        input_message_counts=result.input_message_counts,
+    )
+
+
+@dataclass(frozen=True)
+class MergeStreamsResult:
+    inputs: list[tuple[str, Path]]
+    output: Path
+    input_message_counts: dict[str, int]
+    output_message_count: int
+    byte_count: int
+    inspection: dict[str, Any]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "inputs": [{"label": label, "path": str(path)} for label, path in self.inputs],
+            "output": str(self.output),
+            "input_message_counts": self.input_message_counts,
+            "output_message_count": self.output_message_count,
+            "byte_count": self.byte_count,
+            "inspection": self.inspection,
+        }
+
+
+def merge_grib_streams(
+    inputs: list[tuple[str, Path]],
+    output: Path,
+    *,
+    overwrite: bool = False,
+) -> MergeStreamsResult:
+    if not inputs:
+        raise ValidationError("at least one GRIB input is required")
+    expanded_inputs = [(label, path.expanduser()) for label, path in inputs]
+    for label, path in expanded_inputs:
+        if not path.exists():
+            raise ValidationError(f"{label} GRIB not found: {path}")
+    output = output.expanduser()
+    if output.exists() and output.is_dir():
+        raise ValidationError("--output must be a file path, not a directory")
+    if output.exists() and not overwrite:
+        raise ValidationError(f"output already exists: {output}; use --overwrite to replace it")
+
+    input_message_counts: dict[str, int] = {}
+    expected_messages = 0
+    for label, path in expanded_inputs:
+        scan = scan_grib_messages(path)
+        input_message_counts[label] = scan.message_count
+        expected_messages += scan.message_count
     tmp_path: Path | None = None
     try:
         output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(prefix=output.name + ".", suffix=".tmp", dir=output.parent, delete=False) as tmp:
             tmp_path = Path(tmp.name)
-            with current.open("rb") as current_handle:
-                tmp.write(current_handle.read())
-            with weather.open("rb") as weather_handle:
-                tmp.write(weather_handle.read())
+            for _, path in expanded_inputs:
+                with path.open("rb") as handle:
+                    tmp.write(handle.read())
         output_scan = scan_grib_messages(tmp_path)
         if output_scan.message_count != expected_messages:
             raise ValidationError(
@@ -72,12 +135,10 @@ def merge_grib_files(current: Path, weather: Path, output: Path, *, overwrite: b
     finally:
         if tmp_path is not None and tmp_path.exists():
             tmp_path.unlink()
-    return MergeGribsResult(
-        current=current,
-        weather=weather,
+    return MergeStreamsResult(
+        inputs=expanded_inputs,
         output=output,
-        current_message_count=current_scan.message_count,
-        weather_message_count=weather_scan.message_count,
+        input_message_counts=input_message_counts,
         output_message_count=output_scan.message_count,
         byte_count=output_scan.byte_count,
         inspection=inspection,

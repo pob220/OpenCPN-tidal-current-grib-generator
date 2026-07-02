@@ -11,11 +11,16 @@ from tidal_current_grib_generator.geo import BoundingBox
 from tidal_current_grib_generator.weather import (
     ECMWFWeatherRequest,
     GFSCycle,
+    GFSWaveRequest,
     GFSWeatherRequest,
+    WeatherGenerateResult,
     build_gfs_filter_url,
+    build_gfs_wave_filter_url,
     forecast_hour_sequence,
+    generate_gfs_wave_grib,
     generate_ecmwf_weather_grib,
     generate_gfs_weather_grib,
+    gfs_variables_for_preset,
     gfs_cycle_candidates,
     list_weather_providers,
 )
@@ -65,6 +70,30 @@ def test_gfs_url_construction_for_known_cycle_bbox():
     assert "rightlon=-2.5" in url
     assert "toplat=56.5" in url
     assert "bottomlat=50.5" in url
+
+
+def test_gfs_preset_fields():
+    assert set(gfs_variables_for_preset("minimal")) == {"var_UGRD", "var_VGRD", "lev_10_m_above_ground"}
+    marine = gfs_variables_for_preset("marine")
+    assert marine["var_GUST"] == "on"
+    assert marine["var_TCDC"] == "on"
+    assert marine["var_APCP"] == "on"
+
+
+def test_gfs_wave_url_construction_for_known_cycle_bbox():
+    url = build_gfs_wave_filter_url(
+        GFSCycle("20260701", "06"),
+        3,
+        BoundingBox(-8.5, 50.5, -2.5, 56.5),
+    )
+
+    assert url.startswith("https://nomads.ncep.noaa.gov/cgi-bin/filter_gfswave.pl?")
+    assert "file=gfswave.t06z.global.0p25.f003.grib2" in url
+    assert "dir=%2Fgfs.20260701%2F06%2Fwave%2Fgridded" in url
+    assert "var_HTSGW=on" in url
+    assert "var_PERPW=on" in url
+    assert "var_DIRPW=on" in url
+    assert "lev_surface=on" in url
 
 
 def test_gfs_auto_cycle_candidates_newest_to_older():
@@ -157,6 +186,41 @@ def test_generate_gfs_appends_grib_segments_atomically(monkeypatch, tmp_path: Pa
     assert output.read_bytes().count(b"GRIB") == 3
 
 
+def test_generate_gfs_wave_appends_grib_segments_atomically(monkeypatch, tmp_path: Path):
+    calls = []
+
+    def fake_http_get(url, timeout):
+        calls.append(url)
+        return _fake_grib2(f"wave-{len(calls)}".encode())
+
+    monkeypatch.setattr(
+        "tidal_current_grib_generator.weather.inspect_grib",
+        lambda path: {
+            "stream_valid": True,
+            "message_count": 3,
+            "edition_counts": {2: 3},
+            "short_name_counts": {"swh": 1, "perpw": 1, "dirpw": 1},
+        },
+    )
+
+    result = generate_gfs_wave_grib(
+        GFSWaveRequest(
+            bbox=BoundingBox(-8.5, 50.5, -2.5, 56.5),
+            output=tmp_path / "waves.grb2",
+            hours=6,
+            step_hours=3,
+            cycle="06",
+            date="20260701",
+        ),
+        http_get=fake_http_get,
+    )
+
+    assert result.output.exists()
+    assert result.provider == "gfs_wave"
+    assert len(calls) == 3
+    assert all("filter_gfswave.pl" in call for call in calls)
+
+
 def test_auto_cycle_falls_back_using_mocked_http(monkeypatch, tmp_path: Path):
     calls = []
 
@@ -186,6 +250,38 @@ def test_auto_cycle_falls_back_using_mocked_http(monkeypatch, tmp_path: Path):
 
     assert result.cycle == GFSCycle("20260702", "06")
     assert len(calls) == 2
+
+
+def test_auto_cycle_checks_all_required_gfs_hours(monkeypatch, tmp_path: Path):
+    calls = []
+
+    def fake_http_get(url, timeout):
+        calls.append(url)
+        if "20260702%2F12" in url and "f004" in url:
+            return b"<html>not published</html>"
+        return _fake_grib2(b"ok")
+
+    monkeypatch.setattr(
+        "tidal_current_grib_generator.weather.inspect_grib",
+        lambda path: {"stream_valid": True, "message_count": 1, "edition_counts": {2: 1}},
+    )
+
+    result = generate_gfs_weather_grib(
+        GFSWeatherRequest(
+            bbox=BoundingBox(-1, 50, 0, 51),
+            output=tmp_path / "gfs.grb2",
+            hours=4,
+            step_hours=1,
+            cycle="auto",
+            max_auto_cycles=2,
+            retry_delay_seconds=0,
+        ),
+        http_get=fake_http_get,
+        now=datetime(2026, 7, 2, 13, 30, tzinfo=timezone.utc),
+    )
+
+    assert result.cycle == GFSCycle("20260702", "06")
+    assert any("f004" in call for call in calls)
 
 
 def test_generate_gfs_dry_run_does_not_call_http(tmp_path: Path):
@@ -481,6 +577,486 @@ def test_merge_gribs_cli(monkeypatch, tmp_path: Path, capsys):
     assert "order: current first, weather second" in out
     assert "output messages: 2" in out
     assert output.exists()
+
+
+def test_generate_environment_grib_existing_current_and_weather(monkeypatch, tmp_path: Path, capsys):
+    current = tmp_path / "current.grb"
+    weather = tmp_path / "weather.grb2"
+    output = tmp_path / "environment.grb"
+    current.write_bytes(_fake_grib1(b"current"))
+    weather.write_bytes(_fake_grib2(b"weather"))
+    monkeypatch.setattr(
+        "tidal_current_grib_generator.grib.merge.inspect_grib",
+        lambda path: {
+            "stream_valid": True,
+            "message_count": 2,
+            "edition_counts": {1: 1, 2: 1},
+            "short_name_counts": {"unknown": 1, "10u": 1},
+            "current_component_counts": {"u_49": 1, "v_50": 0},
+        },
+    )
+
+    rc = main(
+        [
+            "generate-environment-grib",
+            "--bbox",
+            "-8.5",
+            "50.5",
+            "-2.5",
+            "56.5",
+            "--weather-provider",
+            "existing-file",
+            "--weather-file",
+            str(weather),
+            "--current-source",
+            "existing-file",
+            "--current-file",
+            str(current),
+            "--hours",
+            "3",
+            "--output",
+            str(output),
+            "--metadata-summary",
+        ]
+    )
+
+    assert rc == 0
+    assert output.read_bytes() == current.read_bytes() + weather.read_bytes()
+    out = capsys.readouterr().out
+    assert "current messages: 1" in out
+    assert "weather messages: 1" in out
+
+
+def test_generate_environment_grib_weather_only(monkeypatch, tmp_path: Path):
+    weather = tmp_path / "weather.grb2"
+    output = tmp_path / "environment.grb"
+    weather.write_bytes(_fake_grib2(b"weather"))
+    monkeypatch.setattr(
+        "tidal_current_grib_generator.grib.merge.inspect_grib",
+        lambda path: {"stream_valid": True, "message_count": 1, "edition_counts": {2: 1}},
+    )
+
+    rc = main(
+        [
+            "generate-environment-grib",
+            "--bbox",
+            "-8.5",
+            "50.5",
+            "-2.5",
+            "56.5",
+            "--weather-provider",
+            "existing-file",
+            "--weather-file",
+            str(weather),
+            "--current-source",
+            "none",
+            "--hours",
+            "3",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert rc == 0
+    assert output.read_bytes() == weather.read_bytes()
+
+
+def test_generate_environment_grib_include_waves_requires_gfs(tmp_path: Path, capsys):
+    rc = main(
+        [
+            "generate-environment-grib",
+            "--bbox",
+            "-8.5",
+            "50.5",
+            "-2.5",
+            "56.5",
+            "--weather-provider",
+            "ecmwf_ifs_open",
+            "--include-waves",
+            "--current-source",
+            "none",
+            "--hours",
+            "3",
+            "--output",
+            str(tmp_path / "out.grb"),
+        ]
+    )
+
+    assert rc == 2
+    assert "--include-waves is currently supported only with --weather-provider gfs" in capsys.readouterr().err
+
+
+def test_generate_environment_grib_hourly_weather_with_three_hour_waves(monkeypatch, tmp_path: Path, capsys):
+    calls = {"weather": [], "waves": []}
+
+    def fake_weather(request, progress_callback=None):
+        calls["weather"].append(request)
+        request.output.write_bytes(_fake_grib2(b"weather"))
+        return WeatherGenerateResult(
+            provider="gfs",
+            source="NOAA GFS 0.25° forecast via NOMADS",
+            model="gfs_0p25",
+            cycle=GFSCycle("20260702", "06"),
+            bbox=request.bbox,
+            forecast_hours=forecast_hour_sequence(request.hours, request.step_hours),
+            output=request.output,
+            byte_count=request.output.stat().st_size,
+            message_count=1,
+            inspection={"stream_valid": True, "message_count": 1},
+            urls=[],
+            variables_levels={},
+        )
+
+    def fake_wave(request, progress_callback=None):
+        calls["waves"].append(request)
+        request.output.write_bytes(_fake_grib2(b"wave"))
+        return WeatherGenerateResult(
+            provider="gfs_wave",
+            source="NOAA GFS Wave forecast via NOMADS",
+            model="gfswave_global_0p25",
+            cycle=GFSCycle("20260702", "06"),
+            bbox=request.bbox,
+            forecast_hours=forecast_hour_sequence(request.hours, request.step_hours),
+            output=request.output,
+            byte_count=request.output.stat().st_size,
+            message_count=1,
+            inspection={"stream_valid": True, "message_count": 1},
+            urls=[],
+            variables_levels={},
+        )
+
+    monkeypatch.setattr("tidal_current_grib_generator.cli.generate_gfs_weather_grib", fake_weather)
+    monkeypatch.setattr("tidal_current_grib_generator.cli.generate_gfs_wave_grib", fake_wave)
+
+    rc = main(
+        [
+            "generate-environment-grib",
+            "--bbox",
+            "-8.5",
+            "50.5",
+            "-2.5",
+            "56.5",
+            "--weather-provider",
+            "gfs",
+            "--include-waves",
+            "--step-hours",
+            "1",
+            "--hours",
+            "6",
+            "--current-source",
+            "none",
+            "--output",
+            str(tmp_path / "environment.grb"),
+            "--metadata-summary",
+        ]
+    )
+
+    assert rc == 0
+    assert calls["weather"][0].step_hours == 1
+    assert calls["waves"][0].step_hours == 3
+    assert "Wave fields will be included every 3 hours; weather/current fields remain every 1 hour." in capsys.readouterr().out
+
+
+def _patch_generated_current(monkeypatch):
+    calls = []
+
+    def fake_cmd_generate(args):
+        calls.append(args)
+        args.output.write_bytes(_fake_grib1(f"current-{args.source}".encode()))
+        return 0
+
+    monkeypatch.setattr("tidal_current_grib_generator.cli.cmd_generate", fake_cmd_generate)
+    return calls
+
+
+def test_generate_environment_grib_tpxo_cache_current(monkeypatch, tmp_path: Path):
+    calls = _patch_generated_current(monkeypatch)
+    cache = tmp_path / "cache.tpxocache"
+    cache.write_bytes(b"cache")
+    monkeypatch.setattr(
+        "tidal_current_grib_generator.cli.validate_tpxo_cache",
+        lambda path: {
+            "bbox": {"west": -8.5, "south": 50.5, "east": -2.5, "north": 56.5},
+            "grid_spacing_deg": 0.05,
+            "model_name": "TPXO10-atlas-v2-nc",
+            "stale": False,
+        },
+    )
+    output = tmp_path / "environment.grb"
+
+    rc = main(
+        [
+            "generate-environment-grib",
+            "--bbox",
+            "-8.5",
+            "50.5",
+            "-2.5",
+            "56.5",
+            "--weather-provider",
+            "none",
+            "--current-source",
+            "tpxo-cache",
+            "--input-cache",
+            str(cache),
+            "--start",
+            "2026-07-02T00:00:00Z",
+            "--hours",
+            "3",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert rc == 0
+    assert calls[0].source == "tpxo-cache"
+    assert calls[0].input_cache == cache
+    assert output.read_bytes().startswith(b"GRIB")
+
+
+def test_generate_environment_grib_tpxo_cache_missing_without_auto_prepare(tmp_path: Path, capsys):
+    rc = main(
+        [
+            "generate-environment-grib",
+            "--bbox",
+            "-8.5",
+            "50.5",
+            "-2.5",
+            "56.5",
+            "--weather-provider",
+            "none",
+            "--current-source",
+            "tpxo-cache",
+            "--input-cache",
+            str(tmp_path / "missing.tpxocache"),
+            "--start",
+            "2026-07-02T00:00:00Z",
+            "--hours",
+            "3",
+            "--output",
+            str(tmp_path / "environment.grb"),
+        ]
+    )
+
+    assert rc == 2
+    assert "--auto-prepare-tpxo-cache" in capsys.readouterr().err
+
+
+def test_generate_environment_grib_tpxo_cache_auto_prepare(monkeypatch, tmp_path: Path):
+    calls = _patch_generated_current(monkeypatch)
+    prepared = {}
+
+    def fake_prepare(**kwargs):
+        prepared.update(kwargs)
+        kwargs["output"].write_bytes(b"prepared")
+
+        class FakePrepared:
+            preparation_seconds = 0.5
+
+        return FakePrepared()
+
+    monkeypatch.setattr("tidal_current_grib_generator.cli.prepare_tpxo_cache", fake_prepare)
+    output = tmp_path / "environment.grb"
+    cache = tmp_path / "new.tpxocache"
+
+    rc = main(
+        [
+            "generate-environment-grib",
+            "--bbox",
+            "-8.5",
+            "50.5",
+            "-2.5",
+            "56.5",
+            "--weather-provider",
+            "none",
+            "--current-source",
+            "tpxo-cache",
+            "--input-cache",
+            str(cache),
+            "--auto-prepare-tpxo-cache",
+            "--model-dir",
+            str(tmp_path),
+            "--model-name",
+            "TPXO10-atlas-v2-nc",
+            "--grid-spacing-deg",
+            "0.05",
+            "--start",
+            "2026-07-02T00:00:00Z",
+            "--hours",
+            "3",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert rc == 0
+    assert prepared["output"] == cache
+    assert calls[0].input_cache == cache
+
+
+def test_generate_environment_grib_tpxo_direct_current(monkeypatch, tmp_path: Path):
+    calls = _patch_generated_current(monkeypatch)
+    output = tmp_path / "environment.grb"
+
+    rc = main(
+        [
+            "generate-environment-grib",
+            "--bbox",
+            "-6.0",
+            "53.0",
+            "-5.5",
+            "53.5",
+            "--weather-provider",
+            "none",
+            "--current-source",
+            "tpxo",
+            "--model-dir",
+            str(tmp_path),
+            "--model-name",
+            "TPXO10-atlas-v2-nc",
+            "--start",
+            "2026-07-02T00:00:00Z",
+            "--hours",
+            "3",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert rc == 0
+    assert calls[0].source == "tpxo"
+    assert calls[0].model_directory == tmp_path
+
+
+def test_generate_environment_grib_marine_ie_current(monkeypatch, tmp_path: Path):
+    calls = []
+
+    def fake_download(output, overwrite=False, progress_callback=None):
+        calls.append((output, overwrite))
+        output.write_bytes(_fake_grib1(b"marine"))
+        return object()
+
+    monkeypatch.setattr("tidal_current_grib_generator.cli.download_marine_ie_irish_sea_grib", fake_download)
+    output = tmp_path / "environment.grb"
+
+    rc = main(
+        [
+            "generate-environment-grib",
+            "--bbox",
+            "-6.0",
+            "53.0",
+            "-5.5",
+            "53.5",
+            "--weather-provider",
+            "none",
+            "--current-source",
+            "marine_ie_irish_sea",
+            "--hours",
+            "24",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert rc == 0
+    assert calls and calls[0][1] is True
+
+
+def test_generate_environment_grib_copernicus_current(monkeypatch, tmp_path: Path):
+    calls = []
+
+    def fake_copernicus(args):
+        calls.append(args)
+        args.output.write_bytes(_fake_grib1(b"copernicus"))
+        return 0
+
+    monkeypatch.setattr("tidal_current_grib_generator.cli.cmd_generate_copernicus", fake_copernicus)
+    output = tmp_path / "environment.grb"
+
+    rc = main(
+        [
+            "generate-environment-grib",
+            "--bbox",
+            "-8.5",
+            "50.5",
+            "-2.5",
+            "56.5",
+            "--weather-provider",
+            "none",
+            "--current-source",
+            "copernicus_nws",
+            "--username",
+            "user@example.com",
+            "--password-env",
+            "CURRENTGRIB_COPERNICUS_PASSWORD",
+            "--start",
+            "2026-07-02T00:00:00Z",
+            "--hours",
+            "3",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert rc == 0
+    assert calls[0].provider == "copernicus_nws"
+    assert calls[0].username == "user@example.com"
+    assert calls[0].password_env == "CURRENTGRIB_COPERNICUS_PASSWORD"
+
+
+def test_generate_environment_grib_auto_current_selects_marine(monkeypatch, tmp_path: Path, capsys):
+    def fake_download(output, overwrite=False, progress_callback=None):
+        output.write_bytes(_fake_grib1(b"marine"))
+        return object()
+
+    monkeypatch.setattr("tidal_current_grib_generator.cli.download_marine_ie_irish_sea_grib", fake_download)
+    output = tmp_path / "environment.grb"
+
+    rc = main(
+        [
+            "generate-environment-grib",
+            "--bbox",
+            "-6.0",
+            "53.0",
+            "-5.5",
+            "53.5",
+            "--weather-provider",
+            "none",
+            "--current-source",
+            "auto",
+            "--hours",
+            "24",
+            "--output",
+            str(output),
+            "--metadata-summary",
+        ]
+    )
+
+    assert rc == 0
+    assert "selected current provider: marine_ie_irish_sea" in capsys.readouterr().out
+
+
+def test_generate_environment_grib_missing_current_inputs(tmp_path: Path, capsys):
+    rc = main(
+        [
+            "generate-environment-grib",
+            "--bbox",
+            "-8.5",
+            "50.5",
+            "-2.5",
+            "56.5",
+            "--weather-provider",
+            "none",
+            "--current-source",
+            "existing-file",
+            "--hours",
+            "3",
+            "--output",
+            str(tmp_path / "out.grb"),
+        ]
+    )
+
+    assert rc == 2
+    assert "--current-file is required" in capsys.readouterr().err
 
 
 @pytest.mark.skipif(os.environ.get("CURRENTGRIB_TEST_LIVE_GFS") != "1", reason="live GFS test is opt-in")

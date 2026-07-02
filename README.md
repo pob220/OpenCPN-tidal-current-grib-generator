@@ -272,6 +272,7 @@ tidal-current-grib weather-providers
 Implemented providers:
 
 - `gfs`: Source: NOAA GFS 0.25° forecast via NOMADS. Downloads bbox-subset GRIB2 files without credentials.
+- `gfs_wave`: Source: NOAA GFS Wave forecast via NOMADS. Downloads bbox-subset significant wave height, primary wave period, and primary wave direction from the GFS Wave global 0.25 degree grid.
 - `ecmwf_ifs_open`: Source: ECMWF IFS Open Data forecast. Uses the optional official `ecmwf-opendata` client. The first implementation retrieves the requested fields from ECMWF Open Data and records the bbox in metadata; spatial cropping is not yet applied by this provider.
 
 Planned provider:
@@ -297,6 +298,30 @@ tidal-current-grib generate-weather \
   --metadata-summary \
   --verbose
 ```
+
+GFS marine preset with waves:
+
+```bash
+tidal-current-grib generate-environment-grib \
+  --bbox -8.5 50.5 -2.5 56.5 \
+  --cycle auto \
+  --hours 24 \
+  --step-hours 3 \
+  --weather-provider gfs \
+  --weather-preset marine \
+  --include-waves \
+  --current-source tpxo-cache \
+  --input-cache ~/.opencpn/tpxo-cache/tpxo10_irish_sea_bristol_north_channel_0p05.tpxocache \
+  --output ~/.opencpn/grib/generated/environment_gfs_waves_tpxo_irish_sea_24h.grb \
+  --metadata-summary \
+  --verbose
+```
+
+Weather presets:
+
+- `minimal`: 10 m U/V wind only.
+- `routing`: 10 m U/V wind, mean sea-level pressure, 2 m temperature.
+- `marine`: routing fields plus gusts, precipitation, and cloud cover where available. NOMADS applies variable and level selections independently, so this preset can include a few extra harmless surface/atmosphere messages.
 
 ECMWF Open Data example:
 

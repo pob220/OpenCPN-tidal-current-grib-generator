@@ -17,9 +17,11 @@ from tidal_current_grib_generator.geo import BoundingBox
 from tidal_current_grib_generator.grib.validation import inspect_grib, scan_grib_messages
 
 GFS_FILTER_ENDPOINT = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl"
+GFS_WAVE_FILTER_ENDPOINT = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfswave.pl"
 GFS_SOURCE_LABEL = "NOAA GFS 0.25° forecast via NOMADS"
+GFS_WAVE_SOURCE_LABEL = "NOAA GFS Wave forecast via NOMADS"
 ECMWF_SOURCE_LABEL = "ECMWF IFS Open Data forecast"
-GFS_VARIABLES_LEVELS = {
+GFS_ROUTING_VARIABLES_LEVELS = {
     "var_UGRD": "on",
     "var_VGRD": "on",
     "var_PRMSL": "on",
@@ -28,6 +30,25 @@ GFS_VARIABLES_LEVELS = {
     "lev_mean_sea_level": "on",
     "lev_2_m_above_ground": "on",
 }
+GFS_MINIMAL_VARIABLES_LEVELS = {
+    "var_UGRD": "on",
+    "var_VGRD": "on",
+    "lev_10_m_above_ground": "on",
+}
+GFS_MARINE_EXTRA_VARIABLES_LEVELS = {
+    "var_GUST": "on",
+    "var_TCDC": "on",
+    "var_APCP": "on",
+    "lev_surface": "on",
+    "lev_entire_atmosphere": "on",
+}
+GFS_WAVE_VARIABLES_LEVELS = {
+    "var_HTSGW": "on",
+    "var_PERPW": "on",
+    "var_DIRPW": "on",
+    "lev_surface": "on",
+}
+GFS_VARIABLES_LEVELS = GFS_ROUTING_VARIABLES_LEVELS
 ECMWF_PARAMETERS = ["10u", "10v", "msl", "2t"]
 ECMWF_VARIABLES_LEVELS = {
     "param": ECMWF_PARAMETERS,
@@ -94,6 +115,7 @@ class GFSWeatherRequest:
     retry_delay_seconds: float = 1.0
     max_auto_cycles: int = 8
     dry_run: bool = False
+    preset: str = "routing"
 
 
 @dataclass(frozen=True)
@@ -106,6 +128,22 @@ class ECMWFWeatherRequest:
     date: str | None = None
     overwrite: bool = False
     timeout_seconds: float = 180.0
+    dry_run: bool = False
+    preset: str = "routing"
+
+
+@dataclass(frozen=True)
+class GFSWaveRequest:
+    bbox: BoundingBox
+    output: Path
+    hours: int
+    step_hours: int = 3
+    cycle: str = "auto"
+    date: str | None = None
+    overwrite: bool = False
+    timeout_seconds: float = 60.0
+    retry_delay_seconds: float = 1.0
+    max_auto_cycles: int = 8
     dry_run: bool = False
 
 
@@ -154,6 +192,14 @@ def list_weather_providers() -> list[WeatherProvider]:
             description="Global Forecast System 0.25 degree GRIB2 subsets from the official NOMADS filter.",
         ),
         WeatherProvider(
+            id="gfs_wave",
+            label="NOAA GFS Wave forecast",
+            source="NOAA NOMADS",
+            format="GRIB2",
+            account="free/no account",
+            description="GFS Wave global 0.25 degree GRIB2 subsets from the official NOMADS wave filter.",
+        ),
+        WeatherProvider(
             id="ecmwf_ifs_open",
             label="ECMWF IFS Open Data forecast",
             source="ECMWF Open Data",
@@ -192,6 +238,7 @@ def generate_gfs_weather_grib(
     if output.exists() and not request.overwrite:
         raise ValidationError(f"output already exists: {output}; use --overwrite to replace it")
     forecast_hours = forecast_hour_sequence(request.hours, request.step_hours)
+    variables_levels = gfs_variables_for_preset(request.preset)
     candidates = gfs_cycle_candidates(request, now=now)
     if request.dry_run:
         planned_cycle = candidates[0]
@@ -211,43 +258,54 @@ def generate_gfs_weather_grib(
             byte_count=0,
             message_count=0,
             inspection=inspection,
-            urls=[build_gfs_filter_url(planned_cycle, hour, request.bbox) for hour in forecast_hours],
-            variables_levels=GFS_VARIABLES_LEVELS,
+            urls=[build_gfs_filter_url(planned_cycle, hour, request.bbox, variables_levels=variables_levels) for hour in forecast_hours],
+            variables_levels=variables_levels,
         )
 
-    first_bytes: bytes | None = None
     selected_cycle: GFSCycle | None = None
     urls: list[str] = []
+    segments: list[tuple[int, str, bytes]] = []
     errors: list[str] = []
 
     for candidate in candidates:
-        first_url = build_gfs_filter_url(candidate, forecast_hours[0], request.bbox)
         try:
-            _progress(progress_callback, "checking GFS cycle", {"cycle": candidate.cycle_time, "hour": forecast_hours[0]})
-            first_bytes = _download_grib_segment(first_url, http_get, request.timeout_seconds)
+            segments = _download_gfs_cycle_segments(
+                candidate,
+                forecast_hours,
+                request.bbox,
+                http_get,
+                request.timeout_seconds,
+                variables_levels=variables_levels,
+                progress_callback=progress_callback,
+                provider_label="GFS",
+                url_builder=build_gfs_filter_url,
+            )
             selected_cycle = candidate
-            urls.append(first_url)
+            urls = [url for _, url, _ in segments]
+            _progress(progress_callback, "selected GFS cycle", {"cycle": candidate.cycle_time})
             break
         except ValidationError as exc:
             errors.append(f"{candidate.cycle_time}: {exc}")
             if request.cycle != "auto":
                 raise
+            _progress(
+                progress_callback,
+                "GFS cycle incomplete",
+                {"cycle": candidate.cycle_time, "error": str(exc)},
+            )
             time.sleep(min(request.retry_delay_seconds, 5.0))
-    if selected_cycle is None or first_bytes is None:
-        raise ValidationError("no usable GFS cycle found; tried " + "; ".join(errors))
+    if selected_cycle is None or not segments:
+        raise ValidationError(
+            "No complete GFS cycle was available for the requested hours. "
+            "Try a shorter duration or explicit older cycle. Tried: " + "; ".join(errors)
+        )
 
     tmp_path: Path | None = None
     try:
         output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(prefix=output.name + ".", suffix=".tmp", dir=output.parent, delete=False) as tmp:
             tmp_path = Path(tmp.name)
-            _progress(progress_callback, "downloaded GFS forecast hour", {"cycle": selected_cycle.cycle_time, "hour": forecast_hours[0], "bytes": len(first_bytes)})
-            tmp.write(first_bytes)
-            for forecast_hour in forecast_hours[1:]:
-                url = build_gfs_filter_url(selected_cycle, forecast_hour, request.bbox)
-                _progress(progress_callback, "downloading GFS forecast hour", {"cycle": selected_cycle.cycle_time, "hour": forecast_hour})
-                segment = _download_grib_segment(url, http_get, request.timeout_seconds)
-                urls.append(url)
+            for forecast_hour, _url, segment in segments:
                 tmp.write(segment)
                 _progress(progress_callback, "downloaded GFS forecast hour", {"cycle": selected_cycle.cycle_time, "hour": forecast_hour, "bytes": len(segment)})
         scan = scan_grib_messages(tmp_path)
@@ -273,7 +331,112 @@ def generate_gfs_weather_grib(
         message_count=scan.message_count,
         inspection=inspection,
         urls=urls,
-        variables_levels=GFS_VARIABLES_LEVELS,
+        variables_levels=variables_levels,
+    )
+
+
+def generate_gfs_wave_grib(
+    request: GFSWaveRequest,
+    *,
+    http_get: HttpGet | None = None,
+    now: datetime | None = None,
+    progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+) -> WeatherGenerateResult:
+    request.bbox.validate()
+    _validate_gfs_wave_request(request)
+    http_get = http_get or _http_get
+    output = request.output.expanduser()
+    if output.exists() and output.is_dir():
+        raise ValidationError("--output must be a file path, not a directory")
+    if output.exists() and not request.overwrite:
+        raise ValidationError(f"output already exists: {output}; use --overwrite to replace it")
+    forecast_hours = forecast_hour_sequence(request.hours, request.step_hours)
+    candidates = gfs_wave_cycle_candidates(request, now=now)
+    if request.dry_run:
+        planned_cycle = candidates[0]
+        return WeatherGenerateResult(
+            provider="gfs_wave",
+            source=GFS_WAVE_SOURCE_LABEL,
+            model="gfswave_global_0p25",
+            cycle=planned_cycle,
+            bbox=request.bbox,
+            forecast_hours=forecast_hours,
+            output=output,
+            byte_count=0,
+            message_count=0,
+            inspection={"stream_valid": False, "message_count": 0, "dry_run": True},
+            urls=[build_gfs_wave_filter_url(planned_cycle, hour, request.bbox) for hour in forecast_hours],
+            variables_levels=GFS_WAVE_VARIABLES_LEVELS,
+        )
+
+    selected_cycle: GFSCycle | None = None
+    urls: list[str] = []
+    segments: list[tuple[int, str, bytes]] = []
+    errors: list[str] = []
+    for candidate in candidates:
+        try:
+            segments = _download_gfs_cycle_segments(
+                candidate,
+                forecast_hours,
+                request.bbox,
+                http_get,
+                request.timeout_seconds,
+                variables_levels=None,
+                progress_callback=progress_callback,
+                provider_label="GFS Wave",
+                url_builder=build_gfs_wave_filter_url,
+            )
+            selected_cycle = candidate
+            urls = [url for _, url, _ in segments]
+            _progress(progress_callback, "selected GFS Wave cycle", {"cycle": candidate.cycle_time})
+            break
+        except ValidationError as exc:
+            errors.append(f"{candidate.cycle_time}: {exc}")
+            if request.cycle != "auto":
+                raise
+            _progress(
+                progress_callback,
+                "GFS Wave cycle incomplete",
+                {"cycle": candidate.cycle_time, "error": str(exc)},
+            )
+            time.sleep(min(request.retry_delay_seconds, 5.0))
+    if selected_cycle is None or not segments:
+        raise ValidationError(
+            "No complete GFS Wave cycle was available for the requested hours. "
+            "Try a shorter duration or explicit older cycle. Tried: " + "; ".join(errors)
+        )
+
+    tmp_path: Path | None = None
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(prefix=output.name + ".", suffix=".tmp", dir=output.parent, delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+            for forecast_hour, _url, segment in segments:
+                tmp.write(segment)
+                _progress(progress_callback, "downloaded GFS Wave forecast hour", {"cycle": selected_cycle.cycle_time, "hour": forecast_hour, "bytes": len(segment)})
+        scan = scan_grib_messages(tmp_path)
+        if scan.message_count <= 0:
+            raise ValidationError("combined GFS Wave GRIB contains no messages")
+        inspection = inspect_grib(tmp_path)
+        tmp_path.replace(output)
+        tmp_path = None
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink()
+
+    return WeatherGenerateResult(
+        provider="gfs_wave",
+        source=GFS_WAVE_SOURCE_LABEL,
+        model="gfswave_global_0p25",
+        cycle=selected_cycle,
+        bbox=request.bbox,
+        forecast_hours=forecast_hours,
+        output=output,
+        byte_count=scan.byte_count,
+        message_count=scan.message_count,
+        inspection=inspection,
+        urls=urls,
+        variables_levels=GFS_WAVE_VARIABLES_LEVELS,
     )
 
 
@@ -400,7 +563,26 @@ def forecast_hour_sequence(hours: int, step_hours: int) -> list[int]:
     return list(range(0, hours + 1, step_hours))
 
 
-def build_gfs_filter_url(cycle: GFSCycle, forecast_hour: int, bbox: BoundingBox) -> str:
+def gfs_variables_for_preset(preset: str) -> dict[str, str]:
+    normalized = preset.strip().lower()
+    if normalized == "minimal":
+        return dict(GFS_MINIMAL_VARIABLES_LEVELS)
+    if normalized == "routing":
+        return dict(GFS_ROUTING_VARIABLES_LEVELS)
+    if normalized == "marine":
+        fields = dict(GFS_ROUTING_VARIABLES_LEVELS)
+        fields.update(GFS_MARINE_EXTRA_VARIABLES_LEVELS)
+        return fields
+    raise ValidationError("--weather-preset must be minimal, routing, or marine")
+
+
+def build_gfs_filter_url(
+    cycle: GFSCycle,
+    forecast_hour: int,
+    bbox: BoundingBox,
+    *,
+    variables_levels: dict[str, str] | None = None,
+) -> str:
     query = {
         "dir": cycle.directory,
         "file": f"gfs.t{cycle.cycle}z.pgrb2.0p25.f{forecast_hour:03d}",
@@ -409,9 +591,23 @@ def build_gfs_filter_url(cycle: GFSCycle, forecast_hour: int, bbox: BoundingBox)
         "rightlon": f"{bbox.east:g}",
         "toplat": f"{bbox.north:g}",
         "bottomlat": f"{bbox.south:g}",
-        **GFS_VARIABLES_LEVELS,
+        **(variables_levels or GFS_VARIABLES_LEVELS),
     }
     return f"{GFS_FILTER_ENDPOINT}?{urlencode(query)}"
+
+
+def build_gfs_wave_filter_url(cycle: GFSCycle, forecast_hour: int, bbox: BoundingBox) -> str:
+    query = {
+        "dir": f"/gfs.{cycle.date}/{cycle.cycle}/wave/gridded",
+        "file": f"gfswave.t{cycle.cycle}z.global.0p25.f{forecast_hour:03d}.grib2",
+        "subregion": "",
+        "leftlon": f"{bbox.west:g}",
+        "rightlon": f"{bbox.east:g}",
+        "toplat": f"{bbox.north:g}",
+        "bottomlat": f"{bbox.south:g}",
+        **GFS_WAVE_VARIABLES_LEVELS,
+    }
+    return f"{GFS_WAVE_FILTER_ENDPOINT}?{urlencode(query)}"
 
 
 def gfs_cycle_candidates(request: GFSWeatherRequest, *, now: datetime | None = None) -> list[GFSCycle]:
@@ -435,24 +631,72 @@ def gfs_cycle_candidates(request: GFSWeatherRequest, *, now: datetime | None = N
     return cycles
 
 
-def _download_grib_segment(url: str, http_get: HttpGet, timeout_seconds: float) -> bytes:
+def gfs_wave_cycle_candidates(request: GFSWaveRequest, *, now: datetime | None = None) -> list[GFSCycle]:
+    shim = GFSWeatherRequest(
+        bbox=request.bbox,
+        output=request.output,
+        hours=request.hours,
+        step_hours=request.step_hours,
+        cycle=request.cycle,
+        date=request.date,
+        overwrite=request.overwrite,
+        timeout_seconds=request.timeout_seconds,
+        retry_delay_seconds=request.retry_delay_seconds,
+        max_auto_cycles=request.max_auto_cycles,
+        dry_run=request.dry_run,
+    )
+    return gfs_cycle_candidates(shim, now=now)
+
+
+def _download_gfs_cycle_segments(
+    cycle: GFSCycle,
+    forecast_hours: list[int],
+    bbox: BoundingBox,
+    http_get: HttpGet,
+    timeout_seconds: float,
+    *,
+    variables_levels: dict[str, str] | None,
+    progress_callback: Callable[[str, dict[str, Any]], None] | None,
+    provider_label: str,
+    url_builder: Callable[..., str],
+) -> list[tuple[int, str, bytes]]:
+    segments: list[tuple[int, str, bytes]] = []
+    for forecast_hour in forecast_hours:
+        if provider_label == "GFS":
+            url = url_builder(cycle, forecast_hour, bbox, variables_levels=variables_levels)
+            download_step = "downloading GFS forecast hour"
+        else:
+            url = url_builder(cycle, forecast_hour, bbox)
+            download_step = "downloading GFS Wave forecast hour"
+        check_step = "checking GFS cycle" if provider_label == "GFS" else "checking GFS Wave cycle"
+        _progress(progress_callback, check_step, {"cycle": cycle.cycle_time, "hour": forecast_hour})
+        _progress(progress_callback, download_step, {"cycle": cycle.cycle_time, "hour": forecast_hour})
+        try:
+            data = _download_grib_segment(url, http_get, timeout_seconds, provider_label=provider_label)
+        except ValidationError as exc:
+            raise ValidationError(f"incomplete at f{forecast_hour:03d}: {exc}") from exc
+        segments.append((forecast_hour, url, data))
+    return segments
+
+
+def _download_grib_segment(url: str, http_get: HttpGet, timeout_seconds: float, *, provider_label: str = "GFS") -> bytes:
     try:
         data = http_get(url, timeout_seconds)
     except (HTTPError, URLError, TimeoutError, OSError) as exc:
-        raise ValidationError(f"GFS download failed: {exc}") from exc
-    _validate_downloaded_grib_bytes(data)
+        raise ValidationError(f"{provider_label} download failed: {exc}") from exc
+    _validate_downloaded_grib_bytes(data, provider_label=provider_label)
     return data
 
 
-def _validate_downloaded_grib_bytes(data: bytes) -> None:
+def _validate_downloaded_grib_bytes(data: bytes, *, provider_label: str = "GFS") -> None:
     if not data:
-        raise ValidationError("GFS download returned empty response")
+        raise ValidationError(f"{provider_label} download returned empty response")
     stripped = data.lstrip()
     if stripped.startswith((b"<", b"<!DOCTYPE", b"<html", b"<HTML")):
-        raise ValidationError("GFS download returned HTML/text instead of GRIB2")
+        raise ValidationError(f"{provider_label} download returned HTML/text instead of GRIB2")
     if b"GRIB" not in data[:32]:
         sample = stripped[:80].decode("utf-8", errors="replace")
-        raise ValidationError(f"GFS download did not start with a GRIB message: {sample!r}")
+        raise ValidationError(f"{provider_label} download did not start with a GRIB message: {sample!r}")
     with tempfile.NamedTemporaryFile(prefix="gfs-segment.", suffix=".grb2", delete=False) as tmp:
         tmp_path = Path(tmp.name)
         tmp.write(data)
@@ -461,7 +705,7 @@ def _validate_downloaded_grib_bytes(data: bytes) -> None:
     finally:
         tmp_path.unlink(missing_ok=True)
     if scan.message_count <= 0:
-        raise ValidationError("GFS download contained no GRIB messages")
+        raise ValidationError(f"{provider_label} download contained no GRIB messages")
 
 
 def _validate_downloaded_grib_file(path: Path, provider_label: str) -> None:
@@ -488,6 +732,13 @@ def _http_get(url: str, timeout_seconds: float) -> bytes:
 def _validate_gfs_request(request: GFSWeatherRequest) -> None:
     if request.step_hours not in {1, 3, 6, 12}:
         raise ValidationError("--step-hours must be one of 1, 3, 6, or 12 for GFS")
+    gfs_variables_for_preset(request.preset)
+    forecast_hour_sequence(request.hours, request.step_hours)
+
+
+def _validate_gfs_wave_request(request: GFSWaveRequest) -> None:
+    if request.step_hours not in {1, 3, 6, 12}:
+        raise ValidationError("--step-hours must be one of 1, 3, 6, or 12 for GFS Wave")
     forecast_hour_sequence(request.hours, request.step_hours)
 
 
