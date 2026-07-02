@@ -22,6 +22,7 @@ from tidal_current_grib_generator.copernicus import CopernicusDownloadRequest, d
 from tidal_current_grib_generator.dependencies import check_dependencies
 from tidal_current_grib_generator.geo import BoundingBox, build_regular_grid, build_time_sequence, parse_utc_datetime
 from tidal_current_grib_generator.grib.validation import inspect_grib, scan_grib_messages
+from tidal_current_grib_generator.grib.merge import merge_grib_files
 from tidal_current_grib_generator.grib.read import sample_current_components
 from tidal_current_grib_generator.grib.writer import EccodesGrib1CurrentWriter
 from tidal_current_grib_generator.model import components_to_speed_direction
@@ -40,8 +41,11 @@ from tidal_current_grib_generator.providers import (
 from tidal_current_grib_generator.api import GenerateCurrentGribRequest, generate_current_grib_from_netcdf
 from tidal_current_grib_generator.security import redact_text
 from tidal_current_grib_generator.weather import (
+    ECMWF_SOURCE_LABEL,
+    ECMWFWeatherRequest,
     GFSWeatherRequest,
     generate_gfs_weather_grib,
+    generate_ecmwf_weather_grib,
     list_weather_providers,
 )
 
@@ -169,7 +173,7 @@ def build_parser() -> argparse.ArgumentParser:
     weather_providers.set_defaults(func=cmd_weather_providers)
 
     generate_weather = subparsers.add_parser("generate-weather", help="Download/generate a weather GRIB.")
-    generate_weather.add_argument("--provider", choices=["gfs"], required=True)
+    generate_weather.add_argument("--provider", choices=["gfs", "ecmwf_ifs_open", "dwd_icon_eu"], required=True)
     generate_weather.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"))
     generate_weather.add_argument("--date", help="GFS cycle date YYYYMMDD for explicit cycles.")
     generate_weather.add_argument("--cycle", required=True, help="auto or explicit cycle 00, 06, 12, 18.")
@@ -182,6 +186,16 @@ def build_parser() -> argparse.ArgumentParser:
     generate_weather.add_argument("--json", action="store_true")
     generate_weather.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     generate_weather.set_defaults(func=cmd_generate_weather)
+
+    merge_gribs = subparsers.add_parser("merge-gribs", help="Merge current and weather GRIB streams.")
+    merge_gribs.add_argument("--current", type=Path, required=True)
+    merge_gribs.add_argument("--weather", type=Path, required=True)
+    merge_gribs.add_argument("--output", type=Path, required=True)
+    merge_gribs.add_argument("--overwrite", action="store_true")
+    merge_gribs.add_argument("--metadata-summary", action="store_true")
+    merge_gribs.add_argument("--json", action="store_true")
+    merge_gribs.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    merge_gribs.set_defaults(func=cmd_merge_gribs)
 
     download = subparsers.add_parser("download-copernicus", help="Download a Copernicus Marine current subset.")
     download.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"))
@@ -834,7 +848,7 @@ def cmd_weather_providers(args: argparse.Namespace) -> int:
         print(json.dumps({"providers": providers}, indent=2, sort_keys=True))
     else:
         for provider in providers:
-            print(f"{provider['id']}: {provider['label']}")
+            print(f"{provider['id']}: {provider['label']} ({'implemented' if provider.get('implemented', True) else 'stub'})")
             print(f"  {provider['account']}")
             print(f"  {provider['format']}")
             print(f"  source: {provider['source']}")
@@ -843,26 +857,46 @@ def cmd_weather_providers(args: argparse.Namespace) -> int:
 
 def cmd_generate_weather(args: argparse.Namespace) -> int:
     bbox = BoundingBox.from_values(args.bbox)
-    if args.provider != "gfs":
+    if args.provider == "gfs":
+        source_label = "NOAA GFS 0.25° forecast via NOMADS"
+        request = GFSWeatherRequest(
+            bbox=bbox,
+            output=args.output,
+            hours=args.hours,
+            step_hours=args.step_hours,
+            cycle=args.cycle,
+            date=args.date,
+            overwrite=args.overwrite,
+            dry_run=args.dry_run,
+        )
+        generate_func = generate_gfs_weather_grib
+    elif args.provider == "ecmwf_ifs_open":
+        source_label = ECMWF_SOURCE_LABEL
+        request = ECMWFWeatherRequest(
+            bbox=bbox,
+            output=args.output,
+            hours=args.hours,
+            step_hours=args.step_hours,
+            cycle=args.cycle,
+            date=args.date,
+            overwrite=args.overwrite,
+            dry_run=args.dry_run,
+        )
+        generate_func = generate_ecmwf_weather_grib
+    elif args.provider == "dwd_icon_eu":
+        raise ValidationError(
+            "DWD ICON-EU provider is not implemented yet; ECMWF Open Data and GFS are available in this CLI build"
+        )
+    else:
         raise ValidationError(f"unsupported weather provider: {args.provider}")
-    request = GFSWeatherRequest(
-        bbox=bbox,
-        output=args.output,
-        hours=args.hours,
-        step_hours=args.step_hours,
-        cycle=args.cycle,
-        date=args.date,
-        overwrite=args.overwrite,
-        dry_run=args.dry_run,
-    )
     if args.metadata_summary or args.dry_run:
-        print("Source: NOAA GFS 0.25° forecast via NOMADS", flush=True)
+        print(f"Source: {source_label}", flush=True)
         print(f"provider: {args.provider}", flush=True)
         print(f"bbox: {bbox.west},{bbox.south},{bbox.east},{bbox.north}", flush=True)
         print(f"hours: {args.hours}", flush=True)
         print(f"step_hours: {args.step_hours}", flush=True)
         print(f"output: {args.output.expanduser()}", flush=True)
-    result = generate_gfs_weather_grib(
+    result = generate_func(
         request,
         progress_callback=_weather_progress_callback(args.verbose or args.metadata_summary),
     )
@@ -881,6 +915,43 @@ def cmd_generate_weather(args: argparse.Namespace) -> int:
             last_valid = result.inspection.get("last_valid_time")
             if first_valid and last_valid:
                 print(f"valid_time_range: {first_valid} to {last_valid}", flush=True)
+            for warning in getattr(result, "warnings", None) or []:
+                print(f"warning: {warning}", flush=True)
+    return 0
+
+
+def cmd_merge_gribs(args: argparse.Namespace) -> int:
+    if args.metadata_summary:
+        print("merging GRIB streams", flush=True)
+        print(f"current: {args.current.expanduser()}", flush=True)
+        print(f"weather: {args.weather.expanduser()}", flush=True)
+        print(f"output: {args.output.expanduser()}", flush=True)
+        print("order: current first, weather second", flush=True)
+    result = merge_grib_files(args.current, args.weather, args.output, overwrite=args.overwrite)
+    if args.json:
+        print(json.dumps(result.as_dict(), indent=2, sort_keys=True))
+    else:
+        print(f"wrote merged GRIB: {result.output}", flush=True)
+        print(f"current input messages: {result.current_message_count}", flush=True)
+        print(f"weather input messages: {result.weather_message_count}", flush=True)
+        print(f"output messages: {result.output_message_count}", flush=True)
+        print(f"validated GRIB stream: {result.output_message_count} messages, {result.byte_count} bytes", flush=True)
+        inspection = result.inspection
+        if inspection.get("edition_counts"):
+            print(f"edition counts: {inspection.get('edition_counts')}", flush=True)
+        if inspection.get("parameter_counts"):
+            print(f"parameter counts: {inspection.get('parameter_counts')}", flush=True)
+        if inspection.get("short_name_counts"):
+            print(f"short name counts: {inspection.get('short_name_counts')}", flush=True)
+        if inspection.get("parameter_names"):
+            print(f"parameter names: {inspection.get('parameter_names')}", flush=True)
+        if inspection.get("current_component_counts"):
+            print(f"current components: {inspection.get('current_component_counts')}", flush=True)
+        if inspection.get("first_valid_time") or inspection.get("last_valid_time"):
+            print(
+                f"valid time range: {inspection.get('first_valid_time')} to {inspection.get('last_valid_time')}",
+                flush=True,
+            )
     return 0
 
 

@@ -128,6 +128,8 @@ def inspect_grib(path: Path) -> dict[str, Any]:
     result["eccodes_available"] = True
     parameter_counts: dict[str, int] = {}
     parameter_names: dict[str, str] = {}
+    short_name_counts: dict[str, int] = {}
+    grib2_parameter_counts: dict[str, int] = {}
     current_counts = {"u_49": 0, "v_50": 0}
     valid_times: list[str] = []
     coverages: list[dict[str, float]] = []
@@ -150,6 +152,16 @@ def inspect_grib(path: Path) -> dict[str, Any]:
                         current_counts["u_49"] += 1
                     if int(parameter) == 50:
                         current_counts["v_50"] += 1
+                short_name = _codes_get(eccodes, gid, "shortName")
+                if short_name:
+                    short_name_key = str(short_name)
+                    short_name_counts[short_name_key] = short_name_counts.get(short_name_key, 0) + 1
+                discipline = _codes_get(eccodes, gid, "discipline")
+                category = _codes_get(eccodes, gid, "parameterCategory")
+                grib2_parameter = _codes_get(eccodes, gid, "parameterNumber")
+                if discipline is not None and category is not None and grib2_parameter is not None:
+                    grib2_key = f"{int(discipline)}:{int(category)}:{int(grib2_parameter)}"
+                    grib2_parameter_counts[grib2_key] = grib2_parameter_counts.get(grib2_key, 0) + 1
                 valid_time = _valid_time(eccodes, gid)
                 if valid_time:
                     valid_times.append(valid_time)
@@ -160,6 +172,8 @@ def inspect_grib(path: Path) -> dict[str, Any]:
                 eccodes.codes_release(gid)
     result["parameter_counts"] = parameter_counts
     result["parameter_names"] = parameter_names
+    result["short_name_counts"] = short_name_counts
+    result["grib2_parameter_counts"] = grib2_parameter_counts
     result["current_component_counts"] = current_counts
     if valid_times:
         result["first_valid_time"] = min(valid_times)

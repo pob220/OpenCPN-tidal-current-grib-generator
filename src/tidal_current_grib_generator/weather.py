@@ -7,17 +7,18 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from tidal_current_grib_generator.errors import ValidationError
+from tidal_current_grib_generator.errors import MissingDependencyError, ValidationError
 from tidal_current_grib_generator.geo import BoundingBox
 from tidal_current_grib_generator.grib.validation import inspect_grib, scan_grib_messages
 
 GFS_FILTER_ENDPOINT = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl"
 GFS_SOURCE_LABEL = "NOAA GFS 0.25° forecast via NOMADS"
+ECMWF_SOURCE_LABEL = "ECMWF IFS Open Data forecast"
 GFS_VARIABLES_LEVELS = {
     "var_UGRD": "on",
     "var_VGRD": "on",
@@ -27,8 +28,19 @@ GFS_VARIABLES_LEVELS = {
     "lev_mean_sea_level": "on",
     "lev_2_m_above_ground": "on",
 }
+ECMWF_PARAMETERS = ["10u", "10v", "msl", "2t"]
+ECMWF_VARIABLES_LEVELS = {
+    "param": ECMWF_PARAMETERS,
+    "levtype": "sfc",
+    "type": "fc",
+}
 
 HttpGet = Callable[[str, float], bytes]
+
+
+class EcmwfClientFactory(Protocol):
+    def __call__(self, **kwargs: Any) -> Any:
+        ...
 
 
 @dataclass(frozen=True)
@@ -39,8 +51,9 @@ class WeatherProvider:
     format: str
     account: str
     description: str
+    implemented: bool = True
 
-    def as_dict(self) -> dict[str, str]:
+    def as_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
 
 
@@ -52,6 +65,16 @@ class GFSCycle:
     @property
     def directory(self) -> str:
         return f"/gfs.{self.date}/{self.cycle}/atmos"
+
+    @property
+    def cycle_time(self) -> str:
+        return f"{self.date}T{self.cycle}00Z"
+
+
+@dataclass(frozen=True)
+class WeatherCycle:
+    date: str
+    cycle: str
 
     @property
     def cycle_time(self) -> str:
@@ -74,11 +97,24 @@ class GFSWeatherRequest:
 
 
 @dataclass(frozen=True)
+class ECMWFWeatherRequest:
+    bbox: BoundingBox
+    output: Path
+    hours: int
+    step_hours: int = 3
+    cycle: str = "auto"
+    date: str | None = None
+    overwrite: bool = False
+    timeout_seconds: float = 180.0
+    dry_run: bool = False
+
+
+@dataclass(frozen=True)
 class WeatherGenerateResult:
     provider: str
     source: str
     model: str
-    cycle: GFSCycle
+    cycle: GFSCycle | WeatherCycle
     bbox: BoundingBox
     forecast_hours: list[int]
     output: Path
@@ -86,6 +122,8 @@ class WeatherGenerateResult:
     message_count: int
     inspection: dict[str, Any]
     urls: list[str]
+    variables_levels: dict[str, Any]
+    warnings: list[str] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -95,12 +133,13 @@ class WeatherGenerateResult:
             "cycle": self.cycle.cycle_time,
             "bbox": self.bbox.__dict__,
             "forecast_hours": self.forecast_hours,
-            "variables_levels": GFS_VARIABLES_LEVELS,
+            "variables_levels": self.variables_levels,
             "output": str(self.output),
             "byte_count": self.byte_count,
             "message_count": self.message_count,
             "inspection": self.inspection,
             "urls": self.urls,
+            "warnings": self.warnings or [],
         }
 
 
@@ -113,7 +152,27 @@ def list_weather_providers() -> list[WeatherProvider]:
             format="GRIB2",
             account="free/no account",
             description="Global Forecast System 0.25 degree GRIB2 subsets from the official NOMADS filter.",
-        )
+        ),
+        WeatherProvider(
+            id="ecmwf_ifs_open",
+            label="ECMWF IFS Open Data forecast",
+            source="ECMWF Open Data",
+            format="GRIB2",
+            account="free/no account",
+            description=(
+                "ECMWF Integrated Forecasting System Open Data GRIB2 forecast. "
+                "Initial implementation retrieves the requested fields without spatial cropping."
+            ),
+        ),
+        WeatherProvider(
+            id="dwd_icon_eu",
+            label="DWD ICON-EU forecast",
+            source="DWD Open Data",
+            format="GRIB2",
+            account="free/no account",
+            description="Planned ICON-EU GRIB2 provider. Not implemented in this CLI build yet.",
+            implemented=False,
+        ),
     ]
 
 
@@ -153,6 +212,7 @@ def generate_gfs_weather_grib(
             message_count=0,
             inspection=inspection,
             urls=[build_gfs_filter_url(planned_cycle, hour, request.bbox) for hour in forecast_hours],
+            variables_levels=GFS_VARIABLES_LEVELS,
         )
 
     first_bytes: bytes | None = None
@@ -213,6 +273,120 @@ def generate_gfs_weather_grib(
         message_count=scan.message_count,
         inspection=inspection,
         urls=urls,
+        variables_levels=GFS_VARIABLES_LEVELS,
+    )
+
+
+def generate_ecmwf_weather_grib(
+    request: ECMWFWeatherRequest,
+    *,
+    client_factory: EcmwfClientFactory | None = None,
+    progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+) -> WeatherGenerateResult:
+    """Retrieve ECMWF IFS Open Data using the official ecmwf-opendata client.
+
+    The official client handles the ECMWF Open Data index and byte-range
+    retrieval. The public client API documents parameter/step/date/time
+    selection, but not geographic subsetting, so this first provider accepts a
+    bbox for workflow compatibility and metadata while retrieving the published
+    global 0.25 degree fields.
+    """
+
+    request.bbox.validate()
+    _validate_ecmwf_request(request)
+    output = request.output.expanduser()
+    if output.exists() and output.is_dir():
+        raise ValidationError("--output must be a file path, not a directory")
+    if output.exists() and not request.overwrite:
+        raise ValidationError(f"output already exists: {output}; use --overwrite to replace it")
+    forecast_hours = forecast_hour_sequence(request.hours, request.step_hours)
+    warning = "ECMWF Open Data provider currently retrieves global fields; bbox is recorded but not spatially cropped"
+
+    if request.cycle == "auto":
+        planned_cycle = WeatherCycle("auto", "auto")
+    else:
+        if request.date is None:
+            raise ValidationError("--date YYYYMMDD is required when --cycle is explicit")
+        planned_cycle = WeatherCycle(request.date, request.cycle)
+
+    if request.dry_run:
+        return WeatherGenerateResult(
+            provider="ecmwf_ifs_open",
+            source=ECMWF_SOURCE_LABEL,
+            model="ecmwf_ifs_open_0p25",
+            cycle=planned_cycle,
+            bbox=request.bbox,
+            forecast_hours=forecast_hours,
+            output=output,
+            byte_count=0,
+            message_count=0,
+            inspection={"stream_valid": False, "message_count": 0, "dry_run": True},
+            urls=[],
+            variables_levels=ECMWF_VARIABLES_LEVELS,
+            warnings=[warning],
+        )
+
+    client_factory = client_factory or _ecmwf_client_factory
+    try:
+        client = client_factory(source="ecmwf", model="ifs", resol="0p25")
+    except MissingDependencyError:
+        raise
+    except Exception as exc:
+        raise ValidationError(f"could not initialise ECMWF Open Data client: {exc}") from exc
+
+    retrieve_request: dict[str, Any] = {
+        "type": "fc",
+        "step": forecast_hours,
+        "param": ECMWF_PARAMETERS,
+        "target": None,
+    }
+    if request.cycle != "auto":
+        retrieve_request["date"] = request.date
+        retrieve_request["time"] = int(request.cycle)
+
+    tmp_path: Path | None = None
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(prefix=output.name + ".", suffix=".tmp", dir=output.parent, delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        retrieve_request["target"] = str(tmp_path)
+        _progress(
+            progress_callback,
+            "retrieving ECMWF Open Data forecast",
+            {"params": ECMWF_PARAMETERS, "forecast_hours": forecast_hours},
+        )
+        try:
+            result = client.retrieve(**retrieve_request)
+        except Exception as exc:
+            raise ValidationError(f"ECMWF Open Data retrieval failed: {exc}") from exc
+        if not tmp_path.exists() or tmp_path.stat().st_size == 0:
+            raise ValidationError("ECMWF Open Data retrieval produced an empty GRIB file")
+        _validate_downloaded_grib_file(tmp_path, "ECMWF Open Data")
+        scan = scan_grib_messages(tmp_path)
+        inspection = inspect_grib(tmp_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path.replace(output)
+        tmp_path = None
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink()
+
+    cycle_time = getattr(result, "datetime", None)
+    selected_cycle = _weather_cycle_from_ecmwf_datetime(cycle_time) if cycle_time is not None else planned_cycle
+    return WeatherGenerateResult(
+        provider="ecmwf_ifs_open",
+        source=ECMWF_SOURCE_LABEL,
+        model="ecmwf_ifs_open_0p25",
+        cycle=selected_cycle,
+        bbox=request.bbox,
+        forecast_hours=forecast_hours,
+        output=output,
+        byte_count=scan.byte_count,
+        message_count=scan.message_count,
+        inspection=inspection,
+        urls=[],
+        variables_levels=ECMWF_VARIABLES_LEVELS,
+        warnings=[warning],
     )
 
 
@@ -290,6 +464,21 @@ def _validate_downloaded_grib_bytes(data: bytes) -> None:
         raise ValidationError("GFS download contained no GRIB messages")
 
 
+def _validate_downloaded_grib_file(path: Path, provider_label: str) -> None:
+    data = path.read_bytes()[:128]
+    if not data:
+        raise ValidationError(f"{provider_label} download returned empty response")
+    stripped = data.lstrip()
+    if stripped.startswith((b"<", b"<!DOCTYPE", b"<html", b"<HTML")):
+        raise ValidationError(f"{provider_label} download returned HTML/text instead of GRIB2")
+    if b"GRIB" not in data[:32]:
+        sample = stripped[:80].decode("utf-8", errors="replace")
+        raise ValidationError(f"{provider_label} download did not start with a GRIB message: {sample!r}")
+    scan = scan_grib_messages(path)
+    if scan.message_count <= 0:
+        raise ValidationError(f"{provider_label} download contained no GRIB messages")
+
+
 def _http_get(url: str, timeout_seconds: float) -> bytes:
     request = Request(url, headers={"User-Agent": "tidal-current-grib-generator/0"})
     with urlopen(request, timeout=timeout_seconds) as response:
@@ -300,6 +489,44 @@ def _validate_gfs_request(request: GFSWeatherRequest) -> None:
     if request.step_hours not in {1, 3, 6, 12}:
         raise ValidationError("--step-hours must be one of 1, 3, 6, or 12 for GFS")
     forecast_hour_sequence(request.hours, request.step_hours)
+
+
+def _validate_ecmwf_request(request: ECMWFWeatherRequest) -> None:
+    if request.step_hours not in {3, 6, 12}:
+        raise ValidationError("--step-hours must be one of 3, 6, or 12 for ECMWF Open Data")
+    if request.cycle != "auto":
+        if request.cycle not in {"00", "06", "12", "18"}:
+            raise ValidationError("--cycle must be auto, 00, 06, 12, or 18")
+        if not request.date:
+            raise ValidationError("--date YYYYMMDD is required when --cycle is explicit")
+        _validate_date(request.date)
+    forecast_hour_sequence(request.hours, request.step_hours)
+
+
+def _ecmwf_client_factory(**kwargs: Any) -> Any:
+    try:
+        from ecmwf.opendata import Client
+    except ImportError as exc:
+        raise MissingDependencyError(
+            "ECMWF Open Data provider requires the optional ecmwf-opendata package; "
+            "install with `pip install ecmwf-opendata` or `pip install tidal-current-grib-generator[weather]`."
+        ) from exc
+    return Client(**kwargs)
+
+
+def _weather_cycle_from_ecmwf_datetime(value: Any) -> WeatherCycle:
+    if isinstance(value, datetime):
+        dt = value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return WeatherCycle(dt.strftime("%Y%m%d"), f"{dt.hour:02d}")
+    text = str(value)
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        dt = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        return WeatherCycle(dt.strftime("%Y%m%d"), f"{dt.hour:02d}")
+    except ValueError:
+        return WeatherCycle(text, "")
 
 
 def _validate_date(value: str) -> None:

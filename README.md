@@ -257,9 +257,71 @@ tidal-current-grib generate-copernicus \
 OpenCPN workflow:
 
 1. Generate a current GRIB using the CLI or `currentgrib_pi`.
-2. Download a weather/wind GRIB in OpenCPN.
-3. Use the upgraded GRIB plugin's `Merge GRIBs...` utility to merge current and weather files.
+2. Download or generate a weather/wind GRIB.
+3. Use `tidal-current-grib merge-gribs` or the upgraded GRIB plugin's `Merge GRIBs...` utility to merge current and weather files.
 4. Run Weather Routing with currents enabled and overlapping current/weather time ranges.
+
+## Weather GRIB providers
+
+Weather GRIB support is CLI-only for now. It does not change the OpenCPN plugin.
+
+```bash
+tidal-current-grib weather-providers
+```
+
+Implemented providers:
+
+- `gfs`: Source: NOAA GFS 0.25° forecast via NOMADS. Downloads bbox-subset GRIB2 files without credentials.
+- `ecmwf_ifs_open`: Source: ECMWF IFS Open Data forecast. Uses the optional official `ecmwf-opendata` client. The first implementation retrieves the requested fields from ECMWF Open Data and records the bbox in metadata; spatial cropping is not yet applied by this provider.
+
+Planned provider:
+
+- `dwd_icon_eu`: Source: DWD ICON-EU forecast.
+
+Install the optional ECMWF client with:
+
+```bash
+pip install 'tidal-current-grib-generator[weather]'
+```
+
+GFS example:
+
+```bash
+tidal-current-grib generate-weather \
+  --provider gfs \
+  --bbox -8.5 50.5 -2.5 56.5 \
+  --cycle auto \
+  --hours 24 \
+  --step-hours 3 \
+  --output ~/.opencpn/grib/generated/gfs_weather_irish_sea_24h.grb2 \
+  --metadata-summary \
+  --verbose
+```
+
+ECMWF Open Data example:
+
+```bash
+tidal-current-grib generate-weather \
+  --provider ecmwf_ifs_open \
+  --bbox -8.5 50.5 -2.5 56.5 \
+  --cycle auto \
+  --hours 72 \
+  --step-hours 3 \
+  --output ~/.opencpn/grib/generated/ecmwf_ifs_weather_irish_sea_72h.grb2 \
+  --metadata-summary \
+  --verbose
+```
+
+Merge a current GRIB with a weather GRIB:
+
+```bash
+tidal-current-grib merge-gribs \
+  --current ~/.opencpn/grib/generated/tpxo10_cached_astronomical_tide_current_20260701_2300_120h.grb \
+  --weather ~/.opencpn/grib/generated/gfs_weather_irish_sea_24h.grb2 \
+  --output ~/.opencpn/grib/generated/merged_cli_gfs_tpxo_irish_sea_test.grb \
+  --metadata-summary \
+  --verbose
+```
 
 ## Reference comparison
 

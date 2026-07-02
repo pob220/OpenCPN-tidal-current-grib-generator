@@ -28,10 +28,14 @@ netcdf = [
 copernicus = [
   "copernicusmarine>=2.0",
 ]
+weather = [
+  "ecmwf-opendata>=0.3.30",
+]
 dev = ["pytest>=7.4"]
 all = [
   "eccodes>=1.6",
   "copernicusmarine>=2.0",
+  "ecmwf-opendata>=0.3.30",
   "pyTMD>=3.0",
   "xarray>=2024.7",
   "netCDF4>=1.6",
