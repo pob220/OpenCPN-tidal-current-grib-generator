@@ -39,6 +39,11 @@ from tidal_current_grib_generator.providers import (
 )
 from tidal_current_grib_generator.api import GenerateCurrentGribRequest, generate_current_grib_from_netcdf
 from tidal_current_grib_generator.security import redact_text
+from tidal_current_grib_generator.weather import (
+    GFSWeatherRequest,
+    generate_gfs_weather_grib,
+    list_weather_providers,
+)
 
 LOGGER = logging.getLogger("tidal_current_grib_generator")
 DEFAULT_TPXO_MODEL = "TPXO10-atlas-v2-nc"
@@ -157,6 +162,26 @@ def build_parser() -> argparse.ArgumentParser:
     providers.add_argument("--json", action="store_true")
     providers.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     providers.set_defaults(func=cmd_providers)
+
+    weather_providers = subparsers.add_parser("weather-providers", help="List weather GRIB providers.")
+    weather_providers.add_argument("--json", action="store_true")
+    weather_providers.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    weather_providers.set_defaults(func=cmd_weather_providers)
+
+    generate_weather = subparsers.add_parser("generate-weather", help="Download/generate a weather GRIB.")
+    generate_weather.add_argument("--provider", choices=["gfs"], required=True)
+    generate_weather.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"))
+    generate_weather.add_argument("--date", help="GFS cycle date YYYYMMDD for explicit cycles.")
+    generate_weather.add_argument("--cycle", required=True, help="auto or explicit cycle 00, 06, 12, 18.")
+    generate_weather.add_argument("--hours", type=int, required=True)
+    generate_weather.add_argument("--step-hours", type=int, default=3)
+    generate_weather.add_argument("--output", type=Path, required=True)
+    generate_weather.add_argument("--overwrite", action="store_true")
+    generate_weather.add_argument("--dry-run", action="store_true")
+    generate_weather.add_argument("--metadata-summary", action="store_true")
+    generate_weather.add_argument("--json", action="store_true")
+    generate_weather.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    generate_weather.set_defaults(func=cmd_generate_weather)
 
     download = subparsers.add_parser("download-copernicus", help="Download a Copernicus Marine current subset.")
     download.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"))
@@ -803,6 +828,62 @@ def cmd_providers(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_weather_providers(args: argparse.Namespace) -> int:
+    providers = [provider.as_dict() for provider in list_weather_providers()]
+    if args.json:
+        print(json.dumps({"providers": providers}, indent=2, sort_keys=True))
+    else:
+        for provider in providers:
+            print(f"{provider['id']}: {provider['label']}")
+            print(f"  {provider['account']}")
+            print(f"  {provider['format']}")
+            print(f"  source: {provider['source']}")
+    return 0
+
+
+def cmd_generate_weather(args: argparse.Namespace) -> int:
+    bbox = BoundingBox.from_values(args.bbox)
+    if args.provider != "gfs":
+        raise ValidationError(f"unsupported weather provider: {args.provider}")
+    request = GFSWeatherRequest(
+        bbox=bbox,
+        output=args.output,
+        hours=args.hours,
+        step_hours=args.step_hours,
+        cycle=args.cycle,
+        date=args.date,
+        overwrite=args.overwrite,
+        dry_run=args.dry_run,
+    )
+    if args.metadata_summary or args.dry_run:
+        print("Source: NOAA GFS 0.25° forecast via NOMADS", flush=True)
+        print(f"provider: {args.provider}", flush=True)
+        print(f"bbox: {bbox.west},{bbox.south},{bbox.east},{bbox.north}", flush=True)
+        print(f"hours: {args.hours}", flush=True)
+        print(f"step_hours: {args.step_hours}", flush=True)
+        print(f"output: {args.output.expanduser()}", flush=True)
+    result = generate_gfs_weather_grib(
+        request,
+        progress_callback=_weather_progress_callback(args.verbose or args.metadata_summary),
+    )
+    data = result.as_dict()
+    if args.json:
+        print(json.dumps(data, indent=2, sort_keys=True))
+    else:
+        print(f"cycle: {result.cycle.cycle_time}", flush=True)
+        print(f"forecast_hours: {','.join(str(hour) for hour in result.forecast_hours)}", flush=True)
+        if args.dry_run:
+            print(f"planned output: {result.output}", flush=True)
+        else:
+            print(f"wrote weather GRIB: {result.output}", flush=True)
+            print(f"validated GRIB stream: {result.message_count} messages, {result.byte_count} bytes", flush=True)
+            first_valid = result.inspection.get("first_valid_time")
+            last_valid = result.inspection.get("last_valid_time")
+            if first_valid and last_valid:
+                print(f"valid_time_range: {first_valid} to {last_valid}", flush=True)
+    return 0
+
+
 def cmd_generate_provider(args: argparse.Namespace) -> int:
     provider_id = args.provider
     if provider_id == "auto":
@@ -1294,6 +1375,25 @@ def _generate_copernicus_progress_callback(verbose: bool):
             print(f"converting {details.get('steps')} time steps to GRIB", flush=True)
         elif step == "validating GRIB":
             print(f"validated generated stream: {details.get('messages')} messages", flush=True)
+
+    return callback
+
+
+def _weather_progress_callback(verbose: bool):
+    if not verbose:
+        return None
+
+    def callback(step: str, details: dict[str, Any]) -> None:
+        if step == "checking GFS cycle":
+            print(f"checking GFS cycle {details.get('cycle')} f{int(details.get('hour', 0)):03d}", flush=True)
+        elif step == "downloading GFS forecast hour":
+            print(f"downloading GFS {details.get('cycle')} f{int(details.get('hour', 0)):03d}", flush=True)
+        elif step == "downloaded GFS forecast hour":
+            print(
+                f"downloaded GFS {details.get('cycle')} f{int(details.get('hour', 0)):03d}: "
+                f"{details.get('bytes')} bytes",
+                flush=True,
+            )
 
     return callback
 
