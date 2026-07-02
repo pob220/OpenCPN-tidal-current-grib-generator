@@ -48,6 +48,10 @@ tidal-current-grib inspect-source \
 
 ## Example commands
 
+Source: TPXO10 astronomical tide model.
+
+TPXO predicts astronomical tidal currents from local licensed model files. It does not include weather-driven surge, wind residual currents, river flow, or operational forecast-model corrections.
+
 Sample one point:
 
 ```bash
@@ -72,9 +76,36 @@ tidal-current-grib generate \
   --source tpxo \
   --model-dir /data/tides \
   --model-name TPXO10-atlas-v2-nc \
-  --output irish_sea_tpxo_current.grb \
+  --output tpxo10_astronomical_tide_current_20260701_0000.grb \
   --metadata-summary
 ```
+
+## Local Derived Cache
+
+For repeated generation over the same bbox and grid spacing, use a local TPXO cache. The cache stores interpolated TPXO harmonic-current constants on the output grid, so later generation can predict arbitrary time ranges without reopening and interpolating the full TPXO NetCDF model files.
+
+```bash
+tidal-current-grib prepare-tpxo-cache \
+  --bbox -8.5 50.5 -2.5 56.5 \
+  --grid-spacing-deg 0.05 \
+  --model-dir /data/tides \
+  --model-name TPXO10-atlas-v2-nc \
+  --output tpxo10_irish_sea.tpxocache \
+  --metadata-summary \
+  --verbose
+
+tidal-current-grib generate \
+  --source tpxo-cache \
+  --input-cache tpxo10_irish_sea.tpxocache \
+  --start 2026-07-01T23:00:00Z \
+  --hours 120 \
+  --step-hours 1 \
+  --output tpxo10_irish_sea_astronomical_tide_current_20260701_2300.grb \
+  --metadata-summary \
+  --verbose
+```
+
+Cache files are derived from local licensed TPXO model files. Do not redistribute cache files unless your TPXO licence permits it. The project `.gitignore` excludes `*.tpxocache`, `*.npz`, and `tpxo-cache/`.
 
 ## Conventions
 

@@ -9,6 +9,7 @@ from tidal_current_grib_generator.sources.base import CurrentSource
 from tidal_current_grib_generator.sources.netcdf import NetCDFCurrentSource
 from tidal_current_grib_generator.sources.pytmd import PyTMDSource, PyTMDTPXOSource
 from tidal_current_grib_generator.sources.synthetic import ConstantCurrentSource, SyntheticRotaryTideSource
+from tidal_current_grib_generator.sources.tpxo_cache import TPXOCacheSource
 
 
 def create_source(
@@ -18,6 +19,7 @@ def create_source(
     model_name: str = "TPXO10-atlas-v2-nc",
     definition_file: Path | None = None,
     input_netcdf: Path | None = None,
+    input_cache: Path | None = None,
     u_variable: str | None = None,
     v_variable: str | None = None,
     lat_variable: str | None = None,
@@ -30,6 +32,7 @@ def create_source(
     coverage_tolerance_deg: float = 0.02,
     use_source_grid: bool = False,
     source_grid_regularity_tolerance: float = 1e-5,
+    tpxo_workers: int = 1,
 ) -> CurrentSource:
     normalized = name.strip().lower()
     if normalized == "synthetic":
@@ -43,7 +46,12 @@ def create_source(
             model_directory=model_directory,
             model_name=model_name,
             definition_file=definition_file,
+            workers=tpxo_workers,
         )
+    if normalized in {"tpxo-cache", "tpxo_cache"}:
+        if input_cache is None:
+            raise ValidationError("--input-cache is required for the TPXO cache source")
+        return TPXOCacheSource(input_cache=input_cache)
     if normalized in {"netcdf", "copernicus"}:
         if input_netcdf is None:
             raise ValidationError("--input-netcdf is required for the NetCDF source")
@@ -62,7 +70,7 @@ def create_source(
             use_source_grid=use_source_grid,
             source_grid_regularity_tolerance=source_grid_regularity_tolerance,
         )
-    raise UnsupportedSourceError(f"unsupported source {name!r}; choose synthetic, constant, tpxo, or netcdf")
+    raise UnsupportedSourceError(f"unsupported source {name!r}; choose synthetic, constant, tpxo, tpxo-cache, or netcdf")
 
 
 __all__ = [
@@ -72,5 +80,6 @@ __all__ = [
     "PyTMDSource",
     "PyTMDTPXOSource",
     "SyntheticRotaryTideSource",
+    "TPXOCacheSource",
     "create_source",
 ]

@@ -1,5 +1,6 @@
 #include "currentgrib_dialog.h"
 
+#include <wx/config.h>
 #include <wx/datetime.h>
 #include <wx/filedlg.h>
 #include <wx/filename.h>
@@ -9,6 +10,16 @@
 #include <wx/stdpaths.h>
 #include <wx/stream.h>
 #include <wx/utils.h>
+#include <wx/file.h>
+
+#include <algorithm>
+#include <cerrno>
+#include <cmath>
+#include <vector>
+
+#ifdef __UNIX__
+#include <signal.h>
+#endif
 
 namespace {
 
@@ -25,8 +36,8 @@ wxString DefaultOutputDirectory() {
   return path.GetPath();
 }
 
-wxString DefaultOutputFilename() {
-  return "current_grib_" + wxDateTime::Now().ToUTC().Format("%Y%m%d_%H%M") + ".grb";
+wxString TimestampedFilename(const wxString& prefix) {
+  return prefix + "_" + wxDateTime::Now().ToUTC().Format("%Y%m%d_%H%M") + ".grb";
 }
 
 wxString DefaultStartUtc() {
@@ -58,7 +69,30 @@ wxString RemoteProviderId(const wxString& provider) {
 }
 
 wxString MarineIeOutputFilename() {
-  return "marine_ie_irish_sea_current_" + wxDateTime::Now().ToUTC().Format("%Y%m%d_%H%M") + ".grb";
+  return TimestampedFilename("marine_ie_irish_sea_current");
+}
+
+wxString DefaultTpxoOutputFilename() {
+  return TimestampedFilename("tpxo10_astronomical_tide_current");
+}
+
+wxString IrishSeaTpxoOutputFilename() {
+  return TimestampedFilename("tpxo10_irish_sea_astronomical_tide_current");
+}
+
+wxString DefaultTpxoModelDirectory() {
+  wxFileName path(wxGetHomeDir(), "");
+  path.AppendDir("OpenCPN");
+  path.AppendDir("tide-models");
+  return path.GetPath();
+}
+
+wxString DefaultTpxoCacheFile() {
+  wxFileName path(DefaultOutputDirectory(), "");
+  path.AppendDir("tpxo-cache");
+  path.SetFullName(TimestampedFilename("tpxo10_astronomical_tide_current_cache"));
+  path.SetExt("tpxocache");
+  return path.GetFullPath();
 }
 
 wxString JsonEscape(const wxString& value) {
@@ -83,6 +117,75 @@ wxString JsonEscape(const wxString& value) {
 
 bool IsExecutableFile(const wxString& path) {
   return wxFileName::FileExists(path);
+}
+
+bool ParseDouble(const wxTextCtrl* control, double* value) {
+  return control && control->GetValue().ToDouble(value);
+}
+
+bool GribStreamIsStrictlyValid(const wxString& path, wxString* details) {
+  wxFile file(path);
+  if (!file.IsOpened()) {
+    if (details) *details = "could not open output file";
+    return false;
+  }
+  wxFileOffset size = file.Length();
+  if (size <= 0) {
+    if (details) *details = "output file is empty";
+    return false;
+  }
+  std::vector<unsigned char> buffer(static_cast<size_t>(size));
+  wxFileOffset read = file.Read(buffer.data(), buffer.size());
+  if (read != size) {
+    if (details) *details = "could not read complete output file";
+    return false;
+  }
+  const unsigned char* bytes = buffer.data();
+  size_t offset = 0;
+  int messages = 0;
+  const size_t total = static_cast<size_t>(size);
+  while (offset < total) {
+    if (offset + 12 > total || bytes[offset] != 'G' || bytes[offset + 1] != 'R' ||
+        bytes[offset + 2] != 'I' || bytes[offset + 3] != 'B') {
+      if (details) *details = wxString::Format("GRIB marker not found at byte offset %zu", offset);
+      return false;
+    }
+    int edition = bytes[offset + 7];
+    size_t messageLength = 0;
+    if (edition == 1) {
+      messageLength = (static_cast<size_t>(bytes[offset + 4]) << 16) |
+                      (static_cast<size_t>(bytes[offset + 5]) << 8) |
+                      static_cast<size_t>(bytes[offset + 6]);
+    } else if (edition == 2) {
+      if (offset + 16 > total) {
+        if (details) *details = "truncated GRIB2 header";
+        return false;
+      }
+      for (int i = 8; i < 16; ++i) {
+        messageLength = (messageLength << 8) | static_cast<size_t>(bytes[offset + i]);
+      }
+    } else {
+      if (details) *details = wxString::Format("unsupported GRIB edition %d", edition);
+      return false;
+    }
+    if (messageLength < 12 || offset + messageLength > total) {
+      if (details) *details = wxString::Format("truncated GRIB message at byte offset %zu", offset);
+      return false;
+    }
+    size_t end = offset + messageLength - 4;
+    if (bytes[end] != '7' || bytes[end + 1] != '7' || bytes[end + 2] != '7' || bytes[end + 3] != '7') {
+      if (details) *details = wxString::Format("GRIB terminator not found at byte offset %zu", end);
+      return false;
+    }
+    ++messages;
+    offset += messageLength;
+  }
+  if (messages == 0) {
+    if (details) *details = "no GRIB messages found";
+    return false;
+  }
+  if (details) *details = wxString::Format("validated GRIB stream: %d messages", messages);
+  return true;
 }
 
 void RedactQueryParameter(wxString* text, const wxString& name) {
@@ -125,7 +228,7 @@ CurrentGribDialog::CurrentGribDialog(wxWindow* parent)
   m_south = new wxTextCtrl(scrolled, wxID_ANY, "50.5");
   m_east = new wxTextCtrl(scrolled, wxID_ANY, "-2.5");
   m_north = new wxTextCtrl(scrolled, wxID_ANY, "56.5");
-  wxString presets[] = {"Custom bbox", "Current chart area",
+  wxString presets[] = {"Custom bbox", "Current chart area", "Irish Sea TPXO test area",
                         "Irish Sea Marine Institute 3 day current GRIB",
                         "Irish Sea / North Channel Copernicus example",
                         "Tiny Copernicus connection test",
@@ -140,19 +243,33 @@ CurrentGribDialog::CurrentGribDialog(wxWindow* parent)
   m_stepHours->SetRange(1, 24);
   m_stepHours->SetValue(1);
 
+  wxString modes[] = {"Forecast/model current GRIB",
+                      "Tidal stream prediction from local TPXO model",
+                      "Local NetCDF file",
+                      "Synthetic test source"};
+  m_mode = new wxChoice(scrolled, wxID_ANY, wxDefaultPosition, wxDefaultSize, WXSIZEOF(modes), modes);
+  m_mode->SetSelection(0);
+
   wxString providers[] = {"Auto", "Copernicus Marine North-West Shelf high-resolution currents",
                           "Copernicus Marine Global currents",
-                          "Marine Institute Ireland Irish Sea currents, 3 day",
-                          "Local NetCDF file", "Synthetic test source"};
+                          "Marine Institute Ireland Irish Sea currents, 3 day"};
   m_provider = new wxChoice(scrolled, wxID_ANY, wxDefaultPosition, wxDefaultSize, WXSIZEOF(providers), providers);
   m_provider->SetSelection(1);
   m_username = new wxTextCtrl(scrolled, wxID_ANY);
   m_password = new wxTextCtrl(scrolled, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_PASSWORD);
   m_rememberUsername = new wxCheckBox(scrolled, wxID_ANY, "Remember username");
   m_providerNote = new wxStaticText(scrolled, wxID_ANY, "");
+  m_tpxoModelDir = new wxDirPickerCtrl(scrolled, wxID_ANY, DefaultTpxoModelDirectory());
+  m_tpxoModelName = new wxTextCtrl(scrolled, wxID_ANY, "TPXO10-atlas-v2-nc");
+  m_tpxoGridSpacing = new wxTextCtrl(scrolled, wxID_ANY, "0.05");
+  m_checkTpxoButton = new wxButton(scrolled, wxID_ANY, "Check TPXO model");
+  m_useTpxoCache = new wxCheckBox(scrolled, wxID_ANY, "Use TPXO cache for this area");
+  m_tpxoCacheFile = new wxFilePickerCtrl(scrolled, wxID_ANY, DefaultTpxoCacheFile(),
+                                         "Select TPXO cache file", "*.tpxocache;*.npz");
+  m_prepareTpxoCacheButton = new wxButton(scrolled, wxID_ANY, "Prepare/update cache");
   m_localNetcdf = new wxFilePickerCtrl(scrolled, wxID_ANY, "", "Select NetCDF file", "*.nc;*.nc4");
   m_outputDir = new wxDirPickerCtrl(scrolled, wxID_ANY, DefaultOutputDirectory());
-  m_outputFile = new wxTextCtrl(scrolled, wxID_ANY, DefaultOutputFilename());
+  m_outputFile = new wxTextCtrl(scrolled, wxID_ANY, "");
   auto* outputBrowse = new wxButton(scrolled, wxID_ANY, "Browse...");
   m_openAfter = new wxCheckBox(scrolled, wxID_ANY, "Open generated current GRIB after creation");
   m_showMergeInstructions = new wxCheckBox(scrolled, wxID_ANY, "Show instructions for merging with weather GRIB");
@@ -171,10 +288,21 @@ CurrentGribDialog::CurrentGribDialog(wxWindow* parent)
   addRow("Start UTC", m_startUtc);
   addRow("Duration hours", m_durationHours);
   addRow("Step hours", m_stepHours);
-  addRow("Data source", m_provider);
+  addRow("Generation mode", m_mode);
+  addRow("Forecast provider", m_provider);
   addRow("Copernicus username", m_username);
   addRow("Copernicus password", m_password);
   addRow("Provider note", m_providerNote);
+  addRow("TPXO model directory", m_tpxoModelDir);
+  addRow("TPXO model name", m_tpxoModelName);
+  addRow("TPXO grid spacing degrees", m_tpxoGridSpacing);
+  grid->Add(new wxStaticText(scrolled, wxID_ANY, "TPXO model check"), 0, wxALIGN_CENTER_VERTICAL);
+  grid->Add(m_checkTpxoButton, 0);
+  grid->Add(new wxStaticText(scrolled, wxID_ANY, "TPXO cache"), 0, wxALIGN_CENTER_VERTICAL);
+  grid->Add(m_useTpxoCache, 0);
+  addRow("TPXO cache file", m_tpxoCacheFile);
+  grid->Add(new wxStaticText(scrolled, wxID_ANY, "TPXO cache preparation"), 0, wxALIGN_CENTER_VERTICAL);
+  grid->Add(m_prepareTpxoCacheButton, 0);
   addRow("Local NetCDF", m_localNetcdf);
   addRow("Output directory", m_outputDir);
   auto* outputFileSizer = new wxBoxSizer(wxHORIZONTAL);
@@ -214,9 +342,13 @@ CurrentGribDialog::CurrentGribDialog(wxWindow* parent)
 
   m_checkButton->Bind(wxEVT_BUTTON, &CurrentGribDialog::OnCheckDependencies, this);
   m_generateButton->Bind(wxEVT_BUTTON, &CurrentGribDialog::OnGenerate, this);
+  m_checkTpxoButton->Bind(wxEVT_BUTTON, &CurrentGribDialog::OnCheckTpxoModel, this);
+  m_prepareTpxoCacheButton->Bind(wxEVT_BUTTON, &CurrentGribDialog::OnPrepareTpxoCache, this);
   outputBrowse->Bind(wxEVT_BUTTON, &CurrentGribDialog::OnBrowseOutput, this);
+  m_outputFile->Bind(wxEVT_TEXT, &CurrentGribDialog::OnOutputFilenameChanged, this);
   m_presetChoice->Bind(wxEVT_CHOICE, &CurrentGribDialog::OnPresetChanged, this);
   m_provider->Bind(wxEVT_CHOICE, &CurrentGribDialog::OnProviderChanged, this);
+  m_mode->Bind(wxEVT_CHOICE, &CurrentGribDialog::OnModeChanged, this);
   m_cancelButton->Bind(wxEVT_BUTTON, &CurrentGribDialog::OnCancel, this);
   m_closeButton->Bind(wxEVT_BUTTON, &CurrentGribDialog::OnClose, this);
   Bind(wxEVT_CLOSE_WINDOW, &CurrentGribDialog::OnDialogClose, this);
@@ -224,6 +356,8 @@ CurrentGribDialog::CurrentGribDialog(wxWindow* parent)
   Bind(wxEVT_END_PROCESS, &CurrentGribDialog::OnProcessTerminated, this);
 
   AppendLog("Generated current GRIBs are model data for planning and experimentation, not official navigation products.");
+  LoadSettings();
+  RefreshOutputFilenameDefault();
   UpdateProviderUi();
   SetBusy(false);
 }
@@ -248,22 +382,67 @@ void CurrentGribDialog::OnCheckDependencies(wxCommandEvent&) {
   StartCommand(command, "", false);
 }
 
+void CurrentGribDialog::OnCheckTpxoModel(wxCommandEvent&) {
+  wxString command = ShellQuote(m_generatorPath->GetValue()) +
+                     " inspect-source --source tpxo --model-dir " +
+                     ShellQuote(m_tpxoModelDir->GetPath()) + " --model-name " +
+                     ShellQuote(m_tpxoModelName->GetValue());
+  AppendLog("Checking TPXO model...");
+  AppendLog("Source: TPXO10 astronomical tide model");
+  StartCommand(command, "", false);
+}
+
+void CurrentGribDialog::OnPrepareTpxoCache(wxCommandEvent&) {
+  wxFileName cachePath(m_tpxoCacheFile->GetPath());
+  if (cachePath.GetFullPath().empty()) {
+    wxString message = "Choose a TPXO cache file path before preparing the cache.";
+    AppendLog(message);
+    wxMessageBox(message, "Missing TPXO cache file", wxOK | wxICON_WARNING, this);
+    return;
+  }
+  if (!cachePath.DirExists()) {
+    cachePath.Mkdir(wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL);
+  }
+  wxString command = ShellQuote(m_generatorPath->GetValue()) + " prepare-tpxo-cache --bbox " +
+                     ShellQuote(m_west->GetValue()) + " " + ShellQuote(m_south->GetValue()) + " " +
+                     ShellQuote(m_east->GetValue()) + " " + ShellQuote(m_north->GetValue()) +
+                     " --grid-spacing-deg " + ShellQuote(m_tpxoGridSpacing->GetValue()) +
+                     " --model-dir " + ShellQuote(m_tpxoModelDir->GetPath()) +
+                     " --model-name " + ShellQuote(m_tpxoModelName->GetValue()) +
+                     " --output " + ShellQuote(cachePath.GetFullPath()) +
+                     " --metadata-summary --verbose";
+  AppendLog("Preparing TPXO cache...");
+  AppendLog("Source: TPXO10 astronomical tide model");
+  AppendLog("TPXO cache files are derived from local licensed TPXO model files. Do not redistribute unless your TPXO licence permits it.");
+  SaveSettings();
+  StartCommand(command, "", false);
+}
+
 void CurrentGribDialog::OnGenerate(wxCommandEvent&) {
+  int mode = m_mode->GetSelection();
   wxString provider = m_provider->GetStringSelection();
-  if (provider.Contains("Local NetCDF") && m_localNetcdf->GetPath().empty()) {
+  if (mode == 2 && m_localNetcdf->GetPath().empty()) {
     wxString message = "Select a local NetCDF file before generating a current GRIB.";
     AppendLog(message);
     wxMessageBox(message, "Missing NetCDF file", wxOK | wxICON_WARNING, this);
     return;
   }
-  bool autoMarine = provider == "Auto" && AutoWouldUseMarineIe();
-  if (IsCopernicusProvider(provider) && !autoMarine && (m_username->GetValue().empty() || m_password->GetValue().empty())) {
+  if (mode == 1 && m_useTpxoCache->GetValue() && !wxFileName::FileExists(m_tpxoCacheFile->GetPath())) {
+    wxString message = "The selected TPXO cache file does not exist. Use Prepare/update cache first, or disable cache use for direct TPXO generation.";
+    AppendLog(message);
+    wxMessageBox(message, "Missing TPXO cache", wxOK | wxICON_WARNING, this);
+    return;
+  }
+  bool forecastMode = mode == 0;
+  bool autoMarine = forecastMode && provider == "Auto" && AutoWouldUseMarineIe();
+  bool copernicusForecast = forecastMode && IsCopernicusProvider(provider) && !autoMarine;
+  if (copernicusForecast && (m_username->GetValue().empty() || m_password->GetValue().empty())) {
     wxString message = "Enter your Copernicus Marine username and password for this operation. The password is held in memory only and is not passed on the command line.";
     AppendLog(message);
     wxMessageBox(message, "Missing Copernicus credentials", wxOK | wxICON_WARNING, this);
     return;
   }
-  if (IsCopernicusProvider(provider) && !autoMarine && !ConfirmLargeCopernicusRequest()) {
+  if (copernicusForecast && !ConfirmLargeCopernicusRequest()) {
     AppendLog("Generation cancelled before launch.");
     return;
   }
@@ -272,7 +451,7 @@ void CurrentGribDialog::OnGenerate(wxCommandEvent&) {
   if (!output.DirExists()) {
     output.Mkdir(wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL);
   }
-  if (IsCopernicusProvider(provider) && !autoMarine) {
+  if (copernicusForecast) {
     wxFileName downloadDir;
     downloadDir.AssignDir(m_outputDir->GetPath());
     downloadDir.AppendDir("currentgrib_downloads");
@@ -280,8 +459,10 @@ void CurrentGribDialog::OnGenerate(wxCommandEvent&) {
       downloadDir.Mkdir(wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL);
     }
   }
+  SaveSettings();
   AppendLog("Starting generation...");
-  wxString childPassword = (IsCopernicusProvider(provider) && !autoMarine) ? m_password->GetValue() : "";
+  AppendLog("Source: " + SourceLabel());
+  wxString childPassword = copernicusForecast ? m_password->GetValue() : "";
   StartCommand(command, childPassword, true);
 }
 
@@ -292,7 +473,23 @@ void CurrentGribDialog::OnBrowseOutput(wxCommandEvent&) {
   if (dialog.ShowModal() != wxID_OK) return;
   wxFileName selected(dialog.GetPath());
   m_outputDir->SetPath(selected.GetPath());
+  m_outputFileUserCustomized = true;
   m_outputFile->SetValue(selected.GetFullName());
+}
+
+void CurrentGribDialog::OnOutputFilenameChanged(wxCommandEvent&) {
+  if (m_updatingOutputFilename) return;
+  wxString value = m_outputFile->GetValue();
+  if (value.empty()) {
+    m_outputFileUserCustomized = false;
+    RefreshOutputFilenameDefault();
+    return;
+  }
+  if (!m_lastAutoOutputFilename.empty() && value == m_lastAutoOutputFilename) {
+    m_outputFileUserCustomized = false;
+    return;
+  }
+  m_outputFileUserCustomized = true;
 }
 
 void CurrentGribDialog::OnPresetChanged(wxCommandEvent& event) {
@@ -300,11 +497,18 @@ void CurrentGribDialog::OnPresetChanged(wxCommandEvent& event) {
 }
 
 void CurrentGribDialog::OnProviderChanged(wxCommandEvent&) {
+  RefreshOutputFilenameDefault();
+  UpdateProviderUi();
+}
+
+void CurrentGribDialog::OnModeChanged(wxCommandEvent&) {
+  RefreshOutputFilenameDefault();
   UpdateProviderUi();
 }
 
 void CurrentGribDialog::ApplyPreset(int selection) {
   if (selection == 0) {
+    RefreshOutputFilenameDefault();
     AppendLog("Using custom bbox.");
     return;
   }
@@ -328,24 +532,41 @@ void CurrentGribDialog::ApplyPreset(int selection) {
     m_south->SetValue(wxString::Format("%.6f", m_currentViewPort.lat_min));
     m_east->SetValue(wxString::Format("%.6f", m_currentViewPort.lon_max));
     m_north->SetValue(wxString::Format("%.6f", m_currentViewPort.lat_max));
+    RefreshOutputFilenameDefault();
     AppendLog("Applied current chart area preset.");
     m_presetChoice->SetSelection(0);
     return;
   }
   if (selection == 2) {
+    m_west->SetValue("-6.0");
+    m_south->SetValue("53.0");
+    m_east->SetValue("-5.5");
+    m_north->SetValue("53.5");
+    m_startUtc->SetValue("2026-07-04T00:00:00Z");
+    m_durationHours->SetValue(6);
+    m_stepHours->SetValue(1);
+    m_tpxoGridSpacing->SetValue("0.05");
+    m_mode->SetSelection(1);
+    RefreshOutputFilenameDefault();
+    UpdateProviderUi();
+    AppendLog("Applied Irish Sea TPXO test area preset.");
+    return;
+  }
+  if (selection == 3) {
     m_west->SetValue("-6.994");
     m_south->SetValue("51.506");
     m_east->SetValue("-4.006");
     m_north->SetValue("55.494");
     m_durationHours->SetValue(72);
     m_stepHours->SetValue(1);
+    m_mode->SetSelection(0);
     m_provider->SetSelection(3);
-    m_outputFile->SetValue(MarineIeOutputFilename());
+    RefreshOutputFilenameDefault();
     UpdateProviderUi();
     AppendLog("Applied Irish Sea Marine Institute 3 day current GRIB preset.");
     return;
   }
-  if (selection == 3) {
+  if (selection == 4) {
     m_west->SetValue("-8.5");
     m_south->SetValue("50.5");
     m_east->SetValue("-2.5");
@@ -353,13 +574,14 @@ void CurrentGribDialog::ApplyPreset(int selection) {
     m_startUtc->SetValue("2026-07-01T00:00:00Z");
     m_durationHours->SetValue(72);
     m_stepHours->SetValue(1);
+    m_mode->SetSelection(0);
     m_provider->SetSelection(1);
-    m_outputFile->SetValue("plugin_copernicus_live_current_test.grb");
+    RefreshOutputFilenameDefault();
     UpdateProviderUi();
     AppendLog("Applied Irish Sea / North Channel example preset.");
     return;
   }
-  if (selection == 4) {
+  if (selection == 5) {
     m_west->SetValue("-5.5");
     m_south->SetValue("53.0");
     m_east->SetValue("-5.0");
@@ -367,13 +589,14 @@ void CurrentGribDialog::ApplyPreset(int selection) {
     m_startUtc->SetValue("2026-07-01T00:00:00Z");
     m_durationHours->SetValue(3);
     m_stepHours->SetValue(1);
+    m_mode->SetSelection(0);
     m_provider->SetSelection(1);
-    m_outputFile->SetValue("plugin_copernicus_live_tiny_test.grb");
+    RefreshOutputFilenameDefault();
     UpdateProviderUi();
     AppendLog("Applied Tiny Copernicus connection test preset.");
     return;
   }
-  if (selection == 5) {
+  if (selection == 6) {
     m_west->SetValue("-40.5");
     m_south->SetValue("30.0");
     m_east->SetValue("-40.0");
@@ -381,8 +604,9 @@ void CurrentGribDialog::ApplyPreset(int selection) {
     m_startUtc->SetValue("2026-07-01T00:00:00Z");
     m_durationHours->SetValue(6);
     m_stepHours->SetValue(1);
+    m_mode->SetSelection(0);
     m_provider->SetSelection(2);
-    m_outputFile->SetValue("plugin_copernicus_global_tiny_test.grb");
+    RefreshOutputFilenameDefault();
     UpdateProviderUi();
     AppendLog("Applied Global Copernicus tiny connection test preset.");
   }
@@ -400,15 +624,64 @@ bool CurrentGribDialog::AutoWouldUseMarineIe() const {
 }
 
 void CurrentGribDialog::UpdateProviderUi() {
+  int mode = m_mode->GetSelection();
   wxString provider = m_provider->GetStringSelection();
-  bool marine = IsMarineIeProvider(provider);
-  m_username->Enable(!marine);
-  m_password->Enable(!marine);
-  m_rememberUsername->Enable(!marine);
-  if (marine) {
-    m_providerNote->SetLabel("Downloads a ready-made 3-day Irish Sea current GRIB from Marine Institute Ireland. No Copernicus account required.");
+  bool forecastMode = mode == 0;
+  bool tpxoMode = mode == 1;
+  bool netcdfMode = mode == 2;
+  bool syntheticMode = mode == 3;
+  bool marine = forecastMode && IsMarineIeProvider(provider);
+  bool copernicus = forecastMode && IsCopernicusProvider(provider) && !(provider == "Auto" && AutoWouldUseMarineIe());
+
+  m_provider->Enable(forecastMode);
+  m_username->Enable(copernicus);
+  m_password->Enable(copernicus);
+  m_rememberUsername->Enable(copernicus);
+  m_tpxoModelDir->Enable(tpxoMode);
+  m_tpxoModelName->Enable(tpxoMode);
+  m_tpxoGridSpacing->Enable(tpxoMode);
+  m_checkTpxoButton->Enable(tpxoMode && !m_processRunning);
+  m_useTpxoCache->Enable(tpxoMode);
+  m_tpxoCacheFile->Enable(tpxoMode);
+  m_prepareTpxoCacheButton->Enable(tpxoMode && !m_processRunning);
+  m_localNetcdf->Enable(netcdfMode);
+
+  if (tpxoMode) {
+    double west = 0.0;
+    double south = 0.0;
+    double east = 0.0;
+    double north = 0.0;
+    double spacing = 0.0;
+    wxString estimate;
+    if (ParseDouble(m_west, &west) && ParseDouble(m_south, &south) && ParseDouble(m_east, &east) &&
+        ParseDouble(m_north, &north) && m_tpxoGridSpacing->GetValue().ToDouble(&spacing) && spacing > 0.0 &&
+        east > west && north > south) {
+      int nx = static_cast<int>(std::floor((east - west) / spacing + 0.5)) + 1;
+      int ny = static_cast<int>(std::floor((north - south) / spacing + 0.5)) + 1;
+      int step = std::max(1, m_stepHours->GetValue());
+      int timesteps = (m_durationHours->GetValue() / step) + 1;
+      estimate = wxString::Format(
+          "\nEstimated generation: %d x %d grid (%d points), %d timesteps, %d GRIB messages. "
+          "TPXO generation may take about 1-2 minutes for moderate Irish Sea grids.",
+          nx, ny, nx * ny, timesteps, timesteps * 2);
+    }
+    m_providerNote->SetLabel(
+        wxString("TPXO predicts astronomical tidal currents from local licensed model files. It does not include "
+                 "weather-driven surge, wind residual currents, river flow, or operational forecast-model corrections.") +
+        "\nOptional cache: prepare a local derived TPXO cache for this bbox/grid, then enable cache use for faster repeated time ranges. Do not redistribute cache files unless your TPXO licence permits it." +
+        estimate);
+  } else if (netcdfMode) {
+    m_providerNote->SetLabel("Source: Local NetCDF model current. Converts local u/v current fields to the OpenCPN-compatible current GRIB format.");
+  } else if (syntheticMode) {
+    m_providerNote->SetLabel("Source: Synthetic test current. For offline testing only, not navigation.");
+  } else if (marine) {
+    m_providerNote->SetLabel("Source: Marine Institute Ireland Irish Sea forecast/model current. Downloads a ready-made 3-day Irish Sea current GRIB. No Copernicus account required.");
   } else if (provider == "Auto") {
-    m_providerNote->SetLabel("Auto prefers Marine Institute Ireland inside its Irish Sea coverage for up to 72 hours, then Copernicus NWS, then Copernicus Global.");
+    m_providerNote->SetLabel("Auto forecast provider prefers Marine Institute Ireland inside its Irish Sea coverage for up to 72 hours, then Copernicus NWS, then Copernicus Global.");
+  } else if (provider.Contains("North-West Shelf")) {
+    m_providerNote->SetLabel("Source: Copernicus Marine NWS forecast/model current.");
+  } else if (provider.Contains("Global")) {
+    m_providerNote->SetLabel("Source: Copernicus Marine Global forecast/model current.");
   } else {
     m_providerNote->SetLabel("");
   }
@@ -439,12 +712,26 @@ void CurrentGribDialog::OnCancel(wxCommandEvent&) {
     AppendLog("No running process to cancel.");
     return;
   }
+  if (!ChildProcessStillExists()) {
+    AppendLog(wxString::Format("Process pid=%ld has already exited; cleaning up dialog state.", m_processPid));
+    DrainProcessOutput();
+    FlushProcessOutput();
+    FinishCommand(-1, true);
+    return;
+  }
   m_processCancelled = true;
   AppendLog(wxString::Format("Cancelling process, pid=%ld", m_processPid));
   wxKillError error = wxKILL_OK;
   wxKill(m_processPid, wxSIGTERM, &error, wxKILL_CHILDREN);
   if (error != wxKILL_OK) {
     AppendLog(wxString::Format("Process cancel request returned wxKillError=%d", static_cast<int>(error)));
+    if (!ChildProcessStillExists()) {
+      AppendLog("Process was already gone after cancel request; treating it as exited.");
+      DrainProcessOutput();
+      FlushProcessOutput();
+      FinishCommand(-1, true);
+      return;
+    }
   }
 }
 
@@ -461,6 +748,7 @@ void CurrentGribDialog::OnClose(wxCommandEvent& event) {
     return;
   }
   (void)event;
+  SaveSettings();
   Hide();
 }
 
@@ -478,15 +766,25 @@ void CurrentGribDialog::OnDialogClose(wxCloseEvent& event) {
     event.Veto();
     return;
   }
+  SaveSettings();
   Hide();
 }
 
 void CurrentGribDialog::OnProcessTimer(wxTimerEvent& event) {
   (void)event;
   DrainProcessOutput();
+  if (m_processRunning && m_processPid != 0 && !ChildProcessStillExists()) {
+    AppendLog(wxString::Format("Process pid=%ld is no longer running; finalizing without wxEVT_END_PROCESS.", m_processPid));
+    FlushProcessOutput();
+    FinishCommand(-1, true);
+  }
 }
 
 void CurrentGribDialog::OnProcessTerminated(wxProcessEvent& event) {
+  if (!m_processRunning || event.GetPid() != m_processPid) {
+    AppendLog(wxString::Format("Ignoring stale process completion event, pid=%d", static_cast<int>(event.GetPid())));
+    return;
+  }
   AppendLog(wxString::Format("Process completed, pid=%d", static_cast<int>(event.GetPid())));
   DrainProcessOutput();
   FlushProcessOutput();
@@ -590,12 +888,21 @@ void CurrentGribDialog::FinishCommand(long exit_code, bool launched) {
                  "Launch failed", wxOK | wxICON_ERROR, this);
     return;
   }
-  if (cancelled) {
+  wxString validationDetails;
+  bool outputValid = generation && OutputFileLooksValidGrib(&validationDetails);
+  if (outputValid && exit_code != 0) {
+    AppendLog(validationDetails);
+  }
+  bool generationSucceeded = generation && (exit_code == 0 || (exit_code < 0 && outputValid));
+  if (cancelled && !generationSucceeded) {
     AppendLog("Process cancelled.");
     return;
   }
-  if (exit_code == 0 && generation) {
-    wxString message = "Generated current GRIB:\n" + OutputPath();
+  if (generationSucceeded) {
+    wxString message = "Generated current GRIB\nSource: " + SourceLabel() +
+                       "\nValid time: " + ValidTimeSummary() +
+                       "\nMessages: " + wxString::Format("%d", ExpectedMessageCount()) +
+                       "\nOutput: " + OutputPath();
     if (m_openAfter->GetValue()) {
       TryOpenGeneratedGrib();
       message += "\n\nA request was sent to the GRIB plugin to open this file. If it does not appear, open this GRIB in the GRIB plugin, or merge it with a weather GRIB using GRIB -> Merge GRIBs.";
@@ -613,11 +920,33 @@ void CurrentGribDialog::FinishCommand(long exit_code, bool launched) {
   }
 }
 
+bool CurrentGribDialog::ChildProcessStillExists() const {
+  if (!m_processRunning || m_processPid == 0) return false;
+#ifdef __UNIX__
+  errno = 0;
+  if (kill(static_cast<pid_t>(m_processPid), 0) == 0) return true;
+  if (errno == ESRCH) return false;
+  return true;
+#else
+  return true;
+#endif
+}
+
+bool CurrentGribDialog::OutputFileLooksValidGrib(wxString* details) const {
+  wxString path = OutputPath();
+  if (!wxFileName::FileExists(path)) {
+    if (details) *details = "output file does not exist";
+    return false;
+  }
+  return GribStreamIsStrictlyValid(path, details);
+}
+
 void CurrentGribDialog::SetBusy(bool busy) {
   m_checkButton->Enable(!busy);
   m_generateButton->Enable(!busy);
   m_cancelButton->Enable(busy);
   m_closeButton->Enable(true);
+  UpdateProviderUi();
 }
 
 void CurrentGribDialog::TryOpenGeneratedGrib() {
@@ -632,8 +961,28 @@ void CurrentGribDialog::TryOpenGeneratedGrib() {
 }
 
 wxString CurrentGribDialog::BuildGenerateCommand() const {
+  int mode = m_mode->GetSelection();
   wxString provider = m_provider->GetStringSelection();
-  if (IsCopernicusProvider(provider) || IsMarineIeProvider(provider)) {
+  if (mode == 1) {
+    if (m_useTpxoCache->GetValue()) {
+      return ShellQuote(m_generatorPath->GetValue()) + " generate --source tpxo-cache --input-cache " +
+             ShellQuote(m_tpxoCacheFile->GetPath()) +
+             " --start " + ShellQuote(m_startUtc->GetValue()) +
+             " --hours " + wxString::Format("%d", m_durationHours->GetValue()) +
+             " --step-hours " + wxString::Format("%d", m_stepHours->GetValue()) +
+             " --output " + ShellQuote(OutputPath()) + " --metadata-summary --verbose";
+    }
+    return ShellQuote(m_generatorPath->GetValue()) + " generate --bbox " + ShellQuote(m_west->GetValue()) + " " +
+           ShellQuote(m_south->GetValue()) + " " + ShellQuote(m_east->GetValue()) + " " + ShellQuote(m_north->GetValue()) +
+           " --start " + ShellQuote(m_startUtc->GetValue()) +
+           " --hours " + wxString::Format("%d", m_durationHours->GetValue()) +
+           " --step-hours " + wxString::Format("%d", m_stepHours->GetValue()) +
+           " --grid-spacing-deg " + ShellQuote(m_tpxoGridSpacing->GetValue()) +
+           " --source tpxo --model-dir " + ShellQuote(m_tpxoModelDir->GetPath()) +
+           " --model-name " + ShellQuote(m_tpxoModelName->GetValue()) +
+           " --output " + ShellQuote(OutputPath()) + " --metadata-summary --verbose";
+  }
+  if (mode == 0 && (IsCopernicusProvider(provider) || IsMarineIeProvider(provider))) {
     wxFileName downloadDir;
     downloadDir.AssignDir(m_outputDir->GetPath());
     downloadDir.AppendDir("currentgrib_downloads");
@@ -654,7 +1003,8 @@ wxString CurrentGribDialog::BuildGenerateCommand() const {
   }
   wxString source = "synthetic";
   wxString extra;
-  if (provider.Contains("Local NetCDF")) {
+  wxString spacing = "0.03";
+  if (mode == 2) {
     source = "netcdf";
     extra = " --input-netcdf " + ShellQuote(m_localNetcdf->GetPath()) +
             " --clip-bbox-to-source --use-source-grid";
@@ -664,13 +1014,154 @@ wxString CurrentGribDialog::BuildGenerateCommand() const {
          " --start " + ShellQuote(m_startUtc->GetValue()) +
          " --hours " + wxString::Format("%d", m_durationHours->GetValue()) +
          " --step-hours " + wxString::Format("%d", m_stepHours->GetValue()) +
-         " --grid-spacing-deg 0.03 --source " + source + extra +
+         " --grid-spacing-deg " + spacing + " --source " + source + extra +
          " --output " + ShellQuote(OutputPath()) + " --metadata-summary --verbose";
 }
 
 wxString CurrentGribDialog::OutputPath() const {
   wxFileName output(m_outputDir->GetPath(), m_outputFile->GetValue());
   return output.GetFullPath();
+}
+
+wxString CurrentGribDialog::SourceLabel() const {
+  int mode = m_mode->GetSelection();
+  if (mode == 1 && m_useTpxoCache->GetValue()) return "TPXO10 astronomical tide model cache";
+  if (mode == 1) return "TPXO10 astronomical tide model";
+  if (mode == 2) return "Local NetCDF model current";
+  if (mode == 3) return "Synthetic test current";
+  wxString provider = m_provider->GetStringSelection();
+  if (IsMarineIeProvider(provider) || (provider == "Auto" && AutoWouldUseMarineIe())) {
+    return "Marine Institute Ireland Irish Sea forecast/model current";
+  }
+  if (provider.Contains("North-West Shelf")) {
+    return "Copernicus Marine NWS forecast/model current";
+  }
+  if (provider.Contains("Global")) {
+    return "Copernicus Marine Global forecast/model current";
+  }
+  return "Auto forecast/model current provider";
+}
+
+wxString CurrentGribDialog::ValidTimeSummary() const {
+  wxString startText = m_startUtc->GetValue();
+  wxString parseText = startText;
+  if (parseText.EndsWith("Z")) parseText.RemoveLast();
+  wxDateTime start;
+  if (start.ParseISOCombined(parseText, 'T')) {
+    wxDateTime end = start + wxTimeSpan::Hours(m_durationHours->GetValue());
+    return start.FormatISOCombined('T') + "Z to " + end.FormatISOCombined('T') + "Z";
+  }
+  return startText + " plus " + wxString::Format("%d hours", m_durationHours->GetValue());
+}
+
+int CurrentGribDialog::ExpectedMessageCount() const {
+  int step = std::max(1, m_stepHours->GetValue());
+  int timesteps = (m_durationHours->GetValue() / step) + 1;
+  return timesteps * 2;
+}
+
+wxString CurrentGribDialog::DefaultOutputFilenameForSelection() const {
+  int mode = m_mode->GetSelection();
+  int preset = m_presetChoice->GetSelection();
+  if (mode == 1) {
+    return preset == 2 ? IrishSeaTpxoOutputFilename() : DefaultTpxoOutputFilename();
+  }
+  if (mode == 2) return TimestampedFilename("local_netcdf_current");
+  if (mode == 3) return TimestampedFilename("synthetic_current");
+
+  wxString provider = m_provider->GetStringSelection();
+  if (IsMarineIeProvider(provider) || (provider == "Auto" && AutoWouldUseMarineIe())) {
+    return MarineIeOutputFilename();
+  }
+  if (provider.Contains("Copernicus Marine Global")) {
+    return TimestampedFilename("copernicus_global_current");
+  }
+  if (provider.Contains("Copernicus Marine North-West Shelf")) {
+    return TimestampedFilename("copernicus_nws_current");
+  }
+  if (provider == "Auto") {
+    double west = 0.0;
+    double south = 0.0;
+    double east = 0.0;
+    double north = 0.0;
+    bool parsed = m_west->GetValue().ToDouble(&west) && m_south->GetValue().ToDouble(&south) &&
+                  m_east->GetValue().ToDouble(&east) && m_north->GetValue().ToDouble(&north);
+    if (parsed && west >= -20.0 && east <= 13.0 && south >= 40.0 && north <= 65.0) {
+      return TimestampedFilename("copernicus_nws_current");
+    }
+    return TimestampedFilename("copernicus_global_current");
+  }
+  return TimestampedFilename("current_grib");
+}
+
+void CurrentGribDialog::RefreshOutputFilenameDefault() {
+  wxString previousAuto = m_lastAutoOutputFilename;
+  wxString current = m_outputFile->GetValue();
+  wxString nextAuto = DefaultOutputFilenameForSelection();
+  bool shouldUpdate = current.empty() || !m_outputFileUserCustomized ||
+                      (!previousAuto.empty() && current == previousAuto);
+  m_lastAutoOutputFilename = nextAuto;
+  if (!shouldUpdate) return;
+  m_updatingOutputFilename = true;
+  m_outputFile->SetValue(nextAuto);
+  m_updatingOutputFilename = false;
+  m_outputFileUserCustomized = false;
+}
+
+void CurrentGribDialog::LoadSettings() {
+  wxConfigBase* config = wxConfigBase::Get(false);
+  if (!config) return;
+  wxString oldPath = config->GetPath();
+  config->SetPath("/PlugIns/currentgrib_pi");
+  long mode = config->ReadLong("generation_mode", m_mode->GetSelection());
+  if (mode >= 0 && mode < static_cast<long>(m_mode->GetCount())) {
+    m_mode->SetSelection(static_cast<int>(mode));
+  }
+  wxString value;
+  if (config->Read("tpxo_model_directory", &value) && !value.empty()) {
+    m_tpxoModelDir->SetPath(value);
+  }
+  if (config->Read("tpxo_model_name", &value) && !value.empty()) {
+    m_tpxoModelName->SetValue(value);
+  }
+  if (config->Read("tpxo_grid_spacing", &value) && !value.empty()) {
+    m_tpxoGridSpacing->SetValue(value);
+  }
+  if (config->Read("tpxo_cache_file", &value) && !value.empty()) {
+    m_tpxoCacheFile->SetPath(value);
+  }
+  m_useTpxoCache->SetValue(config->ReadBool("use_tpxo_cache", false));
+  m_durationHours->SetValue(static_cast<int>(config->ReadLong("duration_hours", m_durationHours->GetValue())));
+  m_stepHours->SetValue(static_cast<int>(config->ReadLong("step_hours", m_stepHours->GetValue())));
+  bool rememberUsername = config->ReadBool("remember_copernicus_username", false);
+  m_rememberUsername->SetValue(rememberUsername);
+  if (rememberUsername && config->Read("copernicus_username", &value)) {
+    m_username->SetValue(value);
+  }
+  config->SetPath(oldPath);
+}
+
+void CurrentGribDialog::SaveSettings() {
+  wxConfigBase* config = wxConfigBase::Get(false);
+  if (!config) return;
+  wxString oldPath = config->GetPath();
+  config->SetPath("/PlugIns/currentgrib_pi");
+  config->Write("generation_mode", static_cast<long>(m_mode->GetSelection()));
+  config->Write("tpxo_model_directory", m_tpxoModelDir->GetPath());
+  config->Write("tpxo_model_name", m_tpxoModelName->GetValue());
+  config->Write("tpxo_grid_spacing", m_tpxoGridSpacing->GetValue());
+  config->Write("tpxo_cache_file", m_tpxoCacheFile->GetPath());
+  config->Write("use_tpxo_cache", m_useTpxoCache->GetValue());
+  config->Write("duration_hours", static_cast<long>(m_durationHours->GetValue()));
+  config->Write("step_hours", static_cast<long>(m_stepHours->GetValue()));
+  config->Write("remember_copernicus_username", m_rememberUsername->GetValue());
+  if (m_rememberUsername->GetValue()) {
+    config->Write("copernicus_username", m_username->GetValue());
+  } else {
+    config->DeleteEntry("copernicus_username", false);
+  }
+  config->Flush();
+  config->SetPath(oldPath);
 }
 
 wxString CurrentGribDialog::FindDefaultGenerator() const {

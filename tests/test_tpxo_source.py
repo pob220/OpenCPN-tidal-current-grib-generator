@@ -75,6 +75,21 @@ def test_tpxo_passes_flattened_meshgrid_to_pytmd(monkeypatch, tmp_path: Path):
     assert np.allclose(current.v_mps, 0.02)
 
 
+def test_tpxo_rejects_invalid_worker_count(tmp_path: Path):
+    with pytest.raises(ValidationError, match="--tpxo-workers"):
+        create_source("tpxo", model_directory=tmp_path, tpxo_workers=0)
+
+
+def test_tpxo_rejects_parallel_worker_count(tmp_path: Path):
+    with pytest.raises(ValidationError, match="parallel TPXO workers are disabled"):
+        create_source("tpxo", model_directory=tmp_path, tpxo_workers=2)
+
+
+def test_tpxo_single_worker_allowed(tmp_path: Path):
+    source = create_source("tpxo", model_directory=tmp_path, tpxo_workers=1)
+    assert source.workers == 1
+
+
 def test_tpxo_component_values_reshapes_flattened_point_output():
     values = np.arange(6, dtype=float)
     result = _component_values({"u": values}, "u", (2, 3))

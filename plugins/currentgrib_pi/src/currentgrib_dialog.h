@@ -16,10 +16,14 @@ public:
 
 private:
   void OnCheckDependencies(wxCommandEvent& event);
+  void OnCheckTpxoModel(wxCommandEvent& event);
+  void OnPrepareTpxoCache(wxCommandEvent& event);
   void OnGenerate(wxCommandEvent& event);
   void OnBrowseOutput(wxCommandEvent& event);
+  void OnOutputFilenameChanged(wxCommandEvent& event);
   void OnPresetChanged(wxCommandEvent& event);
   void OnProviderChanged(wxCommandEvent& event);
+  void OnModeChanged(wxCommandEvent& event);
   void OnCancel(wxCommandEvent& event);
   void OnClose(wxCommandEvent& event);
   void OnDialogClose(wxCloseEvent& event);
@@ -31,14 +35,23 @@ private:
   void DrainStream(wxInputStream* stream, wxString* buffer, const wxString& prefix);
   void StartCommand(const wxString& command, const wxString& password, bool generation);
   void FinishCommand(long exit_code, bool launched);
+  bool ChildProcessStillExists() const;
+  bool OutputFileLooksValidGrib(wxString* details = nullptr) const;
   void SetBusy(bool busy);
   void ApplyPreset(int selection);
   bool ConfirmLargeCopernicusRequest();
   bool AutoWouldUseMarineIe() const;
   void UpdateProviderUi();
+  void RefreshOutputFilenameDefault();
+  void LoadSettings();
+  void SaveSettings();
   void TryOpenGeneratedGrib();
   wxString BuildGenerateCommand() const;
   wxString OutputPath() const;
+  wxString SourceLabel() const;
+  wxString ValidTimeSummary() const;
+  int ExpectedMessageCount() const;
+  wxString DefaultOutputFilenameForSelection() const;
   wxString FindDefaultGenerator() const;
   wxString Redact(const wxString& text) const;
 
@@ -50,12 +63,20 @@ private:
   wxTextCtrl* m_startUtc;
   wxSpinCtrl* m_durationHours;
   wxSpinCtrl* m_stepHours;
+  wxChoice* m_mode;
   wxChoice* m_presetChoice;
   wxChoice* m_provider;
   wxTextCtrl* m_username;
   wxTextCtrl* m_password;
   wxCheckBox* m_rememberUsername;
   wxStaticText* m_providerNote;
+  wxDirPickerCtrl* m_tpxoModelDir;
+  wxTextCtrl* m_tpxoModelName;
+  wxTextCtrl* m_tpxoGridSpacing;
+  wxButton* m_checkTpxoButton;
+  wxCheckBox* m_useTpxoCache;
+  wxFilePickerCtrl* m_tpxoCacheFile;
+  wxButton* m_prepareTpxoCacheButton;
   wxFilePickerCtrl* m_localNetcdf;
   wxDirPickerCtrl* m_outputDir;
   wxTextCtrl* m_outputFile;
@@ -77,4 +98,7 @@ private:
   wxString m_currentCommand;
   wxString m_stdoutBuffer;
   wxString m_stderrBuffer;
+  wxString m_lastAutoOutputFilename;
+  bool m_outputFileUserCustomized{false};
+  bool m_updatingOutputFilename{false};
 };

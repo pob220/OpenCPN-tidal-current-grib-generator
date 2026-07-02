@@ -15,8 +15,21 @@ This is a v1 plugin scaffold:
 - dependency check command is wired
 - synthetic/local NetCDF generation is wired through the Python CLI
 - Copernicus NWS and Global live generation are wired through the Python CLI
+- Marine Institute Ireland ready-made Irish Sea current GRIB download is wired
+- TPXO10 astronomical tidal-current generation from local licensed model files is wired through the Python CLI
+- TPXO cache preparation and cached generation are wired for repeated generation over the same bbox/grid
 - subprocess execution is asynchronous using wx process events
 - Copernicus password must be entered at runtime and is not stored
 - Copernicus password is passed only to the helper process environment, not on argv
 
 The plugin remains a thin wrapper around the Python generator. It does not reimplement NetCDF download, conversion, or GRIB writing.
+
+TPXO output is labelled:
+
+```text
+Source: TPXO10 astronomical tide model
+```
+
+TPXO predicts astronomical tidal currents from local licensed model files. It does not include weather-driven surge, wind residual currents, river flow, or operational forecast-model corrections.
+
+TPXO cache files are local derived data from licensed TPXO files. Do not redistribute them unless the TPXO licence permits it.

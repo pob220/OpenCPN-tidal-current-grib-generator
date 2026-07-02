@@ -17,6 +17,9 @@ secrets*
 *.nc
 *.nc4
 *.zarr/
+*.npz
+*.tpxocache
+tpxo-cache/
 current-data/
 downloads/
 test-output/

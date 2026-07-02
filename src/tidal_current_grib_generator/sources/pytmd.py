@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
-from dataclasses import dataclass
+import time as monotonic_time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -81,11 +82,17 @@ class PyTMDTPXOSource(CurrentSource):
     extrapolation_cutoff_km: float = 10.0
     crop_buffer_degrees: float = 1.0
     infer_minor: bool = True
+    workers: int = 1
+    _last_timing: dict[str, Any] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "model_directory", self.model_directory.expanduser())
         if self.definition_file is not None:
             object.__setattr__(self, "definition_file", self.definition_file.expanduser())
+        if self.workers < 1:
+            raise ValidationError("--tpxo-workers must be 1 or greater")
+        if self.workers != 1:
+            raise ValidationError("parallel TPXO workers are disabled; benchmarking did not show a safe runtime improvement")
 
     def describe(self) -> SourceDescription:
         model_label = self.definition_file.name if self.definition_file else self.model_name
@@ -111,7 +118,14 @@ class PyTMDTPXOSource(CurrentSource):
         self.validate_available()
         if not times:
             return []
+        return self._get_current_grids_single(bbox, times, grid)
+
+    def _get_current_grids_single(self, bbox: BoundingBox, times: list[datetime], grid: RegularGrid) -> list[CurrentGrid]:
+        total_started = monotonic_time.perf_counter()
+        open_started = monotonic_time.perf_counter()
         compute = _import_pytmd_compute()
+        _open_pytmd_model_metadata(self.model_directory, self.model_name, self.definition_file)
+        model_open_seconds = monotonic_time.perf_counter() - open_started
 
         # pyTMD expects x=longitude, y=latitude in EPSG:4326 for crs=4326.
         # Use flattened point/drift mode instead of pyTMD grid mode. This
@@ -129,6 +143,7 @@ class PyTMDTPXOSource(CurrentSource):
         x = np.tile(lon_points, nt)
         y = np.tile(lat_points, nt)
         valid_time = np.repeat(np.asarray(valid_datetimes, dtype="datetime64[ns]"), npoints)
+        compute_started = monotonic_time.perf_counter()
         result = compute.tide_currents(
             x,
             y,
@@ -150,6 +165,7 @@ class PyTMDTPXOSource(CurrentSource):
         )
         u_cm_s = _component_time_values(result, "u", (nt, grid.ny, grid.nx))
         v_cm_s = _component_time_values(result, "v", (nt, grid.ny, grid.nx))
+        compute_seconds = monotonic_time.perf_counter() - compute_started
         grids: list[CurrentGrid] = []
         for index, time in enumerate(times):
             u_mps = u_cm_s[index] / 100.0
@@ -164,7 +180,25 @@ class PyTMDTPXOSource(CurrentSource):
                     mask=mask if mask.any() else None,
                 )
             )
+        total_seconds = monotonic_time.perf_counter() - total_started
+        object.__setattr__(
+            self,
+            "_last_timing",
+            {
+                "source": "tpxo",
+                "workers": 1,
+                "model_open_seconds": model_open_seconds,
+                "coordinate_grid_size": {"nx": grid.nx, "ny": grid.ny},
+                "point_count": int(npoints),
+                "timestep_count": nt,
+                "pytmd_compute_seconds": compute_seconds,
+                "total_source_seconds": total_seconds,
+            },
+        )
         return grids
+
+    def last_timing(self) -> dict[str, Any]:
+        return dict(self._last_timing)
 
     def inspect(self) -> dict[str, Any]:
         return inspect_pytmd_source(
@@ -268,6 +302,20 @@ def inspect_pytmd_source(
 
 def _component_values(result: Any, component: str, expected_shape: tuple[int, int]) -> np.ndarray:
     return _component_array(result, component, expected_shape)
+
+
+def _open_pytmd_model_metadata(model_directory: Path, model_name: str, definition_file: Path | None) -> None:
+    try:
+        import pyTMD.io
+
+        model_factory = pyTMD.io.model(model_directory, verify=False)
+        if definition_file is not None:
+            model_factory.from_file(definition_file)
+        else:
+            model_factory.from_database(model_name, group=("u", "v"))
+    except Exception:
+        # compute.tide_currents below raises the authoritative pyTMD/model error.
+        return
 
 
 def _component_time_values(result: Any, component: str, expected_shape: tuple[int, int, int]) -> np.ndarray:

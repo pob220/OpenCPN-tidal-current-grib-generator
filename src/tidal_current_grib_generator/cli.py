@@ -11,6 +11,7 @@ import os
 import tempfile
 import time as monotonic_time
 import sys
+import shutil
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -29,6 +30,7 @@ from tidal_current_grib_generator.reference import compare_reference_csv
 from tidal_current_grib_generator.sources import create_source
 from tidal_current_grib_generator.sources.netcdf import NetCDFCurrentSource, inspect_netcdf, netcdf_time_metadata
 from tidal_current_grib_generator.sources.pytmd import inspect_pytmd_source
+from tidal_current_grib_generator.sources.tpxo_cache import prepare_tpxo_cache, validate_tpxo_cache
 from tidal_current_grib_generator.providers import (
     Provider,
     ProviderRegistry,
@@ -60,15 +62,22 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     generate = subparsers.add_parser("generate", help="Generate a current GRIB.")
-    generate.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"))
+    generate.add_argument("--bbox", nargs=4, type=float, metavar=("W", "S", "E", "N"))
     generate.add_argument("--start", required=True, help="UTC ISO-8601 start time, e.g. 2026-07-01T00:00:00Z.")
     generate.add_argument("--hours", type=int, required=True)
     generate.add_argument("--step-hours", type=int, default=1)
-    generate.add_argument("--grid-spacing-deg", type=float, required=True)
+    generate.add_argument("--grid-spacing-deg", type=float)
     generate.add_argument("--source", default="synthetic")
     generate.add_argument("--model-dir", "--model-directory", dest="model_directory", type=Path)
     generate.add_argument("--model-name", default=DEFAULT_TPXO_MODEL)
     generate.add_argument("--definition-file", type=Path)
+    generate.add_argument("--input-cache", type=Path, help="Local TPXO cache file for --source tpxo-cache.")
+    generate.add_argument(
+        "--tpxo-workers",
+        type=int,
+        default=1,
+        help="TPXO-only worker count. Values above 1 are currently disabled because benchmarking did not show a safe improvement.",
+    )
     _add_netcdf_options(generate)
     generate.add_argument("--output", type=Path, required=True)
     generate.add_argument("--format", choices=["grib1"], default="grib1")
@@ -112,6 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--model-dir", "--model-directory", dest="model_directory", type=Path)
     inspect.add_argument("--model-name", default=DEFAULT_TPXO_MODEL)
     inspect.add_argument("--definition-file", type=Path)
+    inspect.add_argument("--input-cache", type=Path)
     inspect.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     inspect.set_defaults(func=cmd_inspect_source)
 
@@ -238,6 +248,34 @@ def build_parser() -> argparse.ArgumentParser:
     generate_provider.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     generate_provider.add_argument("--debug", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     generate_provider.set_defaults(func=cmd_generate_provider)
+
+    prepare_cache = subparsers.add_parser("prepare-tpxo-cache", help="Prepare a local derived TPXO harmonic-current cache.")
+    prepare_cache.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"))
+    prepare_cache.add_argument("--grid-spacing-deg", type=float, required=True)
+    prepare_cache.add_argument("--model-dir", "--model-directory", dest="model_directory", type=Path, required=True)
+    prepare_cache.add_argument("--model-name", default=DEFAULT_TPXO_MODEL)
+    prepare_cache.add_argument("--definition-file", type=Path)
+    prepare_cache.add_argument("--output", type=Path, required=True)
+    prepare_cache.add_argument("--metadata-summary", action="store_true")
+    prepare_cache.add_argument("--json", action="store_true")
+    prepare_cache.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    prepare_cache.set_defaults(func=cmd_prepare_tpxo_cache)
+
+    benchmark_tpxo = subparsers.add_parser("benchmark-tpxo", help="Benchmark TPXO generation worker counts.")
+    benchmark_tpxo.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"))
+    benchmark_tpxo.add_argument("--start", required=True)
+    benchmark_tpxo.add_argument("--hours", type=int, required=True)
+    benchmark_tpxo.add_argument("--step-hours", type=int, default=1)
+    benchmark_tpxo.add_argument("--grid-spacing-deg", type=float, required=True)
+    benchmark_tpxo.add_argument("--model-dir", "--model-directory", dest="model_directory", type=Path, required=True)
+    benchmark_tpxo.add_argument("--model-name", default=DEFAULT_TPXO_MODEL)
+    benchmark_tpxo.add_argument("--definition-file", type=Path)
+    benchmark_tpxo.add_argument("--workers", required=True, help="Comma-separated worker counts, e.g. 1,2,4.")
+    benchmark_tpxo.add_argument("--output-directory", type=Path, help="Directory for temporary benchmark GRIBs.")
+    benchmark_tpxo.add_argument("--keep-outputs", action="store_true")
+    benchmark_tpxo.add_argument("--json", action="store_true")
+    benchmark_tpxo.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    benchmark_tpxo.set_defaults(func=cmd_benchmark_tpxo)
     return parser
 
 
@@ -258,11 +296,33 @@ def _add_netcdf_options(parser: argparse.ArgumentParser, include_input: bool = T
 
 
 def cmd_generate(args: argparse.Namespace) -> int:
-    requested_bbox = BoundingBox.from_values(args.bbox)
+    command_started = monotonic_time.perf_counter()
+    source_name = args.source.strip().lower()
+    if args.tpxo_workers < 1:
+        raise ValidationError("--tpxo-workers must be 1 or greater")
+    if args.tpxo_workers != 1 and source_name not in {"tpxo", "pytmd"}:
+        raise ValidationError("--tpxo-workers is only supported with --source tpxo")
+    if args.tpxo_workers != 1:
+        raise ValidationError("parallel TPXO workers are disabled; benchmarking did not show a safe runtime improvement")
     start = parse_utc_datetime(args.start)
     times = build_time_sequence(start, args.hours, args.step_hours)
     source = _source_from_args(args)
-    plan = _build_generation_plan(args, source, requested_bbox, times)
+    if source.describe().name == "tpxo-cache":
+        requested_bbox = source.bbox
+        plan = GenerationPlan(
+            requested_bbox=source.bbox,
+            bbox=source.bbox,
+            grid=source.grid,
+            times=times,
+            warnings=[],
+        )
+    else:
+        if args.bbox is None:
+            raise ValidationError("--bbox is required unless --source tpxo-cache is used")
+        if args.grid_spacing_deg is None:
+            raise ValidationError("--grid-spacing-deg is required unless --source tpxo-cache is used")
+        requested_bbox = BoundingBox.from_values(args.bbox)
+        plan = _build_generation_plan(args, source, requested_bbox, times)
     output = args.output.expanduser()
     if output.exists() and output.is_dir():
         raise ValidationError("--output must be a file path, not a directory")
@@ -274,6 +334,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
             "\n".join(
                 [
                     f"source: {source.describe().name}",
+                    f"Source: {_source_provenance_label(source)}",
                     f"bbox: {plan.bbox.west},{plan.bbox.south},{plan.bbox.east},{plan.bbox.north}",
                     f"grid: {plan.grid.nx} x {plan.grid.ny} ({plan.grid.nx * plan.grid.ny} points)",
                     f"times: {times[0].isoformat()} to {times[-1].isoformat()} ({len(times)} steps)",
@@ -286,20 +347,32 @@ def cmd_generate(args: argparse.Namespace) -> int:
     if args.dry_run:
         return 0
 
-    grids = _current_grids_for_generation(source, plan.bbox, times, plan.grid, args.verbose)
+    source_name = source.describe().name
+    tpxo_timing: dict[str, Any] = {}
+    if source_name in {"tpxo", "tpxo-cache"}:
+        grids = list(_current_grids_for_generation(source, plan.bbox, times, plan.grid, args.verbose))
+        timing_method = getattr(source, "last_timing", None)
+        if callable(timing_method):
+            tpxo_timing = timing_method()
+    else:
+        grids = _current_grids_for_generation(source, plan.bbox, times, plan.grid, args.verbose)
     writer = EccodesGrib1CurrentWriter()
     tmp_path: Path | None = None
     try:
         output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(prefix=output.name + ".", suffix=".tmp", dir=output.parent, delete=False) as tmp:
             tmp_path = Path(tmp.name)
+        write_started = monotonic_time.perf_counter()
         summary = writer.write(grids, tmp_path, progress_callback=_progress_callback(args.verbose))
+        write_seconds = monotonic_time.perf_counter() - write_started
         if summary.message_count != plan.message_count:
             raise ValidationError(
                 f"wrote {summary.message_count} messages, expected {plan.message_count}; "
                 "discarding incomplete GRIB output"
             )
+        validation_started = monotonic_time.perf_counter()
         scan = scan_grib_messages(summary.output)
+        validation_seconds = monotonic_time.perf_counter() - validation_started
         if scan.message_count != plan.message_count:
             raise ValidationError(
                 f"validated {scan.message_count} messages, expected {plan.message_count}; "
@@ -315,11 +388,193 @@ def cmd_generate(args: argparse.Namespace) -> int:
         result["written_messages"] = summary.message_count
         result["validated_messages"] = scan.message_count
         result["bytes"] = scan.byte_count
+        if source_name in {"tpxo", "tpxo-cache"}:
+            result["timing"] = _tpxo_generation_timing_dict(
+                tpxo_timing,
+                write_seconds=write_seconds,
+                validation_seconds=validation_seconds,
+                total_seconds=monotonic_time.perf_counter() - command_started,
+            )
         print(json.dumps(result, indent=2, sort_keys=True))
     else:
         print(f"wrote {summary.message_count} GRIB messages to {output}")
         print(f"validated GRIB stream: {scan.message_count} messages, {scan.byte_count} bytes")
+        if args.verbose and source_name in {"tpxo", "tpxo-cache"}:
+            _print_tpxo_generation_timing(_tpxo_generation_timing_dict(
+                    tpxo_timing,
+                    write_seconds=write_seconds,
+                    validation_seconds=validation_seconds,
+                    total_seconds=monotonic_time.perf_counter() - command_started,
+                )
+            )
+    args._last_generation_timing = _tpxo_generation_timing_dict(
+        tpxo_timing,
+        write_seconds=write_seconds,
+        validation_seconds=validation_seconds,
+        total_seconds=monotonic_time.perf_counter() - command_started,
+    ) if source_name in {"tpxo", "tpxo-cache"} else {}
     return 0
+
+
+def cmd_benchmark_tpxo(args: argparse.Namespace) -> int:
+    worker_counts = _parse_worker_counts(args.workers)
+    benchmark_dir = (
+        args.output_directory.expanduser()
+        if args.output_directory is not None
+        else Path(tempfile.mkdtemp(prefix="tidal-current-grib-tpxo-benchmark-"))
+    )
+    benchmark_dir.mkdir(parents=True, exist_ok=True)
+    results: list[dict[str, Any]] = []
+    print(
+        "TPXO benchmark warning: multiple workers can duplicate TPXO NetCDF model opening, memory use, and disk I/O. "
+        "Do not assume more workers is faster.",
+        flush=True,
+    )
+    for workers in worker_counts:
+        output = benchmark_dir / f"benchmark_tpxo_workers_{workers}.grb"
+        if workers != 1:
+            result = {
+                "workers": workers,
+                "skipped": True,
+                "reason": "parallel TPXO workers are disabled; a real 24h benchmark exceeded single-worker runtime and did not complete promptly",
+            }
+            results.append(result)
+            print(f"benchmark workers={workers}: skipped ({result['reason']})", flush=True)
+            continue
+        if output.exists():
+            output.unlink()
+        run_args = argparse.Namespace(
+            bbox=args.bbox,
+            start=args.start,
+            hours=args.hours,
+            step_hours=args.step_hours,
+            grid_spacing_deg=args.grid_spacing_deg,
+            source="tpxo",
+            model_directory=args.model_directory,
+            model_name=args.model_name,
+            definition_file=args.definition_file,
+            tpxo_workers=workers,
+            input_netcdf=None,
+            u_variable=None,
+            v_variable=None,
+            lat_variable=None,
+            lon_variable=None,
+            time_variable=None,
+            depth_index=None,
+            depth_value=None,
+            assume_units=None,
+            nearest_time=False,
+            coverage_tolerance_deg=0.02,
+            source_grid_regularity_tolerance=1e-5,
+            use_source_grid=False,
+            output=output,
+            format="grib1",
+            units="mps",
+            dry_run=False,
+            metadata_summary=True,
+            json_summary=False,
+            verbose=True,
+        )
+        print(f"benchmark workers={workers}", flush=True)
+        started = monotonic_time.perf_counter()
+        rc = cmd_generate(run_args)
+        elapsed = monotonic_time.perf_counter() - started
+        inspection = inspect_grib(output)
+        result = {
+            "workers": workers,
+            "output": str(output),
+            "runtime_seconds": elapsed,
+            "timing": getattr(run_args, "_last_generation_timing", {}),
+            "message_count": inspection.get("message_count"),
+            "stream_valid": inspection.get("stream_valid"),
+            "parameter_counts": inspection.get("parameter_counts"),
+            "first_valid_time": inspection.get("first_valid_time"),
+            "last_valid_time": inspection.get("last_valid_time"),
+        }
+        results.append(result)
+        if not args.keep_outputs:
+            output.unlink(missing_ok=True)
+    if not args.keep_outputs and args.output_directory is None:
+        shutil.rmtree(benchmark_dir, ignore_errors=True)
+    if args.json:
+        print(json.dumps(results, indent=2, sort_keys=True))
+    else:
+        print("TPXO benchmark summary:", flush=True)
+        for result in results:
+            if result.get("skipped"):
+                print(f"  workers={result['workers']}: skipped - {result['reason']}", flush=True)
+                continue
+            timing = result.get("timing", {})
+            print(
+                "  workers={workers}: total={total:.2f}s, pyTMD={pytmd}, write={write}, "
+                "messages={messages}, valid={valid}".format(
+                    workers=result["workers"],
+                    total=float(result["runtime_seconds"]),
+                    pytmd=_format_seconds(timing.get("pytmd_compute_seconds")),
+                    write=_format_seconds(timing.get("grib_write_seconds")),
+                    messages=result.get("message_count"),
+                    valid=result.get("stream_valid"),
+                ),
+                flush=True,
+            )
+    return 0
+
+
+def cmd_prepare_tpxo_cache(args: argparse.Namespace) -> int:
+    bbox = BoundingBox.from_values(args.bbox)
+    output = args.output.expanduser()
+    if output.exists() and output.is_dir():
+        raise ValidationError("--output must be a cache file path, not a directory")
+    if args.metadata_summary:
+        print("preparing TPXO cache", flush=True)
+        print(f"Source: TPXO10 astronomical tide model", flush=True)
+        print(f"bbox: {bbox.west},{bbox.south},{bbox.east},{bbox.north}", flush=True)
+        print(f"grid_spacing_deg: {args.grid_spacing_deg}", flush=True)
+        print(f"output: {output}", flush=True)
+        print("notice: Derived from local licensed TPXO model files. Do not redistribute unless your TPXO licence permits it.", flush=True)
+    prepared = prepare_tpxo_cache(
+        bbox=bbox,
+        grid_spacing_deg=args.grid_spacing_deg,
+        model_directory=args.model_directory,
+        model_name=args.model_name,
+        definition_file=args.definition_file,
+        output=output,
+        verbose=args.verbose,
+    )
+    summary = prepared.summary()
+    if args.json:
+        print(json.dumps(summary, indent=2, sort_keys=True))
+    else:
+        print(f"wrote TPXO cache: {prepared.path}", flush=True)
+        print(
+            f"cache grid: {prepared.grid.nx} x {prepared.grid.ny} "
+            f"({prepared.point_count} points)",
+            flush=True,
+        )
+        print(f"constituents: {', '.join(prepared.metadata.constituents)}", flush=True)
+        print(f"preparation_seconds: {prepared.preparation_seconds:.2f}", flush=True)
+        print("notice: Derived from local licensed TPXO model files. Do not redistribute unless your TPXO licence permits it.", flush=True)
+    return 0
+
+
+def _parse_worker_counts(value: str) -> list[int]:
+    counts: list[int] = []
+    for raw in value.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            count = int(raw)
+        except ValueError as exc:
+            raise ValidationError("--workers must be a comma-separated list of positive integers") from exc
+        if count < 1:
+            raise ValidationError("--workers values must be 1 or greater")
+        if count > 8:
+            raise ValidationError("--workers values above 8 are not supported; TPXO jobs are I/O and memory heavy")
+        counts.append(count)
+    if not counts:
+        raise ValidationError("--workers must include at least one worker count")
+    return counts
 
 
 def _current_grids_for_generation(source: Any, bbox: BoundingBox, times: list[Any], grid: Any, verbose: bool):
@@ -342,6 +597,63 @@ def _current_grids_for_generation(source: Any, bbox: BoundingBox, times: list[An
         if verbose:
             print(f"computed timestep {index}/{len(times)} {valid_time.isoformat()} in {elapsed:.2f}s", flush=True)
         yield current
+
+
+def _tpxo_generation_timing_dict(
+    source_timing: dict[str, Any],
+    *,
+    write_seconds: float,
+    validation_seconds: float,
+    total_seconds: float,
+) -> dict[str, Any]:
+    return {
+        "workers": source_timing.get("workers", 1),
+        "model_open_seconds": source_timing.get("model_open_seconds"),
+        "coordinate_grid_size": source_timing.get("coordinate_grid_size"),
+        "point_count": source_timing.get("point_count"),
+        "timestep_count": source_timing.get("timestep_count"),
+        "pytmd_compute_seconds": source_timing.get("pytmd_compute_seconds"),
+        "cache_predict_seconds": source_timing.get("cache_predict_seconds"),
+        "grib_write_seconds": write_seconds,
+        "grib_validation_seconds": validation_seconds,
+        "total_generation_seconds": total_seconds,
+        "worker_timings": source_timing.get("worker_timings"),
+    }
+
+
+def _print_tpxo_generation_timing(timing: dict[str, Any]) -> None:
+    grid_size = timing.get("coordinate_grid_size") or {}
+    print("TPXO timing:", flush=True)
+    print(f"  workers: {timing.get('workers')}", flush=True)
+    print(f"  model_open_seconds: {_format_seconds(timing.get('model_open_seconds'))}", flush=True)
+    print(f"  coordinate_grid_size: {grid_size.get('nx')} x {grid_size.get('ny')}", flush=True)
+    print(f"  point_count: {timing.get('point_count')}", flush=True)
+    print(f"  timestep_count: {timing.get('timestep_count')}", flush=True)
+    print(f"  pytmd_compute_seconds: {_format_seconds(timing.get('pytmd_compute_seconds'))}", flush=True)
+    if timing.get("cache_predict_seconds") is not None:
+        print(f"  cache_predict_seconds: {_format_seconds(timing.get('cache_predict_seconds'))}", flush=True)
+    print(f"  grib_write_seconds: {_format_seconds(timing.get('grib_write_seconds'))}", flush=True)
+    print(f"  grib_validation_seconds: {_format_seconds(timing.get('grib_validation_seconds'))}", flush=True)
+    print(f"  total_generation_seconds: {_format_seconds(timing.get('total_generation_seconds'))}", flush=True)
+
+
+def _format_seconds(value: Any) -> str:
+    if value is None:
+        return "(unknown)"
+    return f"{float(value):.2f}"
+
+
+def _source_provenance_label(source: Any) -> str:
+    description = source.describe()
+    if description.name == "tpxo":
+        return "TPXO10 astronomical tide model"
+    if description.name == "tpxo-cache":
+        return "TPXO10 astronomical tide model cache"
+    if description.name == "netcdf":
+        return "Local NetCDF model current"
+    if description.name == "synthetic":
+        return "Synthetic test current"
+    return description.summary
 
 
 def cmd_compare_reference(args: argparse.Namespace) -> int:
@@ -387,6 +699,10 @@ def cmd_inspect_source(args: argparse.Namespace) -> int:
             model_name=args.model_name,
             definition_file=args.definition_file,
         ).as_dict()
+    elif args.source.strip().lower() in {"tpxo-cache", "tpxo_cache"}:
+        if getattr(args, "input_cache", None) is None:
+            raise ValidationError("--input-cache is required for inspecting a TPXO cache")
+        inspection = validate_tpxo_cache(args.input_cache)
     else:
         inspection = create_source(args.source, units="mps").inspect()
     _print_mapping(inspection)
@@ -808,7 +1124,14 @@ def _jsonable_time_plan(plan: dict[str, Any]) -> dict[str, Any]:
 def _print_mapping(inspection: dict) -> None:
     for key, value in inspection.items():
         if isinstance(value, list):
-            print(f"{key}: {', '.join(value) if value else '(none)'}")
+            if not value:
+                print(f"{key}: (none)")
+            elif all(isinstance(item, str) for item in value):
+                print(f"{key}: {', '.join(value)}")
+            else:
+                print(f"{key}:")
+                for item in value:
+                    print(f"  {json.dumps(item, sort_keys=True)}")
         elif isinstance(value, dict):
             print(f"{key}:")
             for nested_key, nested_value in value.items():
@@ -824,6 +1147,7 @@ def _source_from_args(args: argparse.Namespace):
         model_directory=getattr(args, "model_directory", None),
         model_name=getattr(args, "model_name", DEFAULT_TPXO_MODEL),
         definition_file=getattr(args, "definition_file", None),
+        input_cache=getattr(args, "input_cache", None),
         input_netcdf=getattr(args, "input_netcdf", None),
         u_variable=getattr(args, "u_variable", None),
         v_variable=getattr(args, "v_variable", None),
@@ -837,6 +1161,7 @@ def _source_from_args(args: argparse.Namespace):
         coverage_tolerance_deg=getattr(args, "coverage_tolerance_deg", 0.02),
         use_source_grid=getattr(args, "use_source_grid", False),
         source_grid_regularity_tolerance=getattr(args, "source_grid_regularity_tolerance", 1e-5),
+        tpxo_workers=getattr(args, "tpxo_workers", 1),
     )
 
 
@@ -893,6 +1218,7 @@ def _summary_json(plan: GenerationPlan, source: Any, output: Path, dry_run: bool
             metadata = {"metadata_error": str(exc)}
     summary = {
         "source": source.describe().name,
+        "source_label": _source_provenance_label(source),
         "input_file": metadata.get("input_file") or _source_input_file(source),
         "output_file": str(output),
         "dry_run": dry_run,

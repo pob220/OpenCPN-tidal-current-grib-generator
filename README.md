@@ -104,13 +104,24 @@ Remote providers:
 | Copernicus NWS | UK/Ireland/North Sea/English Channel/Celtic Sea area | NetCDF model currents converted to GRIB | user selected | Copernicus login |
 | Copernicus Global | rest-of-world | NetCDF model currents converted to GRIB | user selected | Copernicus login |
 
+Source labels used in CLI summaries and the OpenCPN plugin:
+
+- Source: Marine Institute Ireland Irish Sea forecast/model current
+- Source: Copernicus Marine NWS forecast/model current
+- Source: Copernicus Marine Global forecast/model current
+- Source: TPXO10 astronomical tide model
+
 Register for a Copernicus Marine account at <https://data.marine.copernicus.eu/register>. Users are responsible for complying with Copernicus Marine terms.
 
 Do not scrape, embed, redistribute, or derive open output from proprietary Admiralty, UKHO, or TotalTide atlas data. Users may use their own legally obtained reference data for private validation.
 
 ## Generate from local TPXO data
 
-TPXO files must be obtained separately under suitable licence terms. See [docs/tpxo_pytmd_setup.md](docs/tpxo_pytmd_setup.md).
+Source: TPXO10 astronomical tide model.
+
+TPXO files must be obtained separately under suitable licence terms. The suggested local layout is `~/OpenCPN/tide-models/TPXO10_atlas_v2`, using `~/OpenCPN/tide-models` as `--model-dir`. See [docs/tpxo_pytmd_setup.md](docs/tpxo_pytmd_setup.md).
+
+TPXO predicts astronomical tidal currents from local licensed model files. It does not include weather-driven surge, wind residual currents, river flow, or operational forecast-model corrections.
 
 ```bash
 tidal-current-grib inspect-source \
@@ -135,11 +146,36 @@ tidal-current-grib generate \
   --source tpxo \
   --model-dir /path/to/model/root \
   --model-name TPXO10-atlas-v2-nc \
-  --output irish_sea_tpxo_current.grb \
+  --output tpxo10_astronomical_tide_current_20260701_0000.grb \
   --metadata-summary
 ```
 
 The pyTMD backend uses `pyTMD.compute.tide_currents`, which returns zonal and meridional tidal-current velocities in cm/s. The generator converts those to internal m/s u/v components before writing the same OpenCPN-compatible GRIB1 current fields as the synthetic source.
+
+For repeated TPXO generation over the same bbox/grid, prepare a local derived cache of interpolated harmonic current constants:
+
+```bash
+tidal-current-grib prepare-tpxo-cache \
+  --bbox -8.5 50.5 -2.5 56.5 \
+  --grid-spacing-deg 0.05 \
+  --model-dir /path/to/model/root \
+  --model-name TPXO10-atlas-v2-nc \
+  --output tpxo10_irish_sea.tpxocache \
+  --metadata-summary
+
+tidal-current-grib generate \
+  --source tpxo-cache \
+  --input-cache tpxo10_irish_sea.tpxocache \
+  --start 2026-07-01T23:00:00Z \
+  --hours 120 \
+  --step-hours 1 \
+  --output tpxo10_irish_sea_astronomical_tide_current_20260701_2300.grb \
+  --metadata-summary
+```
+
+TPXO cache files are derived from local licensed TPXO model files. Do not redistribute them unless your TPXO licence permits it. Cache files are ignored by Git by default.
+
+Marine.ie and Copernicus providers are forecast/model current sources. TPXO is a harmonic astronomical tidal-current prediction; use the source label in generated summaries when comparing or merging products.
 
 ## Generate from a local Copernicus Marine NetCDF file
 
