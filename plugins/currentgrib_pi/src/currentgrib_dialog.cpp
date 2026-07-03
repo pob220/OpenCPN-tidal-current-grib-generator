@@ -539,6 +539,10 @@ void CurrentGribDialog::OnGenerate(wxCommandEvent&) {
     AppendLog("Generation cancelled before launch.");
     return;
   }
+  if (m_generateWeather->GetValue() && weatherProvider.Contains("Met Office UKV") && !ValidateUkvRequest()) {
+    AppendLog("Generation cancelled before launch.");
+    return;
+  }
   wxString command = BuildGenerateCommand();
   wxFileName output(OutputPath());
   if (!output.DirExists()) {
@@ -735,6 +739,7 @@ void CurrentGribDialog::UpdateProviderUi() {
       (m_currentSource->GetStringSelection().Contains("Copernicus") ||
        (m_currentSource->GetStringSelection().Contains("Auto") && !AutoWouldUseMarineIe()));
   bool weatherGfs = weatherEnabled && m_weatherProvider->GetStringSelection().Contains("GFS");
+  bool weatherUkv = weatherEnabled && m_weatherProvider->GetStringSelection().Contains("Met Office UKV");
   bool weatherGenerated = weatherEnabled && !weatherExisting;
   bool showTpxoModel = currentTpxoDirect || currentTpxoCache;
 
@@ -750,6 +755,9 @@ void CurrentGribDialog::UpdateProviderUi() {
   showPair(m_existingWeatherFileLabel, m_existingWeatherFile, weatherExisting);
   m_weatherPreset->Enable(weatherGenerated);
   m_includeWaves->Enable(weatherGfs);
+  if (!weatherGfs) {
+    m_includeWaves->SetValue(false);
+  }
   m_existingWeatherFile->Enable(weatherExisting);
   m_currentSource->Enable(m_generateCurrents->GetValue());
   showPair(m_existingCurrentFileLabel, m_existingCurrentFile, currentExisting);
@@ -776,8 +784,15 @@ void CurrentGribDialog::UpdateProviderUi() {
   m_prepareTpxoCacheButton->Enable(currentTpxoCache && !m_processRunning);
   m_localNetcdf->Enable(false);
 
-  if (weatherEnabled && m_weatherProvider->GetStringSelection().Contains("Met Office UKV")) {
-    m_providerNote->SetLabel("Source: Met Office UKV 2 km forecast. High-resolution UK/Ireland short-range forecast. Regional domain only; NetCDF-to-GRIB conversion is not implemented in this build.");
+  if (weatherUkv) {
+    wxString note =
+        "Source: Met Office UKV 2 km forecast. Met Office UKV 2 km is a high-resolution UK/Ireland short-range forecast. "
+        "The plugin converts the source NetCDF data to OpenCPN GRIB in the background.\n"
+        "Hourly data is available to about 54h. Requests outside the UK/Ireland domain or beyond available hours will fail clearly.";
+    if (m_weatherPreset->GetStringSelection().Contains("Marine")) {
+      note += "\nUKV marine extras are not implemented yet; routing fields will be generated.";
+    }
+    m_providerNote->SetLabel(note);
   } else if (weatherEnabled && m_weatherProvider->GetStringSelection().Contains("ECMWF")) {
     m_providerNote->SetLabel("Source: ECMWF IFS Open Data forecast. Warning: this provider is not spatially cropped yet, so files may be large.");
   } else if (weatherGfs) {
@@ -823,6 +838,34 @@ bool CurrentGribDialog::ConfirmLargeCopernicusRequest() {
       "\nApproximate bbox area: " + wxString::Format("%.2f square degrees", area) +
       "\n\nContinue?";
   return wxMessageBox(message, "Confirm Copernicus download", wxYES_NO | wxICON_WARNING, this) == wxYES;
+}
+
+bool CurrentGribDialog::ValidateUkvRequest() {
+  if (m_stepHours->GetValue() == 1 && m_durationHours->GetValue() > 54) {
+    wxString message =
+        "UKV hourly data is normally available to about 54h. Use a shorter duration, use 3-hourly beyond that when supported, or choose GFS/ECMWF.";
+    AppendLog(message);
+    wxMessageBox(message, "UKV duration unavailable", wxOK | wxICON_WARNING, this);
+    return false;
+  }
+  double west = 0.0;
+  double south = 0.0;
+  double east = 0.0;
+  double north = 0.0;
+  if (m_west->GetValue().ToDouble(&west) && m_south->GetValue().ToDouble(&south) &&
+      m_east->GetValue().ToDouble(&east) && m_north->GetValue().ToDouble(&north)) {
+    if (west < -12.0 || east > 4.0 || south < 48.0 || north > 62.0) {
+      wxString message =
+          "The requested bbox is outside the Met Office UKV UK/Ireland regional domain. Choose a UK/Ireland area or use GFS/ECMWF.";
+      AppendLog(message);
+      wxMessageBox(message, "UKV area unavailable", wxOK | wxICON_WARNING, this);
+      return false;
+    }
+  }
+  if (m_weatherPreset->GetStringSelection().Contains("Marine")) {
+    AppendLog("UKV marine extras are not implemented yet; routing fields will be generated.");
+  }
+  return true;
 }
 
 void CurrentGribDialog::OnCancel(wxCommandEvent&) {
@@ -1254,9 +1297,19 @@ wxString CurrentGribDialog::DefaultOutputFilenameForSelection() const {
   bool currentOn = m_generateCurrents->GetValue() && m_currentSource->GetStringSelection() != "None";
   wxString weatherProvider = m_weatherProvider->GetStringSelection();
   wxString currentSource = m_currentSource->GetStringSelection();
+  double west = 0.0;
+  double south = 0.0;
+  double east = 0.0;
+  double north = 0.0;
+  bool looksIrishSea =
+      m_west->GetValue().ToDouble(&west) && m_south->GetValue().ToDouble(&south) &&
+      m_east->GetValue().ToDouble(&east) && m_north->GetValue().ToDouble(&north) &&
+      std::abs(west - -8.5) < 0.01 && std::abs(south - 50.5) < 0.01 &&
+      std::abs(east - -2.5) < 0.01 && std::abs(north - 56.5) < 0.01;
   if (weatherOn && currentOn) {
     prefix = "environment";
     if (weatherProvider.Contains("GFS")) prefix += "_gfs";
+    else if (weatherProvider.Contains("UKV")) prefix += "_ukmo_ukv";
     else if (weatherProvider.Contains("ECMWF")) prefix += "_ecmwf";
     else if (weatherProvider.Contains("Existing")) prefix += "_existing_weather";
     if (m_includeWaves->GetValue() && weatherProvider.Contains("GFS")) prefix += "_wave";
@@ -1267,13 +1320,16 @@ wxString CurrentGribDialog::DefaultOutputFilenameForSelection() const {
     else if (currentSource.Contains("Global")) prefix += "_copernicus_global";
     else if (currentSource.Contains("Auto")) prefix += "_auto_current";
     else if (currentSource.Contains("Existing")) prefix += "_existing_current";
+    if (looksIrishSea) prefix += "_irish_sea";
   } else if (weatherOn) {
     prefix = "weather";
     if (weatherProvider.Contains("GFS")) prefix += "_gfs";
+    else if (weatherProvider.Contains("UKV")) prefix += "_ukmo_ukv";
     else if (weatherProvider.Contains("ECMWF")) prefix += "_ecmwf";
     else prefix += "_existing";
     if (m_weatherPreset->GetStringSelection().Contains("Marine")) prefix += "_marine";
     if (m_includeWaves->GetValue() && weatherProvider.Contains("GFS")) prefix += "_wave";
+    if (looksIrishSea) prefix += "_irish_sea";
   } else if (currentOn) {
     prefix = "current";
     if (currentSource.Contains("TPXO cache")) prefix += "_tpxo_cache";

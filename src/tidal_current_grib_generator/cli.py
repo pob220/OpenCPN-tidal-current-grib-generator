@@ -48,6 +48,7 @@ from tidal_current_grib_generator.weather import (
     UKMO_UKV_SOURCE_LABEL,
     UKMOUKVInspectRequest,
     UKMOUKVNetCDFInspectRequest,
+    UKMOUKVVerifyRequest,
     UKMOUKVWeatherRequest,
     gfs_cycle_candidates,
     generate_gfs_weather_grib,
@@ -58,6 +59,7 @@ from tidal_current_grib_generator.weather import (
     inspect_ukmo_ukv_netcdf,
     inspect_ukmo_ukv_source,
     list_weather_providers,
+    verify_ukmo_ukv_grib,
 )
 
 LOGGER = logging.getLogger("tidal_current_grib_generator")
@@ -217,6 +219,21 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_ukv_netcdf.add_argument("--json", action="store_true")
     inspect_ukv_netcdf.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     inspect_ukv_netcdf.set_defaults(func=cmd_inspect_ukv_netcdf)
+
+    verify_ukv = subparsers.add_parser("verify-ukv-grib", help="Verify a generated UKV GRIB against regridded UKV NetCDF source values.")
+    verify_ukv.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"))
+    verify_ukv.add_argument("--date", help="UKV cycle date YYYYMMDD for explicit cycles; auto uses the GRIB reference time.")
+    verify_ukv.add_argument("--cycle", default="auto", help="auto or explicit cycle 00, 03, 06, 09, 12, 15, 18, 21.")
+    verify_ukv.add_argument("--hours", type=int, required=True)
+    verify_ukv.add_argument("--step-hours", type=int, default=1)
+    verify_ukv.add_argument("--weather-grid-spacing-deg", type=float, default=0.025)
+    verify_ukv.add_argument("--grib", type=Path, required=True)
+    verify_ukv.add_argument("--download-directory", type=Path, required=True)
+    verify_ukv.add_argument("--tolerance", type=float, default=0.05)
+    verify_ukv.add_argument("--refresh", action="store_true")
+    verify_ukv.add_argument("--json", action="store_true")
+    verify_ukv.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    verify_ukv.set_defaults(func=cmd_verify_ukv_grib)
 
     generate_weather = subparsers.add_parser("generate-weather", help="Download/generate a weather GRIB.")
     generate_weather.add_argument("--provider", choices=["gfs", "gfs_wave", "ukmo_ukv", "ecmwf_ifs_open", "dwd_icon_eu"], required=True)
@@ -1086,6 +1103,46 @@ def cmd_inspect_ukv_netcdf(args: argparse.Namespace) -> int:
         print(json.dumps(inspection["crop_feasibility"], indent=2, sort_keys=True), flush=True)
         print(f"generation_enabled: {inspection['generation_enabled']}", flush=True)
         print(f"blocker: {inspection['blocker']}", flush=True)
+    return 0
+
+
+def cmd_verify_ukv_grib(args: argparse.Namespace) -> int:
+    bbox = BoundingBox.from_values(args.bbox)
+    result = verify_ukmo_ukv_grib(
+        UKMOUKVVerifyRequest(
+            bbox=bbox,
+            grib=args.grib,
+            hours=args.hours,
+            step_hours=args.step_hours,
+            cycle=args.cycle,
+            date=args.date,
+            download_directory=args.download_directory,
+            weather_grid_spacing_deg=args.weather_grid_spacing_deg,
+            tolerance=args.tolerance,
+            refresh=args.refresh,
+        )
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(f"provider: {result['provider']}", flush=True)
+        print(f"source: {result['source']}", flush=True)
+        print(f"grib: {result['grib']}", flush=True)
+        print(f"selected_cycle: {result['selected_cycle']}", flush=True)
+        print(f"forecast_hours: {result['forecast_hours']}", flush=True)
+        print(f"message_count: {result['message_count']}", flush=True)
+        print(f"expected_message_count: {result['expected_message_count']}", flush=True)
+        print(f"grid_checks: {json.dumps(result['grid_checks'], sort_keys=True)}", flush=True)
+        print("comparisons:", flush=True)
+        for key, comparison in result["comparisons"].items():
+            print(
+                f"  {key}: max_abs_error={comparison['max_abs_error']:.6g}, "
+                f"rmse={comparison['rmse']:.6g}, mean_bias={comparison['mean_bias']:.6g}, "
+                f"source_range=({comparison['source_min']:.6g}, {comparison['source_max']:.6g}), "
+                f"grib_range=({comparison['grib_min']:.6g}, {comparison['grib_max']:.6g})",
+                flush=True,
+            )
+        print(f"passed: {result['passed']}", flush=True)
     return 0
 
 

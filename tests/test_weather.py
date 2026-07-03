@@ -29,6 +29,8 @@ from tidal_current_grib_generator.weather import (
     gfs_cycle_candidates,
     inspect_ukmo_ukv_netcdf,
     list_weather_providers,
+    verify_ukmo_ukv_grib,
+    UKMOUKVVerifyRequest,
     wind_speed_direction_to_uv,
 )
 
@@ -54,7 +56,7 @@ def test_weather_provider_registry_includes_gfs():
     assert by_id["ecmwf_ifs_open"].source == "ECMWF Open Data"
     assert by_id["ecmwf_ifs_open"].implemented is True
     assert by_id["ukmo_ukv"].source == "Met Office AWS/Open Data"
-    assert by_id["ukmo_ukv"].implemented is False
+    assert by_id["ukmo_ukv"].implemented is True
     assert by_id["dwd_icon_eu"].implemented is False
 
 
@@ -432,16 +434,98 @@ def test_generate_ukmo_ukv_rejects_long_hourly_request(tmp_path: Path):
         )
 
 
-def test_generate_ukmo_ukv_reports_not_implemented(tmp_path: Path):
-    with pytest.raises(ValidationError, match="Met Office UKV provider is not implemented yet"):
+def test_generate_ukmo_ukv_reports_missing_source_files(tmp_path: Path):
+    def fake_get(url: str, timeout_seconds: float) -> bytes:
+        return b"""<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/" />"""
+
+    with pytest.raises(ValidationError, match="could not find a complete UKV cycle"):
         generate_ukmo_ukv_weather_grib(
             UKMOUKVWeatherRequest(
                 bbox=BoundingBox(-8.5, 50.5, -2.5, 56.5),
                 output=tmp_path / "ukv.grb",
                 hours=24,
                 step_hours=1,
-            )
+                cycle="00",
+                date="20260703",
+            ),
+            http_get=fake_get,
         )
+
+
+def test_generate_ukmo_ukv_from_synthetic_projected_netcdf_roundtrip(tmp_path: Path):
+    pytest.importorskip("eccodes")
+    pytest.importorskip("pyproj")
+    files = {
+        "pressure_at_mean_sea_level": _projected_ukv_netcdf_bytes(
+            tmp_path, "pressure_at_mean_sea_level", standard_name="air_pressure_at_mean_sea_level", units="Pa", long_name="Pressure at mean sea level"
+        ),
+        "temperature_at_screen_level": _projected_ukv_netcdf_bytes(
+            tmp_path, "temperature_at_screen_level", standard_name="air_temperature", units="K", long_name="Temperature at screen level"
+        ),
+        "wind_speed_at_10m": _projected_ukv_netcdf_bytes(
+            tmp_path, "wind_speed_at_10m", standard_name="wind_speed", units="m s-1", long_name="Wind speed at 10m"
+        ),
+        "wind_direction_at_10m": _projected_ukv_netcdf_bytes(
+            tmp_path, "wind_direction_at_10m", standard_name="wind_from_direction", units="degree", long_name="Wind direction at 10m"
+        ),
+    }
+    contents = "\n".join(
+        f"""
+        <Contents>
+          <Key>uk-deterministic-2km/20260703T0000Z/20260703T0000Z-PT0000H00M-{name}.nc</Key>
+          <LastModified>2026-07-03T01:00:00.000Z</LastModified>
+          <Size>{len(data)}</Size>
+        </Contents>
+        """
+        for name, data in files.items()
+    )
+    run_xml = f"""<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">{contents}</ListBucketResult>""".encode()
+
+    def fake_get(url: str, timeout_seconds: float) -> bytes:
+        if "prefix=uk-deterministic-2km%2F20260703T0000Z%2F" in url:
+            return run_xml
+        if url.endswith(".nc"):
+            for name, data in files.items():
+                if name in url:
+                    return data
+        return b"""<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/" />"""
+
+    output = tmp_path / "ukv.grb2"
+    result = generate_ukmo_ukv_weather_grib(
+        UKMOUKVWeatherRequest(
+            bbox=BoundingBox(-5.8, 53.0, -5.2, 53.5),
+            output=output,
+            hours=0,
+            step_hours=1,
+            cycle="00",
+            date="20260703",
+            overwrite=True,
+            weather_grid_spacing_deg=0.1,
+        ),
+        http_get=fake_get,
+    )
+
+    assert result.message_count == 4
+    assert result.inspection["stream_valid"] is True
+    assert result.inspection["short_name_counts"]["10u"] == 1
+    assert result.inspection["short_name_counts"]["10v"] == 1
+    verification = verify_ukmo_ukv_grib(
+        UKMOUKVVerifyRequest(
+            bbox=BoundingBox(-5.8, 53.0, -5.2, 53.5),
+            grib=output,
+            hours=0,
+            step_hours=1,
+            cycle="00",
+            date="20260703",
+            download_directory=tmp_path / "verify-downloads",
+            weather_grid_spacing_deg=0.1,
+            tolerance=0.1,
+        ),
+        http_get=fake_get,
+    )
+
+    assert verification["passed"] is True
+    assert verification["comparisons"]["10u_f000"]["max_abs_error"] < 0.1
 
 
 def test_discover_ukv_source_parses_unsigned_s3_listing():
@@ -722,12 +806,12 @@ def test_inspect_ukv_netcdf_with_mocked_downloads(tmp_path: Path):
     run_xml = f"""<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">{contents}</ListBucketResult>""".encode()
 
     def fake_get(url: str, timeout_seconds: float) -> bytes:
+        if "prefix=uk-deterministic-2km%2F20260703T0000Z%2F" in url:
+            return run_xml
         if url.endswith(".nc"):
             for name, data in files.items():
                 if name in url:
                     return data
-        if "prefix=uk-deterministic-2km%2F20260703T0000Z%2F" in url:
-            return run_xml
         if "prefix=" in url:
             return b"""<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/" />"""
         return root_xml
@@ -750,7 +834,7 @@ def test_inspect_ukv_netcdf_with_mocked_downloads(tmp_path: Path):
     assert result["time_summary"]["requested_hours_available"] is True
     assert result["time_summary"]["hourly_0_to_54_proven"] is False
     assert result["wind_direction_convention"]["status"] == "usable"
-    assert result["wind_uv_sample_stats"]["u"]["finite_count"] == 12
+    assert result["wind_uv_sample_stats"]["convention"] == "meteorological_from"
     assert result["variable_mappings"]["pressure_msl_h000"]["field"] == "pressure_msl"
     assert result["variable_mappings"]["pressure_msl_h000"]["unit_conversion_required"] == "none if writing GRIB pressure in Pa"
 
@@ -784,12 +868,12 @@ def test_inspect_ukv_netcdf_regrid_sample_from_projected_grid(tmp_path: Path):
     run_xml = f"""<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">{contents}</ListBucketResult>""".encode()
 
     def fake_get(url: str, timeout_seconds: float) -> bytes:
+        if "prefix=uk-deterministic-2km%2F20260703T0000Z%2F" in url:
+            return run_xml
         if url.endswith(".nc"):
             for name, data in files.items():
                 if name in url:
                     return data
-        if "prefix=uk-deterministic-2km%2F20260703T0000Z%2F" in url:
-            return run_xml
         return b"""<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/" />"""
 
     result = inspect_ukmo_ukv_netcdf(
@@ -1016,7 +1100,28 @@ def test_generate_weather_cli_dwd_reports_not_implemented(capsys, tmp_path: Path
     assert "DWD ICON-EU provider is not implemented yet" in capsys.readouterr().err
 
 
-def test_generate_weather_cli_ukmo_ukv_reports_not_implemented(capsys, tmp_path: Path):
+def test_generate_weather_cli_ukmo_ukv_metadata(monkeypatch, capsys, tmp_path: Path):
+    class FakeCycle:
+        cycle_time = "20260703T0000Z"
+
+    class FakeResult:
+        provider = "ukmo_ukv"
+        source = "Met Office UKV 2 km forecast"
+        model = "uk_deterministic_2km"
+        cycle = FakeCycle()
+        bbox = BoundingBox(-8.5, 50.5, -2.5, 56.5)
+        forecast_hours = [0]
+        output = tmp_path / "ukv.grb"
+        byte_count = 20
+        message_count = 4
+        inspection = {"stream_valid": True, "message_count": 4, "edition_counts": {2: 4}}
+        urls = []
+        warnings = []
+
+        def as_dict(self):
+            return {"provider": self.provider}
+
+    monkeypatch.setattr("tidal_current_grib_generator.cli.generate_ukmo_ukv_weather_grib", lambda request, progress_callback=None: FakeResult())
     rc = main(
         [
             "generate-weather",
@@ -1035,13 +1140,16 @@ def test_generate_weather_cli_ukmo_ukv_reports_not_implemented(capsys, tmp_path:
             "1",
             "--weather-preset",
             "routing",
+            "--metadata-summary",
             "--output",
             str(tmp_path / "ukv.grb"),
         ]
     )
 
-    assert rc == 2
-    assert "Met Office UKV provider is not implemented yet" in capsys.readouterr().err
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Source: Met Office UKV 2 km forecast" in out
+    assert "validated GRIB stream: 4 messages" in out
 
 
 def test_merge_gribs_current_first(monkeypatch, tmp_path: Path):
@@ -1203,9 +1311,24 @@ def test_generate_environment_grib_include_waves_requires_gfs(tmp_path: Path, ca
     assert "--include-waves is currently supported only with --weather-provider gfs" in capsys.readouterr().err
 
 
-def test_generate_environment_grib_ukmo_ukv_reports_not_implemented(tmp_path: Path, capsys):
-    cache = tmp_path / "cache.tpxocache"
-    cache.write_bytes(b"cache")
+def test_generate_environment_grib_ukmo_ukv_weather_only_mocked(monkeypatch, tmp_path: Path):
+    def fake_weather(request, progress_callback=None):
+        request.output.write_bytes(_fake_grib2(b"ukv"))
+        class FakeCycle:
+            cycle_time = "20260703T0000Z"
+
+        class FakeResult:
+            cycle = FakeCycle()
+            warnings = []
+
+        return FakeResult()
+
+    monkeypatch.setattr("tidal_current_grib_generator.cli.generate_ukmo_ukv_weather_grib", fake_weather)
+    monkeypatch.setattr(
+        "tidal_current_grib_generator.grib.merge.inspect_grib",
+        lambda path: {"stream_valid": True, "message_count": 1, "edition_counts": {2: 1}},
+    )
+    output = tmp_path / "environment.grb"
     rc = main(
         [
             "generate-environment-grib",
@@ -1217,20 +1340,18 @@ def test_generate_environment_grib_ukmo_ukv_reports_not_implemented(tmp_path: Pa
             "--weather-provider",
             "ukmo_ukv",
             "--current-source",
-            "tpxo-cache",
-            "--input-cache",
-            str(cache),
+            "none",
             "--hours",
-            "24",
+            "0",
             "--step-hours",
             "1",
             "--output",
-            str(tmp_path / "environment.grb"),
+            str(output),
         ]
     )
 
-    assert rc == 2
-    assert "Met Office UKV provider is not implemented yet" in capsys.readouterr().err
+    assert rc == 0
+    assert output.read_bytes() == _fake_grib2(b"ukv")
 
 
 def test_generate_environment_grib_hourly_weather_with_three_hour_waves(monkeypatch, tmp_path: Path, capsys):

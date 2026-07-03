@@ -208,4 +208,12 @@ def _coverage(eccodes: Any, gid: int) -> dict[str, float] | None:
     values = {label: _codes_get(eccodes, gid, key) for label, key in keys.items()}
     if any(value is None for value in values.values()):
         return None
-    return {label: float(value) for label, value in values.items()}
+    return {
+        label: _normalize_longitude(float(value)) if label in {"west", "east"} else float(value)
+        for label, value in values.items()
+    }
+
+
+def _normalize_longitude(value: float) -> float:
+    normalized = ((value + 180.0) % 360.0) - 180.0
+    return 180.0 if normalized == -180.0 and value > 0 else normalized

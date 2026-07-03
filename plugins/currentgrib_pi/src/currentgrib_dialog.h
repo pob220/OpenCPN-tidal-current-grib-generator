@@ -40,6 +40,7 @@ private:
   void SetBusy(bool busy);
   void ApplyPreset(int selection);
   bool ConfirmLargeCopernicusRequest();
+  bool ValidateUkvRequest();
   bool AutoWouldUseMarineIe() const;
   void UpdateProviderUi();
   void RefreshOutputFilenameDefault();

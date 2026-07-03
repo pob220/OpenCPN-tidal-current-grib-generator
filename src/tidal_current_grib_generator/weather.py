@@ -204,6 +204,21 @@ class UKMOUKVNetCDFInspectRequest:
 
 
 @dataclass(frozen=True)
+class UKMOUKVVerifyRequest:
+    bbox: BoundingBox
+    grib: Path
+    hours: int
+    download_directory: Path
+    cycle: str = "auto"
+    date: str | None = None
+    step_hours: int = 1
+    weather_grid_spacing_deg: float = 0.025
+    tolerance: float = 0.05
+    refresh: bool = False
+    timeout_seconds: float = 120.0
+
+
+@dataclass(frozen=True)
 class GFSWaveRequest:
     bbox: BoundingBox
     output: Path
@@ -274,6 +289,15 @@ class S3ListResult:
     next_token: str | None = None
 
 
+@dataclass(frozen=True)
+class UKVRegriddedDataset:
+    grid: Any
+    forecast_hours: list[int]
+    fields: dict[tuple[int, str], Any]
+    source_files: dict[str, dict[str, Any]]
+    missing_percent: dict[tuple[int, str], float]
+
+
 def list_weather_providers() -> list[WeatherProvider]:
     return [
         WeatherProvider(
@@ -300,9 +324,8 @@ def list_weather_providers() -> list[WeatherProvider]:
             account="free/no account if using AWS/Open Data",
             description=(
                 "High-resolution UK/Ireland short-range forecast. Good candidate for Irish Sea coastal routing. "
-                "Provider discovery is present, but NetCDF-to-GRIB conversion is not implemented in this CLI build."
+                "CLI generation regrids the projected UKV NetCDF source to regular latitude/longitude GRIB2."
             ),
-            implemented=False,
         ),
         WeatherProvider(
             id="ecmwf_ifs_open",
@@ -661,13 +684,21 @@ def generate_ecmwf_weather_grib(
 def generate_ukmo_ukv_weather_grib(
     request: UKMOUKVWeatherRequest,
     *,
+    http_get: HttpGet | None = None,
     progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> WeatherGenerateResult:
     request.bbox.validate()
     _validate_ukmo_ukv_request(request)
+    http_get = http_get or _http_get
+    output = request.output.expanduser()
+    if output.exists() and output.is_dir():
+        raise ValidationError("--output must be a file path, not a directory")
+    if output.exists() and not request.overwrite:
+        raise ValidationError(f"output already exists: {output}; use --overwrite to replace it")
+    forecast_hours = forecast_hour_sequence(request.hours, request.step_hours)
     _progress(
         progress_callback,
-        "checking Met Office UKV provider",
+        "selecting Met Office UKV source files",
         {
             "bbox": request.bbox.__dict__,
             "hours": request.hours,
@@ -675,11 +706,97 @@ def generate_ukmo_ukv_weather_grib(
             "weather_grid_spacing_deg": request.weather_grid_spacing_deg,
         },
     )
-    raise ValidationError(
-        "Met Office UKV provider is not implemented yet. The no-account AWS/Open Data dataset appears to be "
-        "NetCDF on a regional projected grid; safe OpenCPN output needs source layout discovery, "
-        "projection-aware crop/regrid, and a weather NetCDF-to-GRIB writer. Use GFS for compact cropped output "
-        "or ECMWF Open Data for global medium-range output."
+
+    if request.dry_run:
+        cycle_name = _ukv_cycle_candidates_for_request(
+            UKMOUKVNetCDFInspectRequest(
+                bbox=request.bbox,
+                hours=request.hours,
+                download_directory=Path("."),
+                step_hours=request.step_hours,
+                cycle=request.cycle,
+                date=request.date,
+                weather_grid_spacing_deg=request.weather_grid_spacing_deg,
+                timeout_seconds=request.timeout_seconds,
+            )
+        )[0]
+        planned = _weather_cycle_from_ukv_cycle_name(cycle_name)
+        return WeatherGenerateResult(
+            provider="ukmo_ukv",
+            source=UKMO_UKV_SOURCE_LABEL,
+            model="uk_deterministic_2km",
+            cycle=planned,
+            bbox=request.bbox,
+            forecast_hours=forecast_hours,
+            output=output,
+            byte_count=0,
+            message_count=0,
+            inspection={"stream_valid": False, "message_count": 0, "dry_run": True},
+            urls=[],
+            variables_levels={"preset": request.preset, "weather_grid_spacing_deg": request.weather_grid_spacing_deg},
+        )
+
+    with tempfile.TemporaryDirectory(prefix="ukv-source.") as source_tmp:
+        selected_cycle, downloaded, file_inspections, cycle_errors = _download_and_inspect_ukv_source_files(
+            bbox=request.bbox,
+            hours=request.hours,
+            step_hours=request.step_hours,
+            cycle=request.cycle,
+            date=request.date,
+            download_directory=Path(source_tmp),
+            weather_grid_spacing_deg=request.weather_grid_spacing_deg,
+            refresh=True,
+            extract_sample=False,
+            timeout_seconds=request.timeout_seconds,
+            http_get=http_get,
+        )
+        _progress(progress_callback, "selected Met Office UKV cycle", {"cycle": selected_cycle})
+        if cycle_errors:
+            _progress(progress_callback, "UKV cycle fallback details", {"errors": cycle_errors})
+        dataset = _regrid_ukv_source_fields(
+            downloaded,
+            file_inspections,
+            request.bbox,
+            request.weather_grid_spacing_deg,
+            forecast_hours,
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(prefix=output.name + ".", suffix=".tmp", dir=output.parent, delete=False) as tmp:
+                tmp_path = Path(tmp.name)
+            _write_ukv_grib2(dataset, selected_cycle, tmp_path, progress_callback=progress_callback)
+            scan = scan_grib_messages(tmp_path)
+            expected_messages = len(forecast_hours) * 4
+            if scan.message_count != expected_messages:
+                raise ValidationError(f"UKV GRIB message count mismatch: expected {expected_messages}, got {scan.message_count}")
+            inspection = inspect_grib(tmp_path)
+            if not inspection.get("stream_valid"):
+                raise ValidationError("UKV GRIB stream validation failed")
+            tmp_path.replace(output)
+            tmp_path = None
+        finally:
+            if tmp_path is not None and tmp_path.exists():
+                tmp_path.unlink()
+
+    cycle_obj = _weather_cycle_from_ukv_cycle_name(selected_cycle)
+    return WeatherGenerateResult(
+        provider="ukmo_ukv",
+        source=UKMO_UKV_SOURCE_LABEL,
+        model="uk_deterministic_2km",
+        cycle=cycle_obj,
+        bbox=request.bbox,
+        forecast_hours=forecast_hours,
+        output=output,
+        byte_count=scan.byte_count,
+        message_count=scan.message_count,
+        inspection=inspection,
+        urls=[info["url"] for info in downloaded.values()],
+        variables_levels={
+            "source_fields": sorted({str(info["field"]) for info in downloaded.values()}),
+            "output_short_names": ["10u", "10v", "prmsl", "2t"],
+            "weather_grid_spacing_deg": request.weather_grid_spacing_deg,
+        },
     )
 
 
@@ -759,48 +876,19 @@ def inspect_ukmo_ukv_netcdf(
     )
     http_get = http_get or _http_get
     requested_hours = forecast_hour_sequence(request.hours, request.step_hours)
-    selected_cycle, selected_objects, cycle_errors = _select_complete_ukv_cycle(
-        request,
-        requested_hours,
+    selected_cycle, downloaded, file_inspections, cycle_errors = _download_and_inspect_ukv_source_files(
+        bbox=request.bbox,
+        hours=request.hours,
+        step_hours=request.step_hours,
+        cycle=request.cycle,
+        date=request.date,
+        download_directory=request.download_directory,
+        weather_grid_spacing_deg=request.weather_grid_spacing_deg,
+        refresh=request.refresh,
+        extract_sample=request.extract_sample,
+        timeout_seconds=request.timeout_seconds,
         http_get=http_get,
     )
-
-    request.download_directory.expanduser().mkdir(parents=True, exist_ok=True)
-    downloaded: dict[str, dict[str, Any]] = {}
-    for item_name, item in selected_objects.items():
-        path = request.download_directory.expanduser() / Path(str(item["key"])).name
-        expected_size = int(item.get("size") or 0)
-        reused = path.exists() and not request.refresh and (expected_size <= 0 or path.stat().st_size == expected_size)
-        if not reused:
-            data = http_get(str(item["url"]), request.timeout_seconds)
-            if not data:
-                raise ValidationError(f"UKV download returned empty response for {item['key']}")
-            tmp_path = path.with_name(path.name + ".tmp")
-            tmp_path.write_bytes(data)
-            if expected_size > 0 and tmp_path.stat().st_size != expected_size:
-                tmp_path.unlink(missing_ok=True)
-                raise ValidationError(
-                    f"UKV download size mismatch for {item['key']}: expected {expected_size}, got {len(data)}"
-                )
-            tmp_path.replace(path)
-        downloaded[item_name] = {
-            "field": item["field"],
-            "forecast_hour": item["forecast_hour"],
-            "source_key": item["key"],
-            "url": item["url"],
-            "path": str(path),
-            "expected_size": expected_size,
-            "size": path.stat().st_size,
-            "reused": reused,
-        }
-
-    file_inspections: dict[str, Any] = {}
-    for item_name, info in downloaded.items():
-        file_inspections[item_name] = _inspect_ukv_netcdf_file(
-            Path(info["path"]),
-            request.bbox,
-            extract_sample=request.extract_sample,
-        )
 
     coordinate_summary = _summarize_ukv_coordinates(file_inspections, request.bbox)
     time_summary = _summarize_ukv_times(file_inspections, requested_hours)
@@ -838,6 +926,92 @@ def inspect_ukmo_ukv_netcdf(
             "projection/regridding and numeric source-to-GRIB verification are implemented."
         ),
     }
+
+
+def verify_ukmo_ukv_grib(
+    request: UKMOUKVVerifyRequest,
+    *,
+    http_get: HttpGet | None = None,
+) -> dict[str, Any]:
+    request.bbox.validate()
+    if request.tolerance <= 0:
+        raise ValidationError("--tolerance must be greater than zero")
+    http_get = http_get or _http_get
+    grib_path = request.grib.expanduser()
+    if not grib_path.exists():
+        raise ValidationError(f"UKV GRIB does not exist: {grib_path}")
+    scan = scan_grib_messages(grib_path)
+    if scan.message_count <= 0:
+        raise ValidationError("UKV GRIB contains no messages")
+    grib_fields = _read_ukv_grib_fields(grib_path)
+    if request.cycle == "auto":
+        cycle_dt = grib_fields["reference_time"]
+        cycle = f"{cycle_dt.strftime('%Y%m%dT%H%MZ')}"
+        date = cycle_dt.strftime("%Y%m%d")
+        cycle_hour = f"{cycle_dt.hour:02d}"
+    else:
+        if request.date is None:
+            raise ValidationError("--date YYYYMMDD is required when --cycle is explicit")
+        date = request.date
+        cycle_hour = request.cycle
+        cycle = f"{date}T{cycle_hour}00Z"
+
+    forecast_hours = forecast_hour_sequence(request.hours, request.step_hours)
+    selected_cycle, downloaded, file_inspections, cycle_errors = _download_and_inspect_ukv_source_files(
+        bbox=request.bbox,
+        hours=request.hours,
+        step_hours=request.step_hours,
+        cycle=cycle_hour,
+        date=date,
+        download_directory=request.download_directory,
+        weather_grid_spacing_deg=request.weather_grid_spacing_deg,
+        refresh=request.refresh,
+        extract_sample=False,
+        timeout_seconds=request.timeout_seconds,
+        http_get=http_get,
+    )
+    if selected_cycle != cycle:
+        raise ValidationError(f"UKV verification selected source cycle {selected_cycle}, but GRIB reference cycle is {cycle}")
+    expected = _regrid_ukv_source_fields(
+        downloaded,
+        file_inspections,
+        request.bbox,
+        request.weather_grid_spacing_deg,
+        forecast_hours,
+    )
+    grid_checks = _verify_ukv_grib_grid(grib_fields["grid"], expected.grid, request.bbox)
+    comparisons: dict[str, Any] = {}
+    failures: list[str] = []
+    for hour in forecast_hours:
+        for short_name in ("10u", "10v", "prmsl", "2t"):
+            key = (hour, short_name)
+            if key not in grib_fields["fields"]:
+                failures.append(f"missing GRIB field {short_name} f{hour:03d}")
+                continue
+            comparison = _compare_arrays(expected.fields[key], grib_fields["fields"][key])
+            comparisons[f"{short_name}_f{hour:03d}"] = comparison
+            if comparison["max_abs_error"] > request.tolerance:
+                failures.append(
+                    f"{short_name} f{hour:03d} max_abs_error {comparison['max_abs_error']:.6g} exceeds tolerance {request.tolerance:g}"
+                )
+    result = {
+        "provider": "ukmo_ukv",
+        "source": UKMO_UKV_SOURCE_LABEL,
+        "grib": str(grib_path),
+        "selected_cycle": selected_cycle,
+        "cycle_selection_errors": cycle_errors,
+        "forecast_hours": forecast_hours,
+        "message_count": scan.message_count,
+        "expected_message_count": len(forecast_hours) * 4,
+        "grid_checks": grid_checks,
+        "comparisons": comparisons,
+        "tolerance": request.tolerance,
+        "passed": not failures and grid_checks["passed"] and scan.message_count >= len(forecast_hours) * 4,
+        "failures": failures + grid_checks["failures"],
+    }
+    if not result["passed"]:
+        raise ValidationError("UKV GRIB verification failed: " + "; ".join(result["failures"]))
+    return result
 
 
 def discover_ukmo_ukv_source(
@@ -1080,6 +1254,78 @@ def _select_ukv_required_objects(candidate_files: list[dict[str, Any]], selected
             ]
         selected[field_name] = matches[0] if matches else None
     return selected
+
+
+def _download_and_inspect_ukv_source_files(
+    *,
+    bbox: BoundingBox,
+    hours: int,
+    step_hours: int,
+    cycle: str,
+    date: str | None,
+    download_directory: Path,
+    weather_grid_spacing_deg: float,
+    refresh: bool,
+    extract_sample: bool,
+    timeout_seconds: float,
+    http_get: HttpGet,
+) -> tuple[str, dict[str, dict[str, Any]], dict[str, Any], list[str]]:
+    request = UKMOUKVNetCDFInspectRequest(
+        bbox=bbox,
+        hours=hours,
+        step_hours=step_hours,
+        cycle=cycle,
+        date=date,
+        download_directory=download_directory,
+        weather_grid_spacing_deg=weather_grid_spacing_deg,
+        refresh=refresh,
+        extract_sample=extract_sample,
+        timeout_seconds=timeout_seconds,
+    )
+    requested_hours = forecast_hour_sequence(hours, step_hours)
+    selected_cycle, selected_objects, cycle_errors = _select_complete_ukv_cycle(
+        request,
+        requested_hours,
+        http_get=http_get,
+    )
+    download_directory = download_directory.expanduser()
+    download_directory.mkdir(parents=True, exist_ok=True)
+    downloaded: dict[str, dict[str, Any]] = {}
+    for item_name, item in selected_objects.items():
+        path = download_directory / Path(str(item["key"])).name
+        expected_size = int(item.get("size") or 0)
+        reused = path.exists() and not refresh and (expected_size <= 0 or path.stat().st_size == expected_size)
+        if not reused:
+            data = http_get(str(item["url"]), timeout_seconds)
+            if not data:
+                raise ValidationError(f"UKV download returned empty response for {item['key']}")
+            tmp_path = path.with_name(path.name + ".tmp")
+            tmp_path.write_bytes(data)
+            if expected_size > 0 and tmp_path.stat().st_size != expected_size:
+                tmp_path.unlink(missing_ok=True)
+                raise ValidationError(
+                    f"UKV download size mismatch for {item['key']}: expected {expected_size}, got {len(data)}"
+                )
+            tmp_path.replace(path)
+        downloaded[item_name] = {
+            "field": item["field"],
+            "forecast_hour": item["forecast_hour"],
+            "source_key": item["key"],
+            "url": item["url"],
+            "path": str(path),
+            "expected_size": expected_size,
+            "size": path.stat().st_size,
+            "reused": reused,
+        }
+
+    file_inspections: dict[str, Any] = {}
+    for item_name, info in downloaded.items():
+        file_inspections[item_name] = _inspect_ukv_netcdf_file(
+            Path(info["path"]),
+            bbox,
+            extract_sample=extract_sample,
+        )
+    return selected_cycle, downloaded, file_inspections, cycle_errors
 
 
 def _select_complete_ukv_cycle(
@@ -1576,6 +1822,321 @@ def _ukv_regrid_sample(
     return result
 
 
+def _regrid_ukv_source_fields(
+    downloaded: dict[str, dict[str, Any]],
+    file_inspections: dict[str, Any],
+    bbox: BoundingBox,
+    spacing_deg: float,
+    forecast_hours: list[int],
+) -> UKVRegriddedDataset:
+    try:
+        import numpy as np
+        import xarray as xr
+        from pyproj import CRS, Transformer
+    except ImportError as exc:
+        raise MissingDependencyError(
+            "UKV generation requires numpy, xarray, and pyproj for projection-aware regridding."
+        ) from exc
+
+    first_key = next(iter(file_inspections), None)
+    if first_key is None:
+        raise ValidationError("no UKV source files were available for regridding")
+    grid_mapping = file_inspections[first_key].get("grid_mapping")
+    if not grid_mapping or not grid_mapping.get("attrs"):
+        raise ValidationError("UKV source files do not expose usable CF grid_mapping metadata")
+    xy = file_inspections[first_key].get("xy") or {}
+    x_name = xy.get("x", {}).get("name") or "projection_x_coordinate"
+    y_name = xy.get("y", {}).get("name") or "projection_y_coordinate"
+
+    grid = build_regular_grid(bbox, spacing_deg)
+    lon2d, lat2d = np.meshgrid(grid.longitudes, grid.latitudes)
+    transformer = Transformer.from_crs(CRS.from_epsg(4326), CRS.from_cf(grid_mapping["attrs"]), always_xy=True)
+    x_values, y_values = transformer.transform(lon2d, lat2d)
+    x_da = xr.DataArray(x_values, dims=("latitude", "longitude"))
+    y_da = xr.DataArray(y_values, dims=("latitude", "longitude"))
+
+    fields: dict[tuple[int, str], Any] = {}
+    missing: dict[tuple[int, str], float] = {}
+    for hour in forecast_hours:
+        pressure = _regrid_ukv_scalar_field(downloaded, file_inspections, "pressure_msl", hour, x_name, y_name, x_da, y_da)
+        temperature = _regrid_ukv_scalar_field(downloaded, file_inspections, "temperature_screen", hour, x_name, y_name, x_da, y_da)
+        speed = _load_ukv_source_array(downloaded, file_inspections, "wind_speed_10m", hour)
+        direction = _load_ukv_source_array(downloaded, file_inspections, "wind_direction_10m", hour)
+        u_source, v_source = wind_speed_direction_to_uv(speed.values.astype(float), direction.values.astype(float))
+        u_array = speed.copy(data=u_source)
+        v_array = speed.copy(data=v_source)
+        u = _interp_ukv_array(u_array, x_name, y_name, x_da, y_da)
+        v = _interp_ukv_array(v_array, x_name, y_name, x_da, y_da)
+        for short_name, values in (("prmsl", pressure), ("2t", temperature), ("10u", u), ("10v", v)):
+            values = np.asarray(values, dtype=float)
+            miss = _missing_percent(values)
+            if miss > 0.5:
+                raise ValidationError(f"UKV regridded field {short_name} f{hour:03d} has too many missing cells: {miss:.2f}%")
+            fields[(hour, short_name)] = values
+            missing[(hour, short_name)] = miss
+    return UKVRegriddedDataset(
+        grid=grid,
+        forecast_hours=forecast_hours,
+        fields=fields,
+        source_files=downloaded,
+        missing_percent=missing,
+    )
+
+
+def _load_ukv_source_array(
+    downloaded: dict[str, dict[str, Any]],
+    file_inspections: dict[str, Any],
+    field_name: str,
+    forecast_hour: int,
+) -> Any:
+    import xarray as xr
+
+    item_key = next(
+        (
+            key
+            for key, info in downloaded.items()
+            if info.get("field") == field_name and int(info.get("forecast_hour")) == forecast_hour
+        ),
+        None,
+    )
+    if item_key is None:
+        raise ValidationError(f"missing UKV source field {field_name} for f{forecast_hour:03d}")
+    var_name = file_inspections[item_key].get("primary_data_variable")
+    if not var_name:
+        raise ValidationError(f"could not detect primary variable for UKV source field {field_name} f{forecast_hour:03d}")
+    with xr.open_dataset(downloaded[item_key]["path"]) as ds:
+        return ds[var_name].load()
+
+
+def _regrid_ukv_scalar_field(
+    downloaded: dict[str, dict[str, Any]],
+    file_inspections: dict[str, Any],
+    field_name: str,
+    forecast_hour: int,
+    x_name: str,
+    y_name: str,
+    x_da: Any,
+    y_da: Any,
+) -> Any:
+    source = _load_ukv_source_array(downloaded, file_inspections, field_name, forecast_hour)
+    return _interp_ukv_array(source, x_name, y_name, x_da, y_da)
+
+
+def _interp_ukv_array(source: Any, x_name: str, y_name: str, x_da: Any, y_da: Any) -> Any:
+    import numpy as np
+
+    try:
+        interp = source.interp({x_name: x_da, y_name: y_da}, method="linear")
+    except Exception as exc:
+        raise ValidationError(f"UKV projected-grid interpolation failed: {exc}") from exc
+    values = np.asarray(interp.values, dtype=float)
+    if values.shape != tuple(x_da.shape):
+        raise ValidationError(f"UKV regridded shape mismatch: expected {tuple(x_da.shape)}, got {values.shape}")
+    return values
+
+
+def _write_ukv_grib2(
+    dataset: UKVRegriddedDataset,
+    selected_cycle: str,
+    output: Path,
+    *,
+    progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+) -> None:
+    try:
+        import eccodes
+    except ImportError as exc:
+        raise MissingDependencyError(
+            "Writing UKV weather GRIB requires ECMWF ecCodes Python bindings. "
+            "Install system ecCodes plus `tidal-current-grib-generator[grib]`."
+        ) from exc
+
+    reference = _datetime_from_ukv_cycle_name(selected_cycle)
+    message_count = 0
+    with output.open("wb") as handle:
+        for hour in dataset.forecast_hours:
+            for short_name in ("10u", "10v", "prmsl", "2t"):
+                values = dataset.fields[(hour, short_name)]
+                gid = _create_ukv_grib2_message(eccodes, dataset.grid, reference, hour, short_name, values)
+                try:
+                    eccodes.codes_write(gid, handle)
+                finally:
+                    eccodes.codes_release(gid)
+                message_count += 1
+            _progress(progress_callback, "wrote UKV weather forecast hour", {"hour": hour, "messages": message_count})
+
+
+def _create_ukv_grib2_message(eccodes: Any, grid: Any, reference: datetime, forecast_hour: int, short_name: str, values: Any) -> Any:
+    import numpy as np
+
+    gid = eccodes.codes_grib_new_from_samples("regular_ll_sfc_grib2")
+    try:
+        eccodes.codes_set(gid, "editionNumber", 2)
+        eccodes.codes_set(gid, "discipline", 0)
+        eccodes.codes_set(gid, "productDefinitionTemplateNumber", 0)
+        eccodes.codes_set(gid, "typeOfGeneratingProcess", 2)
+        eccodes.codes_set(gid, "generatingProcessIdentifier", 255)
+        eccodes.codes_set(gid, "shortName", short_name)
+
+        eccodes.codes_set(gid, "dataDate", int(reference.strftime("%Y%m%d")))
+        eccodes.codes_set(gid, "dataTime", int(reference.strftime("%H%M")))
+        eccodes.codes_set(gid, "stepUnits", 1)
+        eccodes.codes_set(gid, "forecastTime", int(forecast_hour))
+
+        eccodes.codes_set(gid, "Ni", grid.nx)
+        eccodes.codes_set(gid, "Nj", grid.ny)
+        eccodes.codes_set(gid, "latitudeOfFirstGridPointInDegrees", float(grid.latitudes[0]))
+        eccodes.codes_set(gid, "longitudeOfFirstGridPointInDegrees", float(grid.longitudes[0]))
+        eccodes.codes_set(gid, "latitudeOfLastGridPointInDegrees", float(grid.latitudes[-1]))
+        eccodes.codes_set(gid, "longitudeOfLastGridPointInDegrees", float(grid.longitudes[-1]))
+        eccodes.codes_set(gid, "iDirectionIncrementInDegrees", float(grid.longitude_spacing_deg))
+        eccodes.codes_set(gid, "jDirectionIncrementInDegrees", float(grid.latitude_spacing_deg))
+        eccodes.codes_set(gid, "iScansNegatively", 0)
+        eccodes.codes_set(gid, "jScansPositively", 1)
+        eccodes.codes_set(gid, "jPointsAreConsecutive", 0)
+
+        encoded = np.asarray(values, dtype=np.float64)
+        if encoded.shape != grid.shape:
+            raise ValidationError(f"UKV field {short_name} has shape {encoded.shape}, expected {grid.shape}")
+        if np.any(~np.isfinite(encoded)):
+            encoded = encoded.copy()
+            encoded[~np.isfinite(encoded)] = 9999.0
+            eccodes.codes_set(gid, "bitmapPresent", 1)
+            eccodes.codes_set(gid, "missingValue", 9999.0)
+        eccodes.codes_set(gid, "bitsPerValue", 24)
+        eccodes.codes_set_values(gid, encoded.ravel(order="C"))
+    except Exception:
+        eccodes.codes_release(gid)
+        raise
+    return gid
+
+
+def _read_ukv_grib_fields(path: Path) -> dict[str, Any]:
+    try:
+        import eccodes
+        import numpy as np
+    except ImportError as exc:
+        raise MissingDependencyError(
+            "Verifying UKV GRIB values requires ecCodes and numpy."
+        ) from exc
+
+    fields: dict[tuple[int, str], Any] = {}
+    reference_time: datetime | None = None
+    grid: dict[str, Any] | None = None
+    with path.open("rb") as handle:
+        while True:
+            gid = eccodes.codes_grib_new_from_file(handle)
+            if gid is None:
+                break
+            try:
+                short_name = str(eccodes.codes_get(gid, "shortName"))
+                if short_name not in {"10u", "10v", "prmsl", "2t"}:
+                    continue
+                ni = int(eccodes.codes_get(gid, "Ni"))
+                nj = int(eccodes.codes_get(gid, "Nj"))
+                hour = _grib_forecast_hour(eccodes, gid)
+                values = np.asarray(eccodes.codes_get_values(gid), dtype=float).reshape((nj, ni))
+                fields[(hour, short_name)] = values
+                if grid is None:
+                    grid = {
+                        "nx": ni,
+                        "ny": nj,
+                        "west": _normalize_longitude_180(float(eccodes.codes_get(gid, "longitudeOfFirstGridPointInDegrees"))),
+                        "south": float(eccodes.codes_get(gid, "latitudeOfFirstGridPointInDegrees")),
+                        "east": _normalize_longitude_180(float(eccodes.codes_get(gid, "longitudeOfLastGridPointInDegrees"))),
+                        "north": float(eccodes.codes_get(gid, "latitudeOfLastGridPointInDegrees")),
+                        "i_increment": float(eccodes.codes_get(gid, "iDirectionIncrementInDegrees")),
+                        "j_increment": float(eccodes.codes_get(gid, "jDirectionIncrementInDegrees")),
+                        "j_scans_positively": int(eccodes.codes_get(gid, "jScansPositively")),
+                    }
+                if reference_time is None:
+                    data_date = f"{int(eccodes.codes_get(gid, 'dataDate')):08d}"
+                    data_time = f"{int(eccodes.codes_get(gid, 'dataTime')):04d}"
+                    reference_time = datetime(
+                        int(data_date[0:4]),
+                        int(data_date[4:6]),
+                        int(data_date[6:8]),
+                        int(data_time[0:2]),
+                        int(data_time[2:4]),
+                        tzinfo=timezone.utc,
+                    )
+            finally:
+                eccodes.codes_release(gid)
+    if reference_time is None or grid is None:
+        raise ValidationError("UKV GRIB did not contain expected weather fields 10u/10v/prmsl/2t")
+    return {"fields": fields, "reference_time": reference_time, "grid": grid}
+
+
+def _normalize_longitude_180(value: float) -> float:
+    normalized = ((value + 180.0) % 360.0) - 180.0
+    return 180.0 if normalized == -180.0 and value > 0 else normalized
+
+
+def _grib_forecast_hour(eccodes: Any, gid: Any) -> int:
+    for key in ("forecastTime", "endStep", "stepRange"):
+        try:
+            value = eccodes.codes_get(gid, key)
+        except Exception:
+            continue
+        text = str(value)
+        if "-" in text:
+            text = text.split("-")[-1]
+        try:
+            return int(float(text))
+        except ValueError:
+            continue
+    raise ValidationError("could not determine GRIB forecast hour")
+
+
+def _verify_ukv_grib_grid(grib_grid: dict[str, Any], expected_grid: Any, bbox: BoundingBox) -> dict[str, Any]:
+    half_cell = max(float(expected_grid.longitude_spacing_deg), float(expected_grid.latitude_spacing_deg)) / 2.0 + 1e-9
+    failures: list[str] = []
+    checks = {
+        "nx": int(expected_grid.nx),
+        "ny": int(expected_grid.ny),
+        "west": float(expected_grid.longitudes[0]),
+        "east": float(expected_grid.longitudes[-1]),
+        "south": float(expected_grid.latitudes[0]),
+        "north": float(expected_grid.latitudes[-1]),
+        "j_scans_positively": 1,
+    }
+    for key in ("nx", "ny"):
+        if grib_grid.get(key) != checks[key]:
+            failures.append(f"grid {key} mismatch: expected {checks[key]}, got {grib_grid.get(key)}")
+    for key in ("west", "east", "south", "north"):
+        if abs(float(grib_grid.get(key)) - checks[key]) > half_cell:
+            failures.append(f"grid {key} mismatch: expected {checks[key]}, got {grib_grid.get(key)}")
+    if int(grib_grid.get("j_scans_positively", -1)) != 1:
+        failures.append("GRIB latitude scan direction is not south-to-north")
+    if abs(checks["west"] - bbox.west) > half_cell or abs(checks["east"] - bbox.east) > half_cell:
+        failures.append("GRIB longitude coverage does not match requested bbox within half a grid cell")
+    if abs(checks["south"] - bbox.south) > half_cell or abs(checks["north"] - bbox.north) > half_cell:
+        failures.append("GRIB latitude coverage does not match requested bbox within half a grid cell")
+    return {"passed": not failures, "expected": checks, "actual": grib_grid, "failures": failures}
+
+
+def _compare_arrays(expected: Any, actual: Any) -> dict[str, Any]:
+    import numpy as np
+
+    exp = np.asarray(expected, dtype=float)
+    act = np.asarray(actual, dtype=float)
+    if exp.shape != act.shape:
+        raise ValidationError(f"array shape mismatch: expected {exp.shape}, got {act.shape}")
+    mask = np.isfinite(exp) & np.isfinite(act)
+    if not np.any(mask):
+        raise ValidationError("no finite values available for array comparison")
+    diff = act[mask] - exp[mask]
+    return {
+        "finite_count": int(mask.sum()),
+        "max_abs_error": float(np.max(np.abs(diff))),
+        "rmse": float(np.sqrt(np.mean(diff * diff))),
+        "mean_bias": float(np.mean(diff)),
+        "source_min": float(np.min(exp[mask])),
+        "source_max": float(np.max(exp[mask])),
+        "grib_min": float(np.min(act[mask])),
+        "grib_max": float(np.max(act[mask])),
+    }
+
+
 def _missing_percent(values: Any) -> float:
     import numpy as np
 
@@ -1962,8 +2523,8 @@ def _validate_ecmwf_request(request: ECMWFWeatherRequest) -> None:
     if request.step_hours not in {3, 6, 12}:
         raise ValidationError("--step-hours must be one of 3, 6, or 12 for ECMWF Open Data")
     if request.cycle != "auto":
-        if request.cycle not in {"00", "06", "12", "18"}:
-            raise ValidationError("--cycle must be auto, 00, 06, 12, or 18")
+        if request.cycle not in {"00", "03", "06", "09", "12", "15", "18", "21"}:
+            raise ValidationError("--cycle must be auto, 00, 03, 06, 09, 12, 15, 18, or 21")
         if not request.date:
             raise ValidationError("--date YYYYMMDD is required when --cycle is explicit")
         _validate_date(request.date)
@@ -2015,6 +2576,15 @@ def _weather_cycle_from_ecmwf_datetime(value: Any) -> WeatherCycle:
         return WeatherCycle(dt.strftime("%Y%m%d"), f"{dt.hour:02d}")
     except ValueError:
         return WeatherCycle(text, "")
+
+
+def _datetime_from_ukv_cycle_name(cycle_name: str) -> datetime:
+    return datetime.strptime(cycle_name, "%Y%m%dT%H%MZ").replace(tzinfo=timezone.utc)
+
+
+def _weather_cycle_from_ukv_cycle_name(cycle_name: str) -> WeatherCycle:
+    dt = _datetime_from_ukv_cycle_name(cycle_name)
+    return WeatherCycle(dt.strftime("%Y%m%d"), f"{dt.hour:02d}")
 
 
 def _validate_date(value: str) -> None:

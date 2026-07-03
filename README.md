@@ -273,11 +273,11 @@ Implemented providers:
 
 - `gfs`: Source: NOAA GFS 0.25° forecast via NOMADS. Downloads bbox-subset GRIB2 files without credentials.
 - `gfs_wave`: Source: NOAA GFS Wave forecast via NOMADS. Downloads bbox-subset significant wave height, primary wave period, and primary wave direction from the GFS Wave global 0.25 degree grid.
+- `ukmo_ukv`: Source: Met Office UKV 2 km forecast. Downloads no-account AWS/Open Data NetCDF source files from `s3://met-office-atmospheric-model-data/`, regrids the projected UKV 2 km source to regular latitude/longitude, and writes OpenCPN-oriented GRIB2 weather fields for UK/Ireland short-range use.
 - `ecmwf_ifs_open`: Source: ECMWF IFS Open Data forecast. Uses the optional official `ecmwf-opendata` client. The first implementation retrieves the requested fields from ECMWF Open Data and records the bbox in metadata; spatial cropping is not yet applied by this provider.
 
 Experimental/planned providers:
 
-- `ukmo_ukv`: Source: Met Office UKV 2 km forecast. Planned high-resolution UK/Ireland short-range provider. The no-account AWS/Open Data source is `s3://met-office-atmospheric-model-data/` in `eu-west-2`. Discovery and NetCDF metadata/regrid inspection are implemented, but generation remains disabled until weather GRIB writing, numeric source-to-GRIB verification, and OpenCPN display are proven.
 - `dwd_icon_eu`: Source: DWD ICON-EU forecast.
 
 UKV discovery helpers:
@@ -333,7 +333,39 @@ tidal-current-grib inspect-ukv-netcdf \
   --verbose
 ```
 
-Observed UKV NetCDF metadata shows a projected `lambert_azimuthal_equal_area` x/y grid with CF grid mapping, not a regular lat/lon grid. Wind is published as speed plus `wind_from_direction`; the inspected metadata supports meteorological "from" direction, so the candidate U/V conversion is `u = -speed * sin(direction)` and `v = -speed * cos(direction)`. The inspection command can regrid a sample onto a regular lon/lat output grid, but UKV output remains disabled until GRIB writing, numeric source-to-GRIB readback verification, and OpenCPN display are complete.
+Observed UKV NetCDF metadata shows a projected `lambert_azimuthal_equal_area` x/y grid with CF grid mapping, not a regular lat/lon grid. Wind is published as speed plus `wind_from_direction`; the inspected metadata supports meteorological "from" direction, so the U/V conversion is `u = -speed * sin(direction)` and `v = -speed * cos(direction)`.
+
+Generate UKV weather GRIB:
+
+```bash
+tidal-current-grib generate-weather \
+  --provider ukmo_ukv \
+  --bbox -8.5 50.5 -2.5 56.5 \
+  --cycle auto \
+  --hours 24 \
+  --step-hours 1 \
+  --weather-preset routing \
+  --weather-grid-spacing-deg 0.025 \
+  --output ~/.opencpn/grib/generated/ukmo_ukv_weather_irish_sea_24h.grb \
+  --metadata-summary \
+  --verbose
+```
+
+Verify UKV source-to-GRIB numeric consistency:
+
+```bash
+tidal-current-grib verify-ukv-grib \
+  --cycle auto \
+  --bbox -8.5 50.5 -2.5 56.5 \
+  --hours 6 \
+  --step-hours 1 \
+  --weather-grid-spacing-deg 0.025 \
+  --grib ~/.opencpn/grib/generated/ukmo_ukv_weather_irish_sea_24h.grb \
+  --download-directory ~/.opencpn/grib/generated/ukv_samples \
+  --verbose
+```
+
+The OpenCPN plugin should only expose UKV as a normal UI provider after manual OpenCPN display testing confirms the generated wind, pressure, and temperature fields render correctly.
 
 Install the optional ECMWF client with:
 
