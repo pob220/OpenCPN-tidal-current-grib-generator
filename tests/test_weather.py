@@ -14,6 +14,7 @@ from tidal_current_grib_generator.weather import (
     GFSWaveRequest,
     GFSWeatherRequest,
     UKMOUKVInspectRequest,
+    UKMOUKVNetCDFInspectRequest,
     UKMOUKVWeatherRequest,
     WeatherGenerateResult,
     build_gfs_filter_url,
@@ -26,7 +27,9 @@ from tidal_current_grib_generator.weather import (
     generate_ukmo_ukv_weather_grib,
     gfs_variables_for_preset,
     gfs_cycle_candidates,
+    inspect_ukmo_ukv_netcdf,
     list_weather_providers,
+    wind_speed_direction_to_uv,
 )
 
 
@@ -573,6 +576,297 @@ def test_discover_ukv_source_cli(monkeypatch, capsys):
     assert "bucket: s3://met-office-atmospheric-model-data/" in out
     assert "anonymous_listing: True" in out
     assert "uk-deterministic/ukv/20260702/0600/10u_f006.nc (123456 bytes)" in out
+
+
+def _tiny_ukv_netcdf_bytes(tmp_path: Path, variable_name: str, *, standard_name: str, units: str, long_name: str) -> bytes:
+    xr = pytest.importorskip("xarray")
+    np = pytest.importorskip("numpy")
+    path = tmp_path / f"{variable_name}.nc"
+    data = np.arange(12, dtype=float).reshape(3, 4)
+    ds = xr.Dataset(
+        data_vars={
+            variable_name: (
+                ("projection_y_coordinate", "projection_x_coordinate"),
+                data,
+                {
+                    "standard_name": standard_name,
+                    "units": units,
+                    "long_name": long_name,
+                    "grid_mapping": "transverse_mercator",
+                },
+            ),
+            "transverse_mercator": (
+                (),
+                0,
+                {
+                    "grid_mapping_name": "transverse_mercator",
+                    "longitude_of_central_meridian": -2.0,
+                    "latitude_of_projection_origin": 49.0,
+                    "false_easting": 400000.0,
+                    "false_northing": -100000.0,
+                },
+            ),
+        },
+        coords={
+            "projection_x_coordinate": (
+                "projection_x_coordinate",
+                [0.0, 2000.0, 4000.0, 6000.0],
+                {"standard_name": "projection_x_coordinate", "units": "m"},
+            ),
+            "projection_y_coordinate": (
+                "projection_y_coordinate",
+                [0.0, 2000.0, 4000.0],
+                {"standard_name": "projection_y_coordinate", "units": "m"},
+            ),
+            "latitude": (
+                ("projection_y_coordinate", "projection_x_coordinate"),
+                np.array([[50.0, 50.0, 50.0, 50.0], [51.0, 51.0, 51.0, 51.0], [52.0, 52.0, 52.0, 52.0]]),
+            ),
+            "longitude": (
+                ("projection_y_coordinate", "projection_x_coordinate"),
+                np.array([[-6.0, -5.0, -4.0, -3.0], [-6.0, -5.0, -4.0, -3.0], [-6.0, -5.0, -4.0, -3.0]]),
+            ),
+            "forecast_period": ((), np.timedelta64(0, "h"), {"standard_name": "forecast_period"}),
+            "forecast_reference_time": ((), np.datetime64("2026-07-03T00:00:00")),
+            "time": ((), np.datetime64("2026-07-03T00:00:00")),
+        },
+    )
+    ds.to_netcdf(path)
+    return path.read_bytes()
+
+
+def _projected_ukv_netcdf_bytes(tmp_path: Path, variable_name: str, *, standard_name: str, units: str, long_name: str) -> bytes:
+    xr = pytest.importorskip("xarray")
+    np = pytest.importorskip("numpy")
+    pyproj = pytest.importorskip("pyproj")
+    path = tmp_path / f"projected_{variable_name}.nc"
+    grid_mapping_attrs = {
+        "grid_mapping_name": "lambert_azimuthal_equal_area",
+        "latitude_of_projection_origin": 54.9,
+        "longitude_of_projection_origin": -2.5,
+        "false_easting": 0.0,
+        "false_northing": 0.0,
+        "semi_major_axis": 6378137.0,
+        "inverse_flattening": 298.257223563,
+    }
+    transformer = pyproj.Transformer.from_crs(pyproj.CRS.from_epsg(4326), pyproj.CRS.from_cf(grid_mapping_attrs), always_xy=True)
+    x0, y0 = transformer.transform(-5.9, 52.9)
+    x1, y1 = transformer.transform(-5.1, 53.6)
+    x = np.linspace(min(x0, x1) - 20_000.0, max(x0, x1) + 20_000.0, 8)
+    y = np.linspace(min(y0, y1) - 20_000.0, max(y0, y1) + 20_000.0, 7)
+    xx, yy = np.meshgrid(x, y)
+    if variable_name == "pressure_at_mean_sea_level":
+        data = 101500.0 + 1.0e-4 * xx + 2.0e-4 * yy
+    elif variable_name == "temperature_at_screen_level":
+        data = 285.0 + 1.0e-5 * xx - 1.0e-5 * yy
+    elif variable_name == "wind_speed_at_10m":
+        data = np.full_like(xx, 10.0)
+    elif variable_name == "wind_direction_at_10m":
+        data = np.full_like(xx, 270.0)
+    else:
+        data = xx * 0.0
+    ds = xr.Dataset(
+        data_vars={
+            variable_name: (
+                ("projection_y_coordinate", "projection_x_coordinate"),
+                data,
+                {
+                    "standard_name": standard_name,
+                    "units": units,
+                    "long_name": long_name,
+                    "grid_mapping": "lambert_azimuthal_equal_area",
+                },
+            ),
+            "lambert_azimuthal_equal_area": ((), 0, grid_mapping_attrs),
+        },
+        coords={
+            "projection_x_coordinate": ("projection_x_coordinate", x, {"standard_name": "projection_x_coordinate", "units": "m"}),
+            "projection_y_coordinate": ("projection_y_coordinate", y, {"standard_name": "projection_y_coordinate", "units": "m"}),
+            "forecast_period": ((), np.timedelta64(0, "h"), {"standard_name": "forecast_period"}),
+            "forecast_reference_time": ((), np.datetime64("2026-07-03T00:00:00")),
+            "time": ((), np.datetime64("2026-07-03T00:00:00")),
+        },
+    )
+    ds.to_netcdf(path)
+    return path.read_bytes()
+
+
+def test_inspect_ukv_netcdf_with_mocked_downloads(tmp_path: Path):
+    files = {
+        "pressure_at_mean_sea_level": _tiny_ukv_netcdf_bytes(
+            tmp_path, "pressure_at_mean_sea_level", standard_name="air_pressure_at_mean_sea_level", units="Pa", long_name="Pressure at mean sea level"
+        ),
+        "temperature_at_screen_level": _tiny_ukv_netcdf_bytes(
+            tmp_path, "temperature_at_screen_level", standard_name="air_temperature", units="K", long_name="Temperature at screen level"
+        ),
+        "wind_speed_at_10m": _tiny_ukv_netcdf_bytes(
+            tmp_path, "wind_speed_at_10m", standard_name="wind_speed", units="m s-1", long_name="Wind speed at 10m"
+        ),
+        "wind_direction_at_10m": _tiny_ukv_netcdf_bytes(
+            tmp_path, "wind_direction_at_10m", standard_name="wind_from_direction", units="degree", long_name="Wind direction at 10m"
+        ),
+    }
+    contents = "\n".join(
+        f"""
+        <Contents>
+          <Key>uk-deterministic-2km/20260703T0000Z/20260703T0000Z-PT0000H00M-{name}.nc</Key>
+          <LastModified>2026-07-03T01:00:00.000Z</LastModified>
+          <Size>{len(data)}</Size>
+        </Contents>
+        """
+        for name, data in files.items()
+    )
+    root_xml = b"""<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+      <CommonPrefixes><Prefix>uk-deterministic-2km/</Prefix></CommonPrefixes>
+    </ListBucketResult>"""
+    run_xml = f"""<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">{contents}</ListBucketResult>""".encode()
+
+    def fake_get(url: str, timeout_seconds: float) -> bytes:
+        if url.endswith(".nc"):
+            for name, data in files.items():
+                if name in url:
+                    return data
+        if "prefix=uk-deterministic-2km%2F20260703T0000Z%2F" in url:
+            return run_xml
+        if "prefix=" in url:
+            return b"""<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/" />"""
+        return root_xml
+
+    result = inspect_ukmo_ukv_netcdf(
+        UKMOUKVNetCDFInspectRequest(
+            bbox=BoundingBox(-5.8, 50.5, -3.5, 51.5),
+            hours=0,
+            download_directory=tmp_path / "downloads",
+            max_keys=80,
+            extract_sample=True,
+        ),
+        http_get=fake_get,
+    )
+
+    assert result["selected_cycle"] == "20260703T0000Z"
+    assert result["generation_enabled"] is False
+    assert result["files"]["pressure_msl_h000"]["primary_data_variable"] == "pressure_at_mean_sea_level"
+    assert result["coordinate_summary"]["grid_type"] == "projected_or_curvilinear_with_auxiliary_2d_lat_lon"
+    assert result["time_summary"]["requested_hours_available"] is True
+    assert result["time_summary"]["hourly_0_to_54_proven"] is False
+    assert result["wind_direction_convention"]["status"] == "usable"
+    assert result["wind_uv_sample_stats"]["u"]["finite_count"] == 12
+    assert result["variable_mappings"]["pressure_msl_h000"]["field"] == "pressure_msl"
+    assert result["variable_mappings"]["pressure_msl_h000"]["unit_conversion_required"] == "none if writing GRIB pressure in Pa"
+
+
+def test_inspect_ukv_netcdf_regrid_sample_from_projected_grid(tmp_path: Path):
+    pytest.importorskip("pyproj")
+    files = {
+        "pressure_at_mean_sea_level": _projected_ukv_netcdf_bytes(
+            tmp_path, "pressure_at_mean_sea_level", standard_name="air_pressure_at_mean_sea_level", units="Pa", long_name="Pressure at mean sea level"
+        ),
+        "temperature_at_screen_level": _projected_ukv_netcdf_bytes(
+            tmp_path, "temperature_at_screen_level", standard_name="air_temperature", units="K", long_name="Temperature at screen level"
+        ),
+        "wind_speed_at_10m": _projected_ukv_netcdf_bytes(
+            tmp_path, "wind_speed_at_10m", standard_name="wind_speed", units="m s-1", long_name="Wind speed at 10m"
+        ),
+        "wind_direction_at_10m": _projected_ukv_netcdf_bytes(
+            tmp_path, "wind_direction_at_10m", standard_name="wind_from_direction", units="degree", long_name="Wind direction at 10m"
+        ),
+    }
+    contents = "\n".join(
+        f"""
+        <Contents>
+          <Key>uk-deterministic-2km/20260703T0000Z/20260703T0000Z-PT0000H00M-{name}.nc</Key>
+          <LastModified>2026-07-03T01:00:00.000Z</LastModified>
+          <Size>{len(data)}</Size>
+        </Contents>
+        """
+        for name, data in files.items()
+    )
+    run_xml = f"""<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">{contents}</ListBucketResult>""".encode()
+
+    def fake_get(url: str, timeout_seconds: float) -> bytes:
+        if url.endswith(".nc"):
+            for name, data in files.items():
+                if name in url:
+                    return data
+        if "prefix=uk-deterministic-2km%2F20260703T0000Z%2F" in url:
+            return run_xml
+        return b"""<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/" />"""
+
+    result = inspect_ukmo_ukv_netcdf(
+        UKMOUKVNetCDFInspectRequest(
+            bbox=BoundingBox(-5.8, 53.0, -5.2, 53.5),
+            hours=0,
+            cycle="00",
+            date="20260703",
+            download_directory=tmp_path / "downloads",
+            extract_sample=True,
+            weather_grid_spacing_deg=0.1,
+        ),
+        http_get=fake_get,
+    )
+
+    regrid = result["regrid_sample"]
+    assert regrid["status"] == "ok"
+    assert regrid["output_grid"]["nx"] == 7
+    assert regrid["output_grid"]["ny"] == 6
+    assert regrid["fields"]["pressure_msl"]["missing_percent"] == 0.0
+    assert regrid["fields"]["wind_u_10m_candidate"]["missing_percent"] == 0.0
+    assert regrid["fields"]["wind_v_10m_candidate"]["missing_percent"] == 0.0
+    assert regrid["fields"]["wind_u_10m_candidate"]["stats"]["mean"] == pytest.approx(10.0)
+    assert regrid["fields"]["wind_v_10m_candidate"]["stats"]["mean"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_inspect_ukv_netcdf_cli(monkeypatch, capsys, tmp_path: Path):
+    monkeypatch.setattr(
+        "tidal_current_grib_generator.cli.inspect_ukmo_ukv_netcdf",
+        lambda request: {
+            "provider": "ukmo_ukv",
+            "source": "Met Office UKV 2 km forecast",
+            "status": "metadata-only",
+            "implemented": False,
+            "selected_cycle": "20260703T0000Z",
+            "download_directory": str(tmp_path),
+            "downloaded_files": {"pressure_msl": {"path": str(tmp_path / "p.nc"), "size": 10, "reused": False}},
+            "files": {},
+            "coordinate_summary": {"grid_type": "projected_xy_with_cf_grid_mapping"},
+            "time_summary": {"requested_forecast_hours": [0]},
+            "variable_mappings": {},
+            "wind_direction_convention": {"status": "ambiguous"},
+            "crop_feasibility": {},
+            "generation_enabled": False,
+            "blocker": "disabled",
+        },
+    )
+
+    rc = main(
+        [
+            "inspect-ukv-netcdf",
+            "--bbox",
+            "-8.5",
+            "50.5",
+            "-2.5",
+            "56.5",
+            "--hours",
+            "0",
+            "--download-directory",
+            str(tmp_path),
+        ]
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "status: metadata-only" in out
+    assert "generation_enabled: False" in out
+
+
+def test_wind_speed_direction_to_uv_from_convention():
+    np = pytest.importorskip("numpy")
+    speed = np.array([10.0, 10.0, 10.0, 10.0])
+    direction = np.array([0.0, 90.0, 180.0, 270.0])
+    u, v = wind_speed_direction_to_uv(speed, direction)
+
+    assert np.allclose(u, [0.0, -10.0, 0.0, 10.0], atol=1e-12)
+    assert np.allclose(v, [-10.0, 0.0, 10.0, 0.0], atol=1e-12)
 
 
 def test_inspect_ukv_source_rejects_outside_domain(capsys):

@@ -30,6 +30,8 @@ copernicus = [
 ]
 weather = [
   "ecmwf-opendata>=0.3.30",
+  "xarray>=2024.7",
+  "netCDF4>=1.6",
 ]
 dev = ["pytest>=7.4"]
 all = [

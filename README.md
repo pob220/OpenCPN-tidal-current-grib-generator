@@ -277,7 +277,7 @@ Implemented providers:
 
 Experimental/planned providers:
 
-- `ukmo_ukv`: Source: Met Office UKV 2 km forecast. Planned high-resolution UK/Ireland short-range provider. The no-account AWS/Open Data source is `s3://met-office-atmospheric-model-data/` in `eu-west-2`. Discovery is implemented, but generation remains disabled until NetCDF coordinate/projection handling, field mapping, regridding, and source-to-GRIB verification are complete.
+- `ukmo_ukv`: Source: Met Office UKV 2 km forecast. Planned high-resolution UK/Ireland short-range provider. The no-account AWS/Open Data source is `s3://met-office-atmospheric-model-data/` in `eu-west-2`. Discovery and NetCDF metadata/regrid inspection are implemented, but generation remains disabled until weather GRIB writing, numeric source-to-GRIB verification, and OpenCPN display are proven.
 - `dwd_icon_eu`: Source: DWD ICON-EU forecast.
 
 UKV discovery helpers:
@@ -301,6 +301,39 @@ aws s3 ls --no-sign-request s3://met-office-atmospheric-model-data/
 ```
 
 The Met Office dataset layout changed around January 2026, so the code validates object structure dynamically instead of hard-coding a brittle path. `inspect-ukv-source` reports discovered prefixes, candidate NetCDF objects, sizes, inferred cycles/forecast hours, and the current blocker instead of producing a fake GRIB.
+
+UKV NetCDF source inspection:
+
+```bash
+tidal-current-grib inspect-ukv-netcdf \
+  --cycle auto \
+  --bbox -8.5 50.5 -2.5 56.5 \
+  --hours 6 \
+  --download-directory ~/.opencpn/grib/generated/ukv_samples \
+  --verbose
+```
+
+This downloads only the required NetCDF source files for the requested forecast hours:
+
+- `pressure_at_mean_sea_level.nc`
+- `temperature_at_screen_level.nc`
+- `wind_speed_at_10m.nc`
+- `wind_direction_at_10m.nc`
+
+Use `--extract-sample` to compute data ranges for the requested bbox and run a projected-grid to regular-lon/lat interpolation sample:
+
+```bash
+tidal-current-grib inspect-ukv-netcdf \
+  --cycle auto \
+  --bbox -5.8 53.0 -5.2 53.5 \
+  --hours 1 \
+  --download-directory ~/.opencpn/grib/generated/ukv_samples \
+  --extract-sample \
+  --weather-grid-spacing-deg 0.025 \
+  --verbose
+```
+
+Observed UKV NetCDF metadata shows a projected `lambert_azimuthal_equal_area` x/y grid with CF grid mapping, not a regular lat/lon grid. Wind is published as speed plus `wind_from_direction`; the inspected metadata supports meteorological "from" direction, so the candidate U/V conversion is `u = -speed * sin(direction)` and `v = -speed * cos(direction)`. The inspection command can regrid a sample onto a regular lon/lat output grid, but UKV output remains disabled until GRIB writing, numeric source-to-GRIB readback verification, and OpenCPN display are complete.
 
 Install the optional ECMWF client with:
 

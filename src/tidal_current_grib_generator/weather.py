@@ -15,7 +15,7 @@ from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 from tidal_current_grib_generator.errors import MissingDependencyError, ValidationError
-from tidal_current_grib_generator.geo import BoundingBox
+from tidal_current_grib_generator.geo import BoundingBox, build_regular_grid
 from tidal_current_grib_generator.grib.validation import inspect_grib, scan_grib_messages
 
 GFS_FILTER_ENDPOINT = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl"
@@ -28,6 +28,28 @@ UKMO_UKV_DOMAIN = BoundingBox(west=-12.0, south=48.0, east=4.0, north=62.0)
 UKMO_UKV_BUCKET = "met-office-atmospheric-model-data"
 UKMO_UKV_REGION = "eu-west-2"
 UKMO_UKV_S3_ENDPOINT = f"https://{UKMO_UKV_BUCKET}.s3.{UKMO_UKV_REGION}.amazonaws.com/"
+UKMO_UKV_REQUIRED_SOURCE_FIELDS = {
+    "pressure_msl": {
+        "filename_token": "pressure_at_mean_sea_level",
+        "intended_grib_short_name": "prmsl/msl",
+        "confidence": "medium",
+    },
+    "temperature_screen": {
+        "filename_token": "temperature_at_screen_level",
+        "intended_grib_short_name": "2t",
+        "confidence": "medium",
+    },
+    "wind_speed_10m": {
+        "filename_token": "wind_speed_at_10m",
+        "intended_grib_short_name": "10si -> 10u/10v after direction conversion",
+        "confidence": "blocked-pending-direction-convention",
+    },
+    "wind_direction_10m": {
+        "filename_token": "wind_direction_at_10m",
+        "intended_grib_short_name": "10wdir -> 10u/10v after direction conversion",
+        "confidence": "blocked-pending-direction-convention",
+    },
+}
 GFS_ROUTING_VARIABLES_LEVELS = {
     "var_UGRD": "on",
     "var_VGRD": "on",
@@ -164,6 +186,21 @@ class UKMOUKVInspectRequest:
     weather_grid_spacing_deg: float = 0.025
     max_keys: int = 200
     refresh_source_index: bool = False
+
+
+@dataclass(frozen=True)
+class UKMOUKVNetCDFInspectRequest:
+    bbox: BoundingBox
+    hours: int
+    download_directory: Path
+    cycle: str = "auto"
+    date: str | None = None
+    step_hours: int = 1
+    max_keys: int = 400
+    refresh: bool = False
+    extract_sample: bool = False
+    weather_grid_spacing_deg: float = 0.025
+    timeout_seconds: float = 120.0
 
 
 @dataclass(frozen=True)
@@ -698,6 +735,111 @@ def inspect_ukmo_ukv_source(request: UKMOUKVInspectRequest) -> dict[str, Any]:
     }
 
 
+def inspect_ukmo_ukv_netcdf(
+    request: UKMOUKVNetCDFInspectRequest,
+    *,
+    http_get: HttpGet | None = None,
+) -> dict[str, Any]:
+    """Download and inspect a minimal set of UKV NetCDF source files.
+
+    This intentionally stops at source metadata and sample statistics. It does
+    not enable UKV GRIB output.
+    """
+
+    request.bbox.validate()
+    _validate_ukmo_ukv_request(
+        UKMOUKVWeatherRequest(
+            bbox=request.bbox,
+            output=Path("ukmo_ukv_inspect.grb"),
+            hours=request.hours,
+            step_hours=request.step_hours,
+            cycle=request.cycle,
+            date=request.date,
+        )
+    )
+    http_get = http_get or _http_get
+    requested_hours = forecast_hour_sequence(request.hours, request.step_hours)
+    selected_cycle, selected_objects, cycle_errors = _select_complete_ukv_cycle(
+        request,
+        requested_hours,
+        http_get=http_get,
+    )
+
+    request.download_directory.expanduser().mkdir(parents=True, exist_ok=True)
+    downloaded: dict[str, dict[str, Any]] = {}
+    for item_name, item in selected_objects.items():
+        path = request.download_directory.expanduser() / Path(str(item["key"])).name
+        expected_size = int(item.get("size") or 0)
+        reused = path.exists() and not request.refresh and (expected_size <= 0 or path.stat().st_size == expected_size)
+        if not reused:
+            data = http_get(str(item["url"]), request.timeout_seconds)
+            if not data:
+                raise ValidationError(f"UKV download returned empty response for {item['key']}")
+            tmp_path = path.with_name(path.name + ".tmp")
+            tmp_path.write_bytes(data)
+            if expected_size > 0 and tmp_path.stat().st_size != expected_size:
+                tmp_path.unlink(missing_ok=True)
+                raise ValidationError(
+                    f"UKV download size mismatch for {item['key']}: expected {expected_size}, got {len(data)}"
+                )
+            tmp_path.replace(path)
+        downloaded[item_name] = {
+            "field": item["field"],
+            "forecast_hour": item["forecast_hour"],
+            "source_key": item["key"],
+            "url": item["url"],
+            "path": str(path),
+            "expected_size": expected_size,
+            "size": path.stat().st_size,
+            "reused": reused,
+        }
+
+    file_inspections: dict[str, Any] = {}
+    for item_name, info in downloaded.items():
+        file_inspections[item_name] = _inspect_ukv_netcdf_file(
+            Path(info["path"]),
+            request.bbox,
+            extract_sample=request.extract_sample,
+        )
+
+    coordinate_summary = _summarize_ukv_coordinates(file_inspections, request.bbox)
+    time_summary = _summarize_ukv_times(file_inspections, requested_hours)
+    variable_mappings = _ukv_variable_mapping_candidates(file_inspections)
+    wind_direction = _infer_ukv_wind_direction_convention(file_inspections)
+    wind_uv_stats = _ukv_wind_uv_sample_stats(downloaded, file_inspections) if request.extract_sample else None
+    regrid_sample = (
+        _ukv_regrid_sample(downloaded, file_inspections, request.bbox, request.weather_grid_spacing_deg)
+        if request.extract_sample
+        else None
+    )
+    return {
+        "provider": "ukmo_ukv",
+        "source": UKMO_UKV_SOURCE_LABEL,
+        "status": "metadata-only",
+        "implemented": False,
+        "selected_cycle": selected_cycle,
+        "cycle_selection_errors": cycle_errors,
+        "source_bucket": f"s3://{UKMO_UKV_BUCKET}/",
+        "source_region": UKMO_UKV_REGION,
+        "download_directory": str(request.download_directory.expanduser()),
+        "requested_forecast_hours": requested_hours,
+        "downloaded_files": downloaded,
+        "files": file_inspections,
+        "coordinate_summary": coordinate_summary,
+        "time_summary": time_summary,
+        "variable_mappings": variable_mappings,
+        "wind_direction_convention": wind_direction,
+        "wind_uv_sample_stats": wind_uv_stats,
+        "regrid_sample": regrid_sample,
+        "crop_feasibility": coordinate_summary.get("crop_feasibility", {}),
+        "generation_enabled": False,
+        "blocker": (
+            "UKV NetCDF source metadata can be inspected, but GRIB generation remains disabled until "
+            "projection/regridding and numeric source-to-GRIB verification are implemented."
+        ),
+    }
+
+
 def discover_ukmo_ukv_source(
     *,
     max_keys: int = 200,
@@ -917,6 +1059,716 @@ def _select_discovered_ukv_cycle(cycles: list[str], request: UKMOUKVInspectReque
     return cycles[0] if cycles else "(not discovered)"
 
 
+def _select_ukv_required_objects(candidate_files: list[dict[str, Any]], selected_cycle: str) -> dict[str, dict[str, Any] | None]:
+    prefix = f"uk-deterministic-2km/{selected_cycle}/"
+    selected: dict[str, dict[str, Any] | None] = {}
+    for field_name, spec in UKMO_UKV_REQUIRED_SOURCE_FIELDS.items():
+        token = str(spec["filename_token"])
+        matches = [
+            item
+            for item in candidate_files
+            if str(item.get("key", "")).startswith(prefix)
+            and token in str(item.get("key", ""))
+            and "PT0000H00M" in str(item.get("key", ""))
+        ]
+        if not matches:
+            matches = [
+                item
+                for item in candidate_files
+                if str(item.get("key", "")).startswith(prefix)
+                and token in str(item.get("key", ""))
+            ]
+        selected[field_name] = matches[0] if matches else None
+    return selected
+
+
+def _select_complete_ukv_cycle(
+    request: UKMOUKVNetCDFInspectRequest,
+    forecast_hours: list[int],
+    *,
+    http_get: HttpGet,
+) -> tuple[str, dict[str, dict[str, Any]], list[str]]:
+    errors: list[str] = []
+    for cycle in _ukv_cycle_candidates_for_request(request):
+        selected: dict[str, dict[str, Any]] = {}
+        missing: list[str] = []
+        for hour in forecast_hours:
+            for field_name, spec in UKMO_UKV_REQUIRED_SOURCE_FIELDS.items():
+                key = _ukv_source_key(cycle, hour, str(spec["filename_token"]))
+                item = _s3_object_for_key(key, http_get=http_get, timeout_seconds=request.timeout_seconds)
+                if item is None:
+                    missing.append(f"{field_name} f{hour:03d}")
+                    continue
+                selected[f"{field_name}_h{hour:03d}"] = {
+                    **item.as_dict(),
+                    "field": field_name,
+                    "forecast_hour": hour,
+                }
+        if not missing:
+            return cycle, selected, errors
+        errors.append(f"{cycle}: missing {', '.join(missing[:8])}" + (" ..." if len(missing) > 8 else ""))
+        if request.cycle != "auto":
+            break
+    raise ValidationError(
+        "could not find a complete UKV cycle for required fields/hours. " + "; ".join(errors)
+    )
+
+
+def _ukv_cycle_candidates_for_request(request: UKMOUKVNetCDFInspectRequest) -> list[str]:
+    if request.cycle != "auto":
+        if not request.date:
+            raise ValidationError("--date YYYYMMDD is required when --cycle is explicit")
+        return [f"{request.date}T{request.cycle}00Z"]
+    now = datetime.now(timezone.utc)
+    return [prefix.removeprefix("uk-deterministic-2km/").removesuffix("/") for prefix in _recent_ukv_run_prefixes(now)]
+
+
+def _ukv_source_key(cycle: str, forecast_hour: int, filename_token: str) -> str:
+    cycle_dt = datetime.strptime(cycle, "%Y%m%dT%H%MZ").replace(tzinfo=timezone.utc)
+    valid_dt = cycle_dt + timedelta(hours=forecast_hour)
+    return (
+        f"uk-deterministic-2km/{cycle}/"
+        f"{valid_dt.strftime('%Y%m%dT%H%MZ')}-PT{forecast_hour:04d}H00M-{filename_token}.nc"
+    )
+
+
+def _s3_object_for_key(
+    key: str,
+    *,
+    http_get: HttpGet,
+    timeout_seconds: float,
+) -> S3ObjectInfo | None:
+    try:
+        listing = _list_s3_prefix(key, delimiter=None, max_keys=1, http_get=http_get, timeout_seconds=timeout_seconds)
+    except ValidationError:
+        return None
+    for obj in listing.objects:
+        if obj.key == key:
+            return obj
+    return None
+
+
+def _inspect_ukv_netcdf_file(path: Path, bbox: BoundingBox, *, extract_sample: bool) -> dict[str, Any]:
+    try:
+        import numpy as np
+        import xarray as xr
+    except ImportError as exc:
+        raise MissingDependencyError(
+            "UKV NetCDF inspection requires xarray and numpy; install the netcdf/weather extras."
+        ) from exc
+
+    with xr.open_dataset(path) as ds:
+        dimensions = {name: int(size) for name, size in ds.sizes.items()}
+        coordinates = list(ds.coords)
+        data_variables = list(ds.data_vars)
+        variables: dict[str, Any] = {}
+        for name in list(ds.variables):
+            var = ds[name]
+            variables[name] = {
+                "dims": list(var.dims),
+                "shape": [int(v) for v in var.shape],
+                "units": _attr_text(var.attrs, "units"),
+                "standard_name": _attr_text(var.attrs, "standard_name"),
+                "long_name": _attr_text(var.attrs, "long_name"),
+                "grid_mapping": _attr_text(var.attrs, "grid_mapping"),
+                "attrs": {str(key): _json_safe_attr_value(value) for key, value in var.attrs.items()},
+            }
+        data_var_names = [name for name in data_variables if ds[name].ndim >= 1]
+        primary_name = _choose_primary_data_variable(ds, path)
+        primary = ds[primary_name] if primary_name else None
+        grid_mapping_name = _attr_text(primary.attrs, "grid_mapping") if primary is not None else None
+        grid_mapping = variables.get(grid_mapping_name or "", None)
+        latlon = _lat_lon_bounds(ds)
+        xy_summary = _xy_coordinate_summary(ds)
+        if not latlon.get("bounds"):
+            projected_bounds = _projected_xy_latlon_bounds(xy_summary, grid_mapping)
+            if projected_bounds:
+                latlon["bounds"] = projected_bounds
+                latlon["derived_from_projection"] = True
+        time_summary = _time_coordinate_summary(ds)
+        crop_index_bounds = _projected_bbox_index_bounds(bbox, xy_summary, grid_mapping)
+        sample_stats: dict[str, Any] | None = None
+        if extract_sample and primary is not None:
+            sample_stats = _sample_data_stats(primary, crop_index_bounds=crop_index_bounds)
+        elif primary is not None:
+            sample_stats = _sample_data_stats(primary, quick=True)
+        bbox_intersection = _bbox_intersects_latlon_bounds(bbox, latlon.get("bounds")) if latlon.get("bounds") else None
+        return {
+            "path": str(path),
+            "file_size": path.stat().st_size,
+            "dimensions": dimensions,
+            "coordinate_variables": coordinates,
+            "data_variables": data_variables,
+            "primary_data_variable": primary_name,
+            "variables": variables,
+            "grid_mapping_name": grid_mapping_name,
+            "grid_mapping": grid_mapping,
+            "time": time_summary,
+            "lat_lon": latlon,
+            "xy": xy_summary,
+            "grid_type": _classify_ukv_grid(latlon, xy_summary, grid_mapping),
+            "bbox_intersects_source_bounds": bbox_intersection,
+            "bbox_index_bounds": crop_index_bounds,
+            "sample_stats": sample_stats,
+        }
+
+
+def _attr_text(attrs: dict[str, Any], name: str) -> str | None:
+    value = attrs.get(name)
+    return None if value is None else str(value)
+
+
+def _json_safe_attr_value(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_attr_value(item) for item in value]
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _choose_primary_data_variable(ds: Any, path: Path) -> str | None:
+    candidates = [name for name in ds.data_vars if not str(name).lower().endswith("bounds")]
+    if not candidates:
+        return None
+    stem = path.stem.lower()
+    for name in candidates:
+        normalized = str(name).lower()
+        if normalized in stem or stem.endswith(normalized):
+            return str(name)
+    candidates.sort(key=lambda name: ds[name].ndim, reverse=True)
+    return str(candidates[0])
+
+
+def _lat_lon_bounds(ds: Any) -> dict[str, Any]:
+    import numpy as np
+
+    lat_names = [name for name in ds.variables if str(name).lower() in {"lat", "latitude", "grid_latitude"}]
+    lon_names = [name for name in ds.variables if str(name).lower() in {"lon", "longitude", "grid_longitude"}]
+    result: dict[str, Any] = {"latitude_variables": lat_names, "longitude_variables": lon_names}
+    lat_name = next((name for name in lat_names if "lat" in str(name).lower()), None)
+    lon_name = next((name for name in lon_names if "lon" in str(name).lower()), None)
+    if lat_name is None or lon_name is None:
+        return result
+    lat = np.asarray(ds[lat_name].values)
+    lon = np.asarray(ds[lon_name].values)
+    result.update(
+        {
+            "latitude_name": str(lat_name),
+            "longitude_name": str(lon_name),
+            "latitude_shape": list(lat.shape),
+            "longitude_shape": list(lon.shape),
+            "latitude_range": _finite_range(lat),
+            "longitude_range": _finite_range(lon),
+            "latitude_monotonic": _is_monotonic(lat),
+            "longitude_monotonic": _is_monotonic(lon),
+        }
+    )
+    if result["latitude_range"] and result["longitude_range"]:
+        result["bounds"] = {
+            "west": result["longitude_range"][0],
+            "south": result["latitude_range"][0],
+            "east": result["longitude_range"][1],
+            "north": result["latitude_range"][1],
+        }
+    return result
+
+
+def _xy_coordinate_summary(ds: Any) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for axis, names in {"x": ("x", "projection_x_coordinate"), "y": ("y", "projection_y_coordinate")}.items():
+        found = next((name for name in ds.variables if str(name).lower() in names), None)
+        if found is None:
+            continue
+        values = ds[found].values
+        result[axis] = {
+            "name": str(found),
+            "dims": list(ds[found].dims),
+            "shape": [int(v) for v in ds[found].shape],
+            "units": _attr_text(ds[found].attrs, "units"),
+            "standard_name": _attr_text(ds[found].attrs, "standard_name"),
+            "range": _finite_range(values),
+            "monotonic": _is_monotonic(values),
+        }
+    return result
+
+
+def _time_coordinate_summary(ds: Any) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for name in ds.variables:
+        lower = str(name).lower()
+        if lower not in {"time", "forecast_period", "forecast_reference_time", "forecast_reference_time_bnds"} and "time" not in lower:
+            continue
+        var = ds[name]
+        values = var.values
+        result[str(name)] = {
+            "dims": list(var.dims),
+            "shape": [int(v) for v in var.shape],
+            "units": _attr_text(var.attrs, "units"),
+            "standard_name": _attr_text(var.attrs, "standard_name"),
+            "long_name": _attr_text(var.attrs, "long_name"),
+            "values": _compact_values(values),
+        }
+    return result
+
+
+def _sample_data_stats(data_array: Any, *, quick: bool = False, crop_index_bounds: dict[str, int] | None = None) -> dict[str, Any]:
+    import numpy as np
+
+    arr = data_array
+    for dim in list(getattr(arr, "dims", ())):
+        lower = dim.lower()
+        if crop_index_bounds and lower in {"projection_x_coordinate", "x"}:
+            arr = arr.isel({dim: slice(crop_index_bounds["x_start"], crop_index_bounds["x_stop"] + 1)})
+        elif crop_index_bounds and lower in {"projection_y_coordinate", "y"}:
+            arr = arr.isel({dim: slice(crop_index_bounds["y_start"], crop_index_bounds["y_stop"] + 1)})
+        elif quick and arr.sizes.get(dim, 1) > 80:
+            arr = arr.isel({dim: slice(0, 80)})
+        elif lower in {"time", "forecast_period"}:
+            arr = arr.isel({dim: 0})
+    values = np.asarray(arr.values, dtype=float)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return {"finite_count": 0}
+    return {
+        "finite_count": int(finite.size),
+        "min": float(np.min(finite)),
+        "max": float(np.max(finite)),
+        "mean": float(np.mean(finite)),
+        "shape": [int(v) for v in values.shape],
+    }
+
+
+def _summarize_ukv_coordinates(file_inspections: dict[str, Any], bbox: BoundingBox) -> dict[str, Any]:
+    first = next(iter(file_inspections.values()), {})
+    latlon = first.get("lat_lon", {})
+    xy = first.get("xy", {})
+    grid_mapping = first.get("grid_mapping", {})
+    summary = {
+        "grid_type": first.get("grid_type"),
+        "lat_lon": latlon,
+        "xy": xy,
+        "grid_mapping": grid_mapping,
+        "pyproj_transform_available": _can_build_pyproj_transform(grid_mapping),
+    }
+    bounds = latlon.get("bounds")
+    if bounds:
+        projected_index_bounds = _projected_bbox_index_bounds(bbox, xy, grid_mapping)
+        fully_covered = (
+            bbox.west >= bounds["west"]
+            and bbox.east <= bounds["east"]
+            and bbox.south >= bounds["south"]
+            and bbox.north <= bounds["north"]
+        )
+        summary["crop_feasibility"] = {
+            "bbox": bbox.__dict__,
+            "source_bounds": bounds,
+            "bbox_fully_covered_by_lat_lon_bounds": fully_covered,
+            "approx_source_index_bounds": projected_index_bounds or "(requires source sample coordinate arrays and projection-aware crop)",
+            "source_buffer_needed_for_interpolation": True,
+        }
+    else:
+        summary["crop_feasibility"] = {
+            "bbox": bbox.__dict__,
+            "bbox_fully_covered_by_lat_lon_bounds": None,
+            "blocker": "source lat/lon bounds not available without deeper coordinate/projection handling",
+        }
+    return summary
+
+
+def _summarize_ukv_times(file_inspections: dict[str, Any], requested_hours: list[int]) -> dict[str, Any]:
+    per_file = {field: info.get("time", {}) for field, info in file_inspections.items()}
+    available = sorted(
+        {
+            hour
+            for field_name, info in file_inspections.items()
+            for hour in (_hours_from_time_summary(info.get("time", {})) or _hours_from_field_name(field_name))
+        }
+    )
+    requested_available = all(hour in available for hour in requested_hours)
+    return {
+        "requested_forecast_hours": requested_hours,
+        "available_forecast_hours_from_files": available,
+        "missing_requested_hours": [hour for hour in requested_hours if hour not in available],
+        "requested_hours_available": requested_available,
+        "requested_hours_form_contiguous_sequence": requested_hours == list(range(min(requested_hours or [0]), max(requested_hours or [0]) + 1)),
+        "hourly_0_to_54_proven": all(hour in available for hour in range(0, 55)) if available else False,
+        "per_file": per_file,
+    }
+
+
+def _ukv_variable_mapping_candidates(file_inspections: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for field_name, info in file_inspections.items():
+        base_field = _ukv_base_field_name(field_name)
+        primary = info.get("primary_data_variable")
+        variables = info.get("variables", {})
+        attrs = variables.get(primary, {}) if primary else {}
+        spec = UKMO_UKV_REQUIRED_SOURCE_FIELDS.get(base_field, {})
+        result[field_name] = {
+            "field": base_field,
+            "source_variable": primary,
+            "units": attrs.get("units"),
+            "standard_name": attrs.get("standard_name"),
+            "long_name": attrs.get("long_name"),
+            "intended_grib_short_name": spec.get("intended_grib_short_name"),
+            "unit_conversion_required": _ukv_unit_conversion_note(field_name, attrs.get("units")),
+            "confidence": spec.get("confidence", "low"),
+        }
+    return result
+
+
+def _infer_ukv_wind_direction_convention(file_inspections: dict[str, Any]) -> dict[str, Any]:
+    info = next((value for key, value in file_inspections.items() if _ukv_base_field_name(key) == "wind_direction_10m"), {})
+    primary = info.get("primary_data_variable")
+    attrs = info.get("variables", {}).get(primary, {}) if primary else {}
+    text = " ".join(str(attrs.get(name) or "") for name in ("standard_name", "long_name", "units")).lower()
+    meteorological_from = "from_direction" in text or "direction from which" in text or "wind_from_direction" in text
+    return {
+        "source_variable": primary,
+        "units": attrs.get("units"),
+        "standard_name": attrs.get("standard_name"),
+        "long_name": attrs.get("long_name"),
+        "is_meteorological_from_direction": meteorological_from,
+        "planned_conversion_if_from": "u = -speed * sin(direction_radians); v = -speed * cos(direction_radians)",
+        "status": "usable" if meteorological_from else "ambiguous",
+    }
+
+
+def wind_speed_direction_to_uv(speed: Any, direction_degrees: Any, *, convention: str = "from") -> tuple[Any, Any]:
+    import numpy as np
+
+    if convention != "from":
+        raise ValidationError("only meteorological 'from' wind direction conversion is supported")
+    radians = np.deg2rad(direction_degrees)
+    u = -np.asarray(speed) * np.sin(radians)
+    v = -np.asarray(speed) * np.cos(radians)
+    return u, v
+
+
+def _ukv_wind_uv_sample_stats(downloaded: dict[str, dict[str, Any]], file_inspections: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        import numpy as np
+        import xarray as xr
+    except ImportError:
+        return None
+    speed_key = next((key for key in file_inspections if _ukv_base_field_name(key) == "wind_speed_10m"), None)
+    direction_key = next((key for key in file_inspections if _ukv_base_field_name(key) == "wind_direction_10m"), None)
+    if speed_key is None or direction_key is None:
+        return None
+    speed_info = file_inspections.get(speed_key)
+    direction_info = file_inspections.get(direction_key)
+    if not speed_info or not direction_info:
+        return None
+    crop = speed_info.get("bbox_index_bounds")
+    speed_var = speed_info.get("primary_data_variable")
+    direction_var = direction_info.get("primary_data_variable")
+    if not crop or not speed_var or not direction_var:
+        return None
+    with xr.open_dataset(downloaded[speed_key]["path"]) as speed_ds, xr.open_dataset(downloaded[direction_key]["path"]) as direction_ds:
+        speed = speed_ds[speed_var]
+        direction = direction_ds[direction_var]
+        indexer: dict[str, slice] = {}
+        for dim in speed.dims:
+            lower = dim.lower()
+            if lower in {"projection_x_coordinate", "x"}:
+                indexer[dim] = slice(crop["x_start"], crop["x_stop"] + 1)
+            elif lower in {"projection_y_coordinate", "y"}:
+                indexer[dim] = slice(crop["y_start"], crop["y_stop"] + 1)
+        speed_values = np.asarray(speed.isel(indexer).values, dtype=float)
+        direction_values = np.asarray(direction.isel(indexer).values, dtype=float)
+        u, v = wind_speed_direction_to_uv(speed_values, direction_values)
+        return {
+            "convention": "meteorological_from",
+            "forecast_hour": downloaded[speed_key].get("forecast_hour"),
+            "u": _array_stats(u),
+            "v": _array_stats(v),
+            "speed": _array_stats(speed_values),
+            "direction_degrees": _array_stats(direction_values),
+        }
+
+
+def _ukv_base_field_name(name: str) -> str:
+    return re.sub(r"_h\d{3}$", "", name)
+
+
+def _ukv_regrid_sample(
+    downloaded: dict[str, dict[str, Any]],
+    file_inspections: dict[str, Any],
+    bbox: BoundingBox,
+    spacing_deg: float,
+) -> dict[str, Any] | None:
+    try:
+        import numpy as np
+        import xarray as xr
+        from pyproj import CRS, Transformer
+    except ImportError:
+        return {"status": "blocked", "reason": "xarray, numpy, and pyproj are required for UKV regrid inspection"}
+
+    first_key = next(iter(file_inspections), None)
+    if first_key is None:
+        return None
+    grid_mapping = file_inspections[first_key].get("grid_mapping")
+    if not grid_mapping or not grid_mapping.get("attrs"):
+        return {"status": "blocked", "reason": "CF grid_mapping metadata was not available"}
+    grid = build_regular_grid(bbox, spacing_deg)
+    lon2d, lat2d = np.meshgrid(grid.longitudes, grid.latitudes)
+    transformer = Transformer.from_crs(CRS.from_epsg(4326), CRS.from_cf(grid_mapping["attrs"]), always_xy=True)
+    x_values, y_values = transformer.transform(lon2d, lat2d)
+    x_da = xr.DataArray(x_values, dims=("latitude", "longitude"))
+    y_da = xr.DataArray(y_values, dims=("latitude", "longitude"))
+    result: dict[str, Any] = {
+        "status": "ok",
+        "method": "xarray linear interpolation on projected x/y coordinates",
+        "forecast_hour": 0,
+        "output_grid": {
+            "nx": grid.nx,
+            "ny": grid.ny,
+            "west": float(grid.longitudes[0]),
+            "east": float(grid.longitudes[-1]),
+            "south": float(grid.latitudes[0]),
+            "north": float(grid.latitudes[-1]),
+            "spacing_deg": spacing_deg,
+        },
+        "fields": {},
+    }
+    regridded_values: dict[str, Any] = {}
+    for field_name in ("pressure_msl", "temperature_screen", "wind_speed_10m", "wind_direction_10m"):
+        item_key = next((key for key, info in downloaded.items() if info.get("field") == field_name and info.get("forecast_hour") == 0), None)
+        if item_key is None:
+            continue
+        info = file_inspections[item_key]
+        var_name = info.get("primary_data_variable")
+        if not var_name:
+            continue
+        with xr.open_dataset(downloaded[item_key]["path"]) as ds:
+            arr = ds[var_name]
+            try:
+                interp = arr.interp(
+                    projection_x_coordinate=x_da,
+                    projection_y_coordinate=y_da,
+                    method="linear",
+                )
+            except Exception as exc:
+                result["fields"][field_name] = {"status": "blocked", "reason": f"linear interpolation failed: {exc}"}
+                continue
+            values = np.asarray(interp.values, dtype=float)
+            regridded_values[field_name] = values
+            result["fields"][field_name] = {
+                "status": "ok",
+                "stats": _array_stats(values),
+                "missing_percent": _missing_percent(values),
+            }
+    if "wind_speed_10m" in regridded_values and "wind_direction_10m" in regridded_values:
+        u, v = wind_speed_direction_to_uv(regridded_values["wind_speed_10m"], regridded_values["wind_direction_10m"])
+        result["fields"]["wind_u_10m_candidate"] = {
+            "status": "ok",
+            "stats": _array_stats(u),
+            "missing_percent": _missing_percent(u),
+        }
+        result["fields"]["wind_v_10m_candidate"] = {
+            "status": "ok",
+            "stats": _array_stats(v),
+            "missing_percent": _missing_percent(v),
+        }
+    return result
+
+
+def _missing_percent(values: Any) -> float:
+    import numpy as np
+
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return 100.0
+    return float(100.0 * np.count_nonzero(~np.isfinite(arr)) / arr.size)
+
+
+def _array_stats(values: Any) -> dict[str, Any]:
+    import numpy as np
+
+    arr = np.asarray(values, dtype=float)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return {"finite_count": 0, "shape": [int(v) for v in arr.shape]}
+    return {
+        "finite_count": int(finite.size),
+        "min": float(np.min(finite)),
+        "max": float(np.max(finite)),
+        "mean": float(np.mean(finite)),
+        "shape": [int(v) for v in arr.shape],
+    }
+
+
+def _classify_ukv_grid(latlon: dict[str, Any], xy: dict[str, Any], grid_mapping: dict[str, Any] | None) -> str:
+    lat_shape = latlon.get("latitude_shape")
+    lon_shape = latlon.get("longitude_shape")
+    if lat_shape and lon_shape and len(lat_shape) == 1 and len(lon_shape) == 1:
+        return "regular_lat_lon_candidate"
+    if lat_shape and lon_shape and lat_shape == lon_shape and len(lat_shape) == 2:
+        return "projected_or_curvilinear_with_auxiliary_2d_lat_lon"
+    if xy and grid_mapping:
+        return "projected_xy_with_cf_grid_mapping"
+    if xy:
+        return "projected_xy_without_confirmed_grid_mapping"
+    return "unknown"
+
+
+def _can_build_pyproj_transform(grid_mapping: dict[str, Any] | None) -> bool:
+    if not grid_mapping or not grid_mapping.get("attrs"):
+        return False
+    try:
+        from pyproj import CRS
+        CRS.from_cf(grid_mapping["attrs"])
+    except ImportError:
+        return False
+    except Exception:
+        return False
+    return True
+
+
+def _ukv_unit_conversion_note(field_name: str, units: str | None) -> str:
+    normalized = (units or "").lower()
+    if field_name.startswith("wind") and ("m s-1" in normalized or "m/s" in normalized):
+        return "none for speed; direction conversion still required"
+    if "pressure" in field_name and normalized in {"pa", "pascal", "pascals"}:
+        return "none if writing GRIB pressure in Pa"
+    if "temperature" in field_name and normalized in {"k", "kelvin"}:
+        return "none if writing GRIB temperature in K"
+    if "degree" in normalized:
+        return "none for angular units; direction convention must be verified"
+    return "unknown; verify before enabling UKV GRIB output"
+
+
+def _finite_range(values: Any) -> tuple[float, float] | None:
+    import numpy as np
+
+    arr = np.asarray(values, dtype=float)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return None
+    return (float(np.min(finite)), float(np.max(finite)))
+
+
+def _is_monotonic(values: Any) -> bool | None:
+    import numpy as np
+
+    arr = np.asarray(values, dtype=float).ravel()
+    arr = arr[np.isfinite(arr)]
+    if arr.size < 2:
+        return None
+    diff = np.diff(arr)
+    return bool(np.all(diff >= 0) or np.all(diff <= 0))
+
+
+def _compact_values(values: Any, limit: int = 8) -> list[str]:
+    import numpy as np
+
+    arr = np.asarray(values).ravel()
+    if arr.size <= limit:
+        return [str(value) for value in arr]
+    head = [str(value) for value in arr[: limit // 2]]
+    tail = [str(value) for value in arr[-(limit // 2) :]]
+    return head + ["..."] + tail
+
+
+def _bbox_intersects_latlon_bounds(bbox: BoundingBox, bounds: dict[str, float]) -> bool:
+    return not (
+        bbox.east < bounds["west"]
+        or bbox.west > bounds["east"]
+        or bbox.north < bounds["south"]
+        or bbox.south > bounds["north"]
+    )
+
+
+def _hours_from_time_summary(time_summary: dict[str, Any]) -> list[int]:
+    hours: set[int] = set()
+    for info in time_summary.values():
+        units = str(info.get("units") or "").lower()
+        for text in info.get("values", []):
+            match = re.search(r"(?<!\d)(\d{1,3})(?:\s*)h", text, flags=re.IGNORECASE)
+            if match:
+                hours.add(int(match.group(1)))
+                continue
+            if units == "seconds":
+                try:
+                    seconds = float(text)
+                except ValueError:
+                    continue
+                if seconds % 3600 == 0:
+                    hours.add(int(seconds // 3600))
+    return sorted(hours)
+
+
+def _hours_from_field_name(field_name: str) -> list[int]:
+    match = re.search(r"_h(\d{3})$", field_name)
+    return [int(match.group(1))] if match else []
+
+
+def _projected_xy_latlon_bounds(xy: dict[str, Any], grid_mapping: dict[str, Any] | None) -> dict[str, float] | None:
+    if not xy or not grid_mapping or not grid_mapping.get("attrs"):
+        return None
+    try:
+        import numpy as np
+        from pyproj import CRS, Transformer
+
+        x_range = xy.get("x", {}).get("range")
+        y_range = xy.get("y", {}).get("range")
+        if not x_range or not y_range:
+            return None
+        crs = CRS.from_cf(grid_mapping["attrs"])
+        transformer = Transformer.from_crs(crs, CRS.from_epsg(4326), always_xy=True)
+        x_values = [float(x_range[0]), float(x_range[1]), float(x_range[1]), float(x_range[0])]
+        y_values = [float(y_range[0]), float(y_range[0]), float(y_range[1]), float(y_range[1])]
+        lon, lat = transformer.transform(x_values, y_values)
+        return {
+            "west": float(np.nanmin(lon)),
+            "south": float(np.nanmin(lat)),
+            "east": float(np.nanmax(lon)),
+            "north": float(np.nanmax(lat)),
+        }
+    except Exception:
+        return None
+
+
+def _projected_bbox_index_bounds(bbox: BoundingBox, xy: dict[str, Any], grid_mapping: dict[str, Any] | None) -> dict[str, int] | None:
+    if not xy or not grid_mapping or not grid_mapping.get("attrs"):
+        return None
+    try:
+        import numpy as np
+        from pyproj import CRS, Transformer
+
+        x_range = xy.get("x", {}).get("range")
+        y_range = xy.get("y", {}).get("range")
+        x_shape = xy.get("x", {}).get("shape")
+        y_shape = xy.get("y", {}).get("shape")
+        if not x_range or not y_range or not x_shape or not y_shape:
+            return None
+        crs = CRS.from_cf(grid_mapping["attrs"])
+        transformer = Transformer.from_crs(CRS.from_epsg(4326), crs, always_xy=True)
+        lon_values = [bbox.west, bbox.east, bbox.east, bbox.west]
+        lat_values = [bbox.south, bbox.south, bbox.north, bbox.north]
+        x_projected, y_projected = transformer.transform(lon_values, lat_values)
+        x0, x1 = float(x_range[0]), float(x_range[1])
+        y0, y1 = float(y_range[0]), float(y_range[1])
+        nx, ny = int(x_shape[0]), int(y_shape[0])
+        ix0 = int(np.floor((min(x_projected) - x0) / ((x1 - x0) / max(nx - 1, 1))))
+        ix1 = int(np.ceil((max(x_projected) - x0) / ((x1 - x0) / max(nx - 1, 1))))
+        iy0 = int(np.floor((min(y_projected) - y0) / ((y1 - y0) / max(ny - 1, 1))))
+        iy1 = int(np.ceil((max(y_projected) - y0) / ((y1 - y0) / max(ny - 1, 1))))
+        return {
+            "x_start": max(0, ix0),
+            "x_stop": min(nx - 1, ix1),
+            "y_start": max(0, iy0),
+            "y_stop": min(ny - 1, iy1),
+            "estimated_points": max(0, min(nx - 1, ix1) - max(0, ix0) + 1)
+            * max(0, min(ny - 1, iy1) - max(0, iy0) + 1),
+        }
+    except Exception:
+        return None
+
+
 def forecast_hour_sequence(hours: int, step_hours: int) -> list[int]:
     if hours < 0:
         raise ValidationError("--hours must be zero or greater")
@@ -976,8 +1828,8 @@ def build_gfs_wave_filter_url(cycle: GFSCycle, forecast_hour: int, bbox: Boundin
 
 def gfs_cycle_candidates(request: GFSWeatherRequest, *, now: datetime | None = None) -> list[GFSCycle]:
     if request.cycle != "auto":
-        if request.cycle not in {"00", "06", "12", "18"}:
-            raise ValidationError("--cycle must be auto, 00, 06, 12, or 18")
+        if request.cycle not in {"00", "03", "06", "09", "12", "15", "18", "21"}:
+            raise ValidationError("--cycle must be auto, 00, 03, 06, 09, 12, 15, 18, or 21")
         if not request.date:
             raise ValidationError("--date YYYYMMDD is required when --cycle is explicit")
         _validate_date(request.date)

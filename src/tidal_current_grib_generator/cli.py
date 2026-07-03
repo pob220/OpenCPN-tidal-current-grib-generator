@@ -47,6 +47,7 @@ from tidal_current_grib_generator.weather import (
     GFSWeatherRequest,
     UKMO_UKV_SOURCE_LABEL,
     UKMOUKVInspectRequest,
+    UKMOUKVNetCDFInspectRequest,
     UKMOUKVWeatherRequest,
     gfs_cycle_candidates,
     generate_gfs_weather_grib,
@@ -54,6 +55,7 @@ from tidal_current_grib_generator.weather import (
     generate_gfs_wave_grib,
     generate_ukmo_ukv_weather_grib,
     discover_ukmo_ukv_source,
+    inspect_ukmo_ukv_netcdf,
     inspect_ukmo_ukv_source,
     list_weather_providers,
 )
@@ -200,6 +202,21 @@ def build_parser() -> argparse.ArgumentParser:
     discover_ukv.add_argument("--json", action="store_true")
     discover_ukv.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     discover_ukv.set_defaults(func=cmd_discover_ukv_source)
+
+    inspect_ukv_netcdf = subparsers.add_parser("inspect-ukv-netcdf", help="Download and inspect minimal Met Office UKV NetCDF source files.")
+    inspect_ukv_netcdf.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"))
+    inspect_ukv_netcdf.add_argument("--date", help="UKV cycle date YYYYMMDD for explicit cycles.")
+    inspect_ukv_netcdf.add_argument("--cycle", default="auto", help="auto or explicit cycle 00, 03, 06, 09, 12, 15, 18, 21.")
+    inspect_ukv_netcdf.add_argument("--hours", type=int, required=True)
+    inspect_ukv_netcdf.add_argument("--step-hours", type=int, default=1)
+    inspect_ukv_netcdf.add_argument("--download-directory", type=Path, required=True)
+    inspect_ukv_netcdf.add_argument("--weather-grid-spacing-deg", type=float, default=0.025)
+    inspect_ukv_netcdf.add_argument("--max-keys", type=int, default=400)
+    inspect_ukv_netcdf.add_argument("--refresh", action="store_true")
+    inspect_ukv_netcdf.add_argument("--extract-sample", action="store_true")
+    inspect_ukv_netcdf.add_argument("--json", action="store_true")
+    inspect_ukv_netcdf.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    inspect_ukv_netcdf.set_defaults(func=cmd_inspect_ukv_netcdf)
 
     generate_weather = subparsers.add_parser("generate-weather", help="Download/generate a weather GRIB.")
     generate_weather.add_argument("--provider", choices=["gfs", "gfs_wave", "ukmo_ukv", "ecmwf_ifs_open", "dwd_icon_eu"], required=True)
@@ -1005,6 +1022,70 @@ def cmd_discover_ukv_source(args: argparse.Namespace) -> int:
         print("candidate_files:", flush=True)
         for item in discovery["candidate_files"][:50]:
             print(f"  {item['key']} ({item['size']} bytes)", flush=True)
+    return 0
+
+
+def cmd_inspect_ukv_netcdf(args: argparse.Namespace) -> int:
+    bbox = BoundingBox.from_values(args.bbox)
+    inspection = inspect_ukmo_ukv_netcdf(
+        UKMOUKVNetCDFInspectRequest(
+            bbox=bbox,
+            hours=args.hours,
+            step_hours=args.step_hours,
+            cycle=args.cycle,
+            date=args.date,
+            download_directory=args.download_directory,
+            weather_grid_spacing_deg=args.weather_grid_spacing_deg,
+            max_keys=args.max_keys,
+            refresh=args.refresh,
+            extract_sample=args.extract_sample,
+        )
+    )
+    if args.json:
+        print(json.dumps(inspection, indent=2, sort_keys=True))
+    else:
+        print(f"provider: {inspection['provider']}", flush=True)
+        print(f"source: {inspection['source']}", flush=True)
+        print(f"status: {inspection['status']}", flush=True)
+        print(f"implemented: {inspection['implemented']}", flush=True)
+        print(f"selected_cycle: {inspection['selected_cycle']}", flush=True)
+        print(f"download_directory: {inspection['download_directory']}", flush=True)
+        print("downloaded_files:", flush=True)
+        for field, info in inspection["downloaded_files"].items():
+            reused = "reused" if info["reused"] else "downloaded"
+            print(f"  {field}: {info['path']} ({info['size']} bytes, {reused})", flush=True)
+        print("files:", flush=True)
+        for field, info in inspection["files"].items():
+            print(f"  {field}:", flush=True)
+            print(f"    primary_data_variable: {info['primary_data_variable']}", flush=True)
+            print(f"    dimensions: {info['dimensions']}", flush=True)
+            print(f"    coordinate_variables: {info['coordinate_variables']}", flush=True)
+            print(f"    data_variables: {info['data_variables']}", flush=True)
+            print(f"    grid_type: {info['grid_type']}", flush=True)
+            print(f"    grid_mapping_name: {info['grid_mapping_name']}", flush=True)
+            print(f"    lat_lon: {info['lat_lon']}", flush=True)
+            print(f"    xy: {info['xy']}", flush=True)
+            print(f"    time: {info['time']}", flush=True)
+            print(f"    bbox_index_bounds: {info['bbox_index_bounds']}", flush=True)
+            print(f"    sample_stats: {info['sample_stats']}", flush=True)
+        print("coordinate_summary:", flush=True)
+        print(json.dumps(inspection["coordinate_summary"], indent=2, sort_keys=True), flush=True)
+        print("time_summary:", flush=True)
+        print(json.dumps(inspection["time_summary"], indent=2, sort_keys=True), flush=True)
+        print("variable_mappings:", flush=True)
+        print(json.dumps(inspection["variable_mappings"], indent=2, sort_keys=True), flush=True)
+        print("wind_direction_convention:", flush=True)
+        print(json.dumps(inspection["wind_direction_convention"], indent=2, sort_keys=True), flush=True)
+        if inspection.get("wind_uv_sample_stats"):
+            print("wind_uv_sample_stats:", flush=True)
+            print(json.dumps(inspection["wind_uv_sample_stats"], indent=2, sort_keys=True), flush=True)
+        if inspection.get("regrid_sample"):
+            print("regrid_sample:", flush=True)
+            print(json.dumps(inspection["regrid_sample"], indent=2, sort_keys=True), flush=True)
+        print("crop_feasibility:", flush=True)
+        print(json.dumps(inspection["crop_feasibility"], indent=2, sort_keys=True), flush=True)
+        print(f"generation_enabled: {inspection['generation_enabled']}", flush=True)
+        print(f"blocker: {inspection['blocker']}", flush=True)
     return 0
 
 
