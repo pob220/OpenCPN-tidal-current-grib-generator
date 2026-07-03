@@ -14,6 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
+from tidal_current_grib_generator.copernicus import CopernicusDownloadRequest, download_copernicus_subset
 from tidal_current_grib_generator.errors import MissingDependencyError, ValidationError
 from tidal_current_grib_generator.geo import BoundingBox, build_regular_grid
 from tidal_current_grib_generator.grib.validation import inspect_grib, scan_grib_messages
@@ -22,8 +23,18 @@ GFS_FILTER_ENDPOINT = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl"
 GFS_WAVE_FILTER_ENDPOINT = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfswave.pl"
 GFS_SOURCE_LABEL = "NOAA GFS 0.25° forecast via NOMADS"
 GFS_WAVE_SOURCE_LABEL = "NOAA GFS Wave forecast via NOMADS"
+COPERNICUS_GLOBAL_WAVE_SOURCE_LABEL = "Copernicus Marine Global Waves forecast"
 ECMWF_SOURCE_LABEL = "ECMWF IFS Open Data forecast"
 UKMO_UKV_SOURCE_LABEL = "Met Office UKV 2 km forecast"
+COPERNICUS_GLOBAL_WAVE_DATASET_ID = "cmems_mod_glo_wav_anfc_0.083deg_PT3H-i"
+COPERNICUS_GLOBAL_WAVE_PRODUCT_ID = "GLOBAL_ANALYSISFORECAST_WAV_001_027"
+COPERNICUS_GLOBAL_WAVE_VARIABLES = ("VHM0", "VTPK", "VMDR")
+COPERNICUS_GLOBAL_WAVE_MIN_VALID_CELLS = 1
+COPERNICUS_GLOBAL_WAVE_ALIASES = {
+    "swh": ("VHM0", "significant_wave_height", "sea_surface_wave_significant_height"),
+    "perpw": ("VTPK", "peak_wave_period", "sea_surface_wave_peak_period"),
+    "dirpw": ("VMDR", "mean_wave_direction", "sea_surface_wave_from_direction"),
+}
 UKMO_UKV_DOMAIN = BoundingBox(west=-12.0, south=48.0, east=4.0, north=62.0)
 UKMO_UKV_BUCKET = "met-office-atmospheric-model-data"
 UKMO_UKV_REGION = "eu-west-2"
@@ -234,6 +245,22 @@ class GFSWaveRequest:
 
 
 @dataclass(frozen=True)
+class CopernicusGlobalWaveRequest:
+    bbox: BoundingBox
+    output: Path
+    start: datetime
+    hours: int
+    step_hours: int = 3
+    username: str = ""
+    password: str = ""
+    download_directory: Path | None = None
+    overwrite: bool = False
+    dry_run: bool = False
+    timeout_seconds: float = 180.0
+    grid_spacing_deg: float | None = None
+
+
+@dataclass(frozen=True)
 class WeatherGenerateResult:
     provider: str
     source: str
@@ -298,6 +325,16 @@ class UKVRegriddedDataset:
     missing_percent: dict[tuple[int, str], float]
 
 
+@dataclass(frozen=True)
+class WaveRegriddedDataset:
+    grid: Any
+    forecast_hours: list[int]
+    fields: dict[tuple[int, str], Any]
+    variable_mapping: dict[str, str]
+    missing_percent: dict[tuple[int, str], float]
+    valid_cell_count: dict[tuple[int, str], int]
+
+
 def list_weather_providers() -> list[WeatherProvider]:
     return [
         WeatherProvider(
@@ -315,6 +352,17 @@ def list_weather_providers() -> list[WeatherProvider]:
             format="GRIB2",
             account="free/no account",
             description="GFS Wave global 0.25 degree GRIB2 subsets from the official NOMADS wave filter.",
+        ),
+        WeatherProvider(
+            id="copernicus_global_waves",
+            label="Copernicus Marine Global Waves forecast",
+            source="Copernicus Marine",
+            format="NetCDF source, converted to OpenCPN GRIB2",
+            account="Copernicus Marine account required",
+            description=(
+                "Global Ocean Waves Analysis and Forecast product "
+                f"{COPERNICUS_GLOBAL_WAVE_PRODUCT_ID}; 3-hourly wave height, primary/peak period, and wave direction."
+            ),
         ),
         WeatherProvider(
             id="ukmo_ukv",
@@ -565,6 +613,130 @@ def generate_gfs_wave_grib(
         inspection=inspection,
         urls=urls,
         variables_levels=GFS_WAVE_VARIABLES_LEVELS,
+    )
+
+
+def generate_copernicus_global_wave_grib(
+    request: CopernicusGlobalWaveRequest,
+    *,
+    progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+) -> WeatherGenerateResult:
+    request.bbox.validate()
+    _validate_copernicus_global_wave_request(request)
+    output = request.output.expanduser()
+    if output.exists() and output.is_dir():
+        raise ValidationError("--output must be a file path, not a directory")
+    if output.exists() and not request.overwrite:
+        raise ValidationError(f"output already exists: {output}; use --overwrite to replace it")
+
+    forecast_hours = forecast_hour_sequence(request.hours, request.step_hours)
+    download_dir = (request.download_directory or output.parent / "copernicus_wave_downloads").expanduser()
+    start = request.start.astimezone(timezone.utc)
+    end = start + timedelta(hours=request.hours)
+    download_filename = f"copernicus_global_waves_{start:%Y%m%dT%H%MZ}_{request.hours}h.nc"
+
+    if request.dry_run:
+        return WeatherGenerateResult(
+            provider="copernicus_global_waves",
+            source=COPERNICUS_GLOBAL_WAVE_SOURCE_LABEL,
+            model=COPERNICUS_GLOBAL_WAVE_DATASET_ID,
+            cycle=WeatherCycle(start.strftime("%Y%m%d"), f"{start.hour:02d}"),
+            bbox=request.bbox,
+            forecast_hours=forecast_hours,
+            output=output,
+            byte_count=0,
+            message_count=0,
+            inspection={"stream_valid": False, "message_count": 0, "dry_run": True},
+            urls=[],
+            variables_levels={
+                "product": COPERNICUS_GLOBAL_WAVE_PRODUCT_ID,
+                "dataset_id": COPERNICUS_GLOBAL_WAVE_DATASET_ID,
+                "variables": list(COPERNICUS_GLOBAL_WAVE_VARIABLES),
+            },
+        )
+
+    _progress(
+        progress_callback,
+        "downloading Copernicus Global Waves NetCDF",
+        {
+            "dataset_id": COPERNICUS_GLOBAL_WAVE_DATASET_ID,
+            "variables": list(COPERNICUS_GLOBAL_WAVE_VARIABLES),
+            "bbox": request.bbox.__dict__,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+        },
+    )
+    download = download_copernicus_subset(
+        CopernicusDownloadRequest(
+            bbox=request.bbox,
+            start=start,
+            end=end,
+            output_directory=download_dir,
+            output_filename=download_filename,
+            username=request.username,
+            password=request.password,
+            dataset_id=COPERNICUS_GLOBAL_WAVE_DATASET_ID,
+            variables=COPERNICUS_GLOBAL_WAVE_VARIABLES,
+            overwrite=True,
+            dry_run=False,
+        ),
+        progress_callback=progress_callback,
+    )
+    _progress(progress_callback, "downloaded Copernicus Global Waves NetCDF", {"path": str(download.path)})
+
+    dataset = _load_copernicus_wave_dataset(
+        download.path,
+        request.bbox,
+        start,
+        forecast_hours,
+        request.grid_spacing_deg,
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix=output.name + ".", suffix=".tmp", dir=output.parent, delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        _write_wave_grib2(dataset, start, tmp_path, progress_callback=progress_callback)
+        scan = scan_grib_messages(tmp_path)
+        expected_messages = len(forecast_hours) * 3
+        if scan.message_count != expected_messages:
+            raise ValidationError(f"Copernicus wave GRIB message count mismatch: expected {expected_messages}, got {scan.message_count}")
+        inspection = inspect_grib(tmp_path)
+        if not inspection.get("stream_valid"):
+            raise ValidationError("Copernicus wave GRIB stream validation failed")
+        inspection["missing_percent"] = {
+            f"f{hour:03d}_{short_name}": percent
+            for (hour, short_name), percent in dataset.missing_percent.items()
+        }
+        inspection["valid_cell_count"] = {
+            f"f{hour:03d}_{short_name}": count
+            for (hour, short_name), count in dataset.valid_cell_count.items()
+        }
+        tmp_path.replace(output)
+        tmp_path = None
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink()
+
+    return WeatherGenerateResult(
+        provider="copernicus_global_waves",
+        source=COPERNICUS_GLOBAL_WAVE_SOURCE_LABEL,
+        model=COPERNICUS_GLOBAL_WAVE_DATASET_ID,
+        cycle=WeatherCycle(start.strftime("%Y%m%d"), f"{start.hour:02d}"),
+        bbox=request.bbox,
+        forecast_hours=forecast_hours,
+        output=output,
+        byte_count=scan.byte_count,
+        message_count=scan.message_count,
+        inspection=inspection,
+        urls=[str(download.path)],
+        variables_levels={
+            "product": COPERNICUS_GLOBAL_WAVE_PRODUCT_ID,
+            "dataset_id": COPERNICUS_GLOBAL_WAVE_DATASET_ID,
+            "variables": list(COPERNICUS_GLOBAL_WAVE_VARIABLES),
+            "output_short_names": ["swh", "perpw", "dirpw"],
+            "missing_values": "GRIB2 bitmap/missingValue for masked or NaN land cells",
+        },
     )
 
 
@@ -2073,6 +2245,184 @@ def _read_ukv_grib_fields(path: Path) -> dict[str, Any]:
     return {"fields": fields, "reference_time": reference_time, "grid": grid}
 
 
+def _load_copernicus_wave_dataset(
+    path: Path,
+    bbox: BoundingBox,
+    start: datetime,
+    forecast_hours: list[int],
+    grid_spacing_deg: float | None,
+) -> WaveRegriddedDataset:
+    try:
+        import numpy as np
+        import xarray as xr
+    except ImportError as exc:
+        raise MissingDependencyError(
+            "Copernicus wave NetCDF conversion requires numpy and xarray; install the netcdf/weather extras."
+        ) from exc
+
+    with xr.open_dataset(path) as ds:
+        lat_name = _find_coord_name(ds, ("latitude", "lat"))
+        lon_name = _find_coord_name(ds, ("longitude", "lon"))
+        time_name = _find_coord_name(ds, ("time", "valid_time"))
+        if lat_name is None or lon_name is None or time_name is None:
+            raise ValidationError("Copernicus wave NetCDF must contain latitude, longitude, and time coordinates")
+        mapping = {
+            short_name: _find_data_variable(ds, aliases)
+            for short_name, aliases in COPERNICUS_GLOBAL_WAVE_ALIASES.items()
+        }
+        missing = [short_name for short_name, var_name in mapping.items() if var_name is None]
+        if missing:
+            raise ValidationError(
+                "Copernicus wave NetCDF is missing required variables for "
+                + ", ".join(missing)
+                + f"; available variables: {', '.join(ds.data_vars)}"
+            )
+        spacing = grid_spacing_deg or _infer_regular_coord_spacing(ds[lon_name].values, default=0.0833333)
+        grid = build_regular_grid(bbox, spacing)
+        fields: dict[tuple[int, str], Any] = {}
+        missing_percent: dict[tuple[int, str], float] = {}
+        valid_cell_count: dict[tuple[int, str], int] = {}
+        for hour in forecast_hours:
+            target = np.datetime64((start + timedelta(hours=hour)).replace(tzinfo=None))
+            for short_name, var_name in mapping.items():
+                assert var_name is not None
+                try:
+                    selected = ds[var_name].sel({time_name: target})
+                except Exception as exc:
+                    raise ValidationError(f"Copernicus wave source is missing forecast hour f{hour:03d} at {target}") from exc
+                selected = _select_first_non_horizontal_dims(selected, horizontal_dims={lat_name, lon_name})
+                interp = selected.interp({lat_name: grid.latitudes, lon_name: grid.longitudes}, method="linear")
+                values = np.asarray(interp.values, dtype=float)
+                if values.shape != grid.shape:
+                    raise ValidationError(f"Copernicus wave field {short_name} f{hour:03d} has shape {values.shape}, expected {grid.shape}")
+                values = _convert_wave_units(values, str(ds[var_name].attrs.get("units", "")), short_name)
+                miss = _missing_percent(values)
+                valid = _valid_cell_count(values)
+                if valid < COPERNICUS_GLOBAL_WAVE_MIN_VALID_CELLS:
+                    raise ValidationError(
+                        f"Copernicus wave field {short_name} f{hour:03d} has no valid wave coverage "
+                        f"inside requested bbox; missing cells: {miss:.2f}%"
+                    )
+                fields[(hour, short_name)] = values
+                missing_percent[(hour, short_name)] = miss
+                valid_cell_count[(hour, short_name)] = valid
+        return WaveRegriddedDataset(
+            grid=grid,
+            forecast_hours=forecast_hours,
+            fields=fields,
+            variable_mapping={short_name: str(var_name) for short_name, var_name in mapping.items() if var_name is not None},
+            missing_percent=missing_percent,
+            valid_cell_count=valid_cell_count,
+        )
+
+
+def _write_wave_grib2(
+    dataset: WaveRegriddedDataset,
+    reference: datetime,
+    output: Path,
+    *,
+    progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+) -> None:
+    try:
+        import eccodes
+    except ImportError as exc:
+        raise MissingDependencyError(
+            "Writing wave GRIB requires ECMWF ecCodes Python bindings. "
+            "Install system ecCodes plus `tidal-current-grib-generator[grib]`."
+        ) from exc
+
+    message_count = 0
+    with output.open("wb") as handle:
+        for hour in dataset.forecast_hours:
+            for short_name in ("swh", "perpw", "dirpw"):
+                values = dataset.fields[(hour, short_name)]
+                gid = _create_ukv_grib2_message(eccodes, dataset.grid, reference, hour, short_name, values)
+                try:
+                    eccodes.codes_write(gid, handle)
+                finally:
+                    eccodes.codes_release(gid)
+                message_count += 1
+            _progress(
+                progress_callback,
+                "wrote wave forecast hour",
+                {
+                    "hour": hour,
+                    "messages": message_count,
+                    "missing_percent": {
+                        short_name: dataset.missing_percent.get((hour, short_name), 0.0)
+                        for short_name in ("swh", "perpw", "dirpw")
+                    },
+                    "valid_cell_count": {
+                        short_name: dataset.valid_cell_count.get((hour, short_name), 0)
+                        for short_name in ("swh", "perpw", "dirpw")
+                    },
+                    "missing_encoding": "GRIB2 bitmap",
+                },
+            )
+
+
+def _find_coord_name(ds: Any, candidates: tuple[str, ...]) -> str | None:
+    lower = {name.lower(): name for name in list(ds.coords) + list(ds.variables)}
+    for candidate in candidates:
+        if candidate.lower() in lower:
+            return lower[candidate.lower()]
+    return None
+
+
+def _find_data_variable(ds: Any, aliases: tuple[str, ...]) -> str | None:
+    lower = {name.lower(): name for name in ds.data_vars}
+    for alias in aliases:
+        if alias.lower() in lower:
+            return lower[alias.lower()]
+    for name, data_array in ds.data_vars.items():
+        attrs = " ".join(str(data_array.attrs.get(key, "")) for key in ("standard_name", "long_name")).lower()
+        if any(alias.lower() in attrs for alias in aliases):
+            return str(name)
+    return None
+
+
+def _select_first_non_horizontal_dims(data_array: Any, *, horizontal_dims: set[str]) -> Any:
+    indexers = {
+        dim: 0
+        for dim in data_array.dims
+        if dim not in horizontal_dims and dim not in {"time", "valid_time"}
+    }
+    return data_array.isel(indexers) if indexers else data_array
+
+
+def _infer_regular_coord_spacing(values: Any, *, default: float) -> float:
+    import numpy as np
+
+    values = np.asarray(values, dtype=float)
+    if values.size < 2:
+        return default
+    diffs = np.diff(np.sort(values))
+    finite = diffs[np.isfinite(diffs) & (np.abs(diffs) > 0)]
+    if finite.size == 0:
+        return default
+    return float(np.median(np.abs(finite)))
+
+
+def _convert_wave_units(values: Any, units: str, short_name: str) -> Any:
+    units_normalized = units.strip().lower().replace(" ", "")
+    if not units_normalized:
+        return values
+    if short_name == "swh":
+        if units_normalized in {"m", "meter", "metre", "meters", "metres"}:
+            return values
+    if short_name == "perpw":
+        if units_normalized in {"s", "sec", "second", "seconds"}:
+            return values
+    if short_name == "dirpw":
+        if units_normalized in {"degree", "degrees", "degrees_true", "deg", "1"}:
+            return values
+        if units_normalized in {"radian", "radians", "rad"}:
+            import numpy as np
+
+            return np.degrees(values)
+    raise ValidationError(f"unsupported Copernicus wave units for {short_name}: {units!r}")
+
+
 def _normalize_longitude_180(value: float) -> float:
     normalized = ((value + 180.0) % 360.0) - 180.0
     return 180.0 if normalized == -180.0 and value > 0 else normalized
@@ -2151,6 +2501,13 @@ def _missing_percent(values: Any) -> float:
     if arr.size == 0:
         return 100.0
     return float(100.0 * np.count_nonzero(~np.isfinite(arr)) / arr.size)
+
+
+def _valid_cell_count(values: Any) -> int:
+    import numpy as np
+
+    arr = np.asarray(values, dtype=float)
+    return int(np.count_nonzero(np.isfinite(arr)))
 
 
 def _array_stats(values: Any) -> dict[str, Any]:
@@ -2541,6 +2898,20 @@ def _validate_gfs_request(request: GFSWeatherRequest) -> None:
 def _validate_gfs_wave_request(request: GFSWaveRequest) -> None:
     if request.step_hours not in {1, 3, 6, 12}:
         raise ValidationError("--step-hours must be one of 1, 3, 6, or 12 for GFS Wave")
+    forecast_hour_sequence(request.hours, request.step_hours)
+
+
+def _validate_copernicus_global_wave_request(request: CopernicusGlobalWaveRequest) -> None:
+    if not request.username:
+        raise ValidationError("Copernicus username is required for Copernicus Global Waves")
+    if not request.password:
+        raise ValidationError("Copernicus password is required for Copernicus Global Waves")
+    if request.step_hours != 3:
+        raise ValidationError("Copernicus Global Waves currently supports 3-hour wave steps")
+    if request.hours > 240:
+        raise ValidationError("Copernicus Global Waves forecast requests are limited to 240 hours")
+    if request.grid_spacing_deg is not None and request.grid_spacing_deg <= 0:
+        raise ValidationError("--weather-grid-spacing-deg must be greater than zero")
     forecast_hour_sequence(request.hours, request.step_hours)
 
 

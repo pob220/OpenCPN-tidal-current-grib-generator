@@ -70,6 +70,8 @@ private:
   wxChoice* m_weatherPreset;
   wxStaticText* m_wavesLabel;
   wxCheckBox* m_includeWaves;
+  wxStaticText* m_waveProviderLabel;
+  wxChoice* m_waveProvider;
   wxStaticText* m_existingWeatherFileLabel;
   wxFilePickerCtrl* m_existingWeatherFile;
   wxCheckBox* m_generateCurrents;

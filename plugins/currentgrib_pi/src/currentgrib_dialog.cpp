@@ -255,8 +255,13 @@ CurrentGribDialog::CurrentGribDialog(wxWindow* parent)
                                  WXSIZEOF(weatherPresets), weatherPresets);
   m_weatherPreset->SetSelection(1);
   m_weatherPreset->SetToolTip("Minimal: wind only. Routing: wind, pressure, and air temperature. Marine: routing fields plus gusts, precipitation, cloud cover, and optional waves.");
-  m_includeWaves = new wxCheckBox(scrolled, wxID_ANY, "Include NOAA GFS Wave fields");
-  m_includeWaves->SetToolTip("Adds significant wave height, primary wave period, and primary wave direction from NOAA GFS Wave. Available only with NOAA GFS weather.");
+  m_includeWaves = new wxCheckBox(scrolled, wxID_ANY, "Include wave fields");
+  m_includeWaves->SetToolTip("Adds significant wave height, primary wave period, and primary wave direction. NOAA GFS Wave requires NOAA GFS weather; Copernicus Global Waves requires a Copernicus account.");
+  wxString waveProviders[] = {"NOAA GFS Wave", "Copernicus Marine Global Waves"};
+  m_waveProvider = new wxChoice(scrolled, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                                WXSIZEOF(waveProviders), waveProviders);
+  m_waveProvider->SetSelection(0);
+  m_waveProvider->SetToolTip("NOAA GFS Wave requires no account. Copernicus Global Waves requires Copernicus Marine credentials and uses 3-hourly global wave fields.");
   m_existingWeatherFile = new wxFilePickerCtrl(scrolled, wxID_ANY, "", "Select weather GRIB", "*.grb;*.grb2");
 
   m_generateCurrents = new wxCheckBox(scrolled, wxID_ANY, "Generate/include currents");
@@ -334,6 +339,7 @@ CurrentGribDialog::CurrentGribDialog(wxWindow* parent)
   m_wavesLabel = new wxStaticText(scrolled, wxID_ANY, "Waves");
   grid->Add(m_wavesLabel, 0, wxALIGN_CENTER_VERTICAL);
   grid->Add(m_includeWaves, 0);
+  m_waveProviderLabel = addRow("Wave provider", m_waveProvider);
   m_existingWeatherFileLabel = addRow("Existing weather GRIB", m_existingWeatherFile);
   grid->Add(new wxStaticText(scrolled, wxID_ANY, "Currents"), 0, wxALIGN_CENTER_VERTICAL);
   grid->Add(m_generateCurrents, 0);
@@ -404,6 +410,7 @@ CurrentGribDialog::CurrentGribDialog(wxWindow* parent)
   m_mode->Bind(wxEVT_CHOICE, &CurrentGribDialog::OnModeChanged, this);
   m_weatherProvider->Bind(wxEVT_CHOICE, &CurrentGribDialog::OnProviderChanged, this);
   m_weatherPreset->Bind(wxEVT_CHOICE, &CurrentGribDialog::OnProviderChanged, this);
+  m_waveProvider->Bind(wxEVT_CHOICE, &CurrentGribDialog::OnProviderChanged, this);
   m_currentSource->Bind(wxEVT_CHOICE, &CurrentGribDialog::OnProviderChanged, this);
   m_generateWeather->Bind(wxEVT_CHECKBOX, &CurrentGribDialog::OnProviderChanged, this);
   m_generateCurrents->Bind(wxEVT_CHECKBOX, &CurrentGribDialog::OnProviderChanged, this);
@@ -526,9 +533,11 @@ void CurrentGribDialog::OnGenerate(wxCommandEvent&) {
     wxMessageBox(message, "Missing TPXO model", wxOK | wxICON_WARNING, this);
     return;
   }
-  bool copernicusForecast = m_generateCurrents->GetValue() &&
+  bool copernicusWaves = m_generateWeather->GetValue() && m_includeWaves->GetValue() &&
+      m_waveProvider->GetStringSelection().Contains("Copernicus");
+  bool copernicusForecast = copernicusWaves || (m_generateCurrents->GetValue() &&
       (currentSource.Contains("Copernicus") ||
-       (currentSource.Contains("Auto") && !AutoWouldUseMarineIe()));
+       (currentSource.Contains("Auto") && !AutoWouldUseMarineIe())));
   if (copernicusForecast && (m_username->GetValue().empty() || m_password->GetValue().empty())) {
     wxString message = "Enter your Copernicus Marine username and password for this operation. The password is held in memory only and is not passed on the command line.";
     AppendLog(message);
@@ -735,12 +744,14 @@ void CurrentGribDialog::UpdateProviderUi() {
   bool currentTpxoCache = currentsEnabled && m_currentSource->GetStringSelection().Contains("TPXO cache");
   bool currentTpxoDirect = currentsEnabled && m_currentSource->GetStringSelection().Contains("TPXO direct");
   bool currentMarine = currentsEnabled && m_currentSource->GetStringSelection().Contains("Marine.ie");
-  bool currentCopernicus = currentsEnabled &&
-      (m_currentSource->GetStringSelection().Contains("Copernicus") ||
-       (m_currentSource->GetStringSelection().Contains("Auto") && !AutoWouldUseMarineIe()));
   bool weatherGfs = weatherEnabled && m_weatherProvider->GetStringSelection().Contains("GFS");
   bool weatherUkv = weatherEnabled && m_weatherProvider->GetStringSelection().Contains("Met Office UKV");
   bool weatherGenerated = weatherEnabled && !weatherExisting;
+  bool waveEnabled = weatherGenerated && m_includeWaves->GetValue();
+  bool waveCopernicus = waveEnabled && m_waveProvider->GetStringSelection().Contains("Copernicus");
+  bool currentCopernicus = waveCopernicus || (currentsEnabled &&
+      (m_currentSource->GetStringSelection().Contains("Copernicus") ||
+       (m_currentSource->GetStringSelection().Contains("Auto") && !AutoWouldUseMarineIe())));
   bool showTpxoModel = currentTpxoDirect || currentTpxoCache;
 
   auto showPair = [](wxWindow* label, wxWindow* control, bool show) {
@@ -751,13 +762,18 @@ void CurrentGribDialog::UpdateProviderUi() {
   m_provider->Enable(false);
   m_weatherProvider->Enable(m_generateWeather->GetValue());
   showPair(m_weatherPresetLabel, m_weatherPreset, weatherGenerated);
-  showPair(m_wavesLabel, m_includeWaves, weatherGfs);
+  showPair(m_wavesLabel, m_includeWaves, weatherGenerated);
+  showPair(m_waveProviderLabel, m_waveProvider, waveEnabled);
   showPair(m_existingWeatherFileLabel, m_existingWeatherFile, weatherExisting);
   m_weatherPreset->Enable(weatherGenerated);
-  m_includeWaves->Enable(weatherGfs);
-  if (!weatherGfs) {
+  m_includeWaves->Enable(weatherGenerated);
+  if (!weatherGenerated) {
     m_includeWaves->SetValue(false);
   }
+  if (!weatherGfs && m_waveProvider->GetStringSelection().Contains("NOAA")) {
+    m_waveProvider->SetSelection(1);
+  }
+  m_waveProvider->Enable(waveEnabled);
   m_existingWeatherFile->Enable(weatherExisting);
   m_currentSource->Enable(m_generateCurrents->GetValue());
   showPair(m_existingCurrentFileLabel, m_existingCurrentFile, currentExisting);
@@ -793,11 +809,21 @@ void CurrentGribDialog::UpdateProviderUi() {
     if (m_weatherPreset->GetStringSelection().Contains("Marine")) {
       note += "\nUKV marine extras are not implemented yet; routing fields will be generated.";
     }
+    if (waveCopernicus) {
+      note += "\nWave source: Copernicus Marine Global Waves forecast. Account required; global 3-hourly wave fields.";
+    }
     m_providerNote->SetLabel(note);
   } else if (weatherEnabled && m_weatherProvider->GetStringSelection().Contains("ECMWF")) {
-    m_providerNote->SetLabel("Source: ECMWF IFS Open Data forecast. Warning: this provider is not spatially cropped yet, so files may be large.");
+    wxString note = "Source: ECMWF IFS Open Data forecast. Warning: this provider is not spatially cropped yet, so files may be large.";
+    if (waveCopernicus) {
+      note += "\nWave source: Copernicus Marine Global Waves forecast. Account required; global 3-hourly wave fields.";
+    }
+    m_providerNote->SetLabel(note);
   } else if (weatherGfs) {
-    wxString note = "Source: NOAA GFS forecast via NOMADS. Bbox-subset weather is compact; optional GFS Wave adds significant wave height, primary wave period, and primary wave direction.";
+    wxString note = "Source: NOAA GFS forecast via NOMADS. Bbox-subset weather is compact; optional wave fields add significant wave height, primary wave period, and primary wave direction.";
+    if (waveCopernicus) {
+      note += "\nWave source: Copernicus Marine Global Waves forecast. Account required; global 3-hourly wave fields.";
+    }
     if (m_includeWaves->GetValue() && m_stepHours->GetValue() != 3) {
       note += wxString::Format("\nWave fields are included every 3 hours; wind/weather and currents remain every %d hour%s.",
                                m_stepHours->GetValue(), m_stepHours->GetValue() == 1 ? "" : "s");
@@ -1165,8 +1191,10 @@ wxString CurrentGribDialog::BuildGenerateCommand() const {
   if (weatherProvider == "existing-file") {
     command += " --weather-file " + ShellQuote(m_existingWeatherFile->GetPath());
   }
-  if (m_includeWaves->GetValue() && weatherProvider == "gfs") {
-    command += " --include-waves --wave-step-hours 3";
+  if (m_includeWaves->GetValue() && weatherProvider != "none" && weatherProvider != "existing-file") {
+    wxString waveProvider = m_waveProvider->GetStringSelection().Contains("Copernicus") ?
+        "copernicus_global_waves" : "gfs_wave";
+    command += " --include-waves --wave-provider " + waveProvider + " --wave-step-hours 3";
   }
   if (currentSource == "existing-file") {
     command += " --current-file " + ShellQuote(m_existingCurrentFile->GetPath());
@@ -1318,7 +1346,9 @@ wxString CurrentGribDialog::DefaultOutputFilenameForSelection() const {
     else if (weatherProvider.Contains("ECMWF")) prefix += "_ecmwf";
     else if (weatherProvider.Contains("Existing")) prefix += "_existing_weather";
     if (ukvMixedCadence) prefix += "_mixed";
-    if (m_includeWaves->GetValue() && weatherProvider.Contains("GFS")) prefix += "_wave";
+    if (m_includeWaves->GetValue()) {
+      prefix += m_waveProvider->GetStringSelection().Contains("Copernicus") ? "_copernicus_waves" : "_wave";
+    }
     if (currentSource.Contains("TPXO cache")) prefix += "_tpxo_cache";
     else if (currentSource.Contains("TPXO direct")) prefix += "_tpxo";
     else if (currentSource.Contains("Marine.ie")) prefix += "_marine_ie";
@@ -1335,7 +1365,9 @@ wxString CurrentGribDialog::DefaultOutputFilenameForSelection() const {
     else prefix += "_existing";
     if (ukvMixedCadence) prefix += "_mixed";
     if (m_weatherPreset->GetStringSelection().Contains("Marine")) prefix += "_marine";
-    if (m_includeWaves->GetValue() && weatherProvider.Contains("GFS")) prefix += "_wave";
+    if (m_includeWaves->GetValue()) {
+      prefix += m_waveProvider->GetStringSelection().Contains("Copernicus") ? "_copernicus_waves" : "_wave";
+    }
     if (looksIrishSea) prefix += "_irish_sea";
   } else if (currentOn) {
     prefix = "current";

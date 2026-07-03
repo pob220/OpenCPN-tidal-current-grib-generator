@@ -1,15 +1,18 @@
 from datetime import datetime, timezone
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from tidal_current_grib_generator.cli import main
 from tidal_current_grib_generator.errors import ValidationError
 from tidal_current_grib_generator.grib.merge import merge_grib_files
+from tidal_current_grib_generator.grib.validation import inspect_grib
 from tidal_current_grib_generator.geo import BoundingBox
 from tidal_current_grib_generator.weather import (
     ECMWFWeatherRequest,
+    CopernicusGlobalWaveRequest,
     GFSCycle,
     GFSWaveRequest,
     GFSWeatherRequest,
@@ -19,11 +22,14 @@ from tidal_current_grib_generator.weather import (
     WeatherGenerateResult,
     build_gfs_filter_url,
     build_gfs_wave_filter_url,
+    COPERNICUS_GLOBAL_WAVE_DATASET_ID,
+    COPERNICUS_GLOBAL_WAVE_VARIABLES,
     discover_ukmo_ukv_source,
     forecast_hour_sequence,
     generate_gfs_wave_grib,
     generate_ecmwf_weather_grib,
     generate_gfs_weather_grib,
+    generate_copernicus_global_wave_grib,
     generate_ukmo_ukv_weather_grib,
     gfs_variables_for_preset,
     gfs_cycle_candidates,
@@ -50,7 +56,7 @@ def test_weather_provider_registry_includes_gfs():
     providers = list_weather_providers()
 
     by_id = {provider.id: provider for provider in providers}
-    assert {"gfs", "ukmo_ukv", "ecmwf_ifs_open", "dwd_icon_eu"} <= set(by_id)
+    assert {"gfs", "gfs_wave", "copernicus_global_waves", "ukmo_ukv", "ecmwf_ifs_open", "dwd_icon_eu"} <= set(by_id)
     assert by_id["gfs"].source == "NOAA NOMADS"
     assert by_id["gfs"].format == "GRIB2"
     assert by_id["gfs"].account == "free/no account"
@@ -58,6 +64,8 @@ def test_weather_provider_registry_includes_gfs():
     assert by_id["ecmwf_ifs_open"].implemented is True
     assert by_id["ukmo_ukv"].source == "Met Office AWS/Open Data"
     assert by_id["ukmo_ukv"].implemented is True
+    assert by_id["copernicus_global_waves"].source == "Copernicus Marine"
+    assert by_id["copernicus_global_waves"].account == "Copernicus Marine account required"
     assert by_id["dwd_icon_eu"].implemented is False
 
 
@@ -231,6 +239,36 @@ def test_generate_gfs_wave_appends_grib_segments_atomically(monkeypatch, tmp_pat
     assert result.provider == "gfs_wave"
     assert len(calls) == 3
     assert all("filter_gfswave.pl" in call for call in calls)
+
+
+def test_copernicus_global_wave_request_requires_credentials(tmp_path: Path):
+    with pytest.raises(ValidationError, match="Copernicus username is required"):
+        generate_copernicus_global_wave_grib(
+            CopernicusGlobalWaveRequest(
+                bbox=BoundingBox(-8.5, 50.5, -2.5, 56.5),
+                output=tmp_path / "waves.grb2",
+                start=datetime(2026, 7, 2, tzinfo=timezone.utc),
+                hours=6,
+                step_hours=3,
+                username="",
+                password="secret",
+            )
+        )
+
+
+def test_copernicus_global_wave_request_rejects_non_three_hour_step(tmp_path: Path):
+    with pytest.raises(ValidationError, match="3-hour wave steps"):
+        generate_copernicus_global_wave_grib(
+            CopernicusGlobalWaveRequest(
+                bbox=BoundingBox(-8.5, 50.5, -2.5, 56.5),
+                output=tmp_path / "waves.grb2",
+                start=datetime(2026, 7, 2, tzinfo=timezone.utc),
+                hours=6,
+                step_hours=1,
+                username="user",
+                password="secret",
+            )
+        )
 
 
 def test_auto_cycle_falls_back_using_mocked_http(monkeypatch, tmp_path: Path):
@@ -1176,6 +1214,206 @@ def test_generate_weather_cli_ukmo_ukv_metadata(monkeypatch, capsys, tmp_path: P
     assert "validated GRIB stream: 4 messages" in out
 
 
+def test_generate_weather_cli_copernicus_global_waves_metadata(monkeypatch, capsys, tmp_path: Path):
+    calls = []
+
+    def fake_waves(request, progress_callback=None):
+        calls.append(request)
+        request.output.write_bytes(_fake_grib2(b"cop-waves"))
+        return WeatherGenerateResult(
+            provider="copernicus_global_waves",
+            source="Copernicus Marine Global Waves forecast",
+            model=COPERNICUS_GLOBAL_WAVE_DATASET_ID,
+            cycle=GFSCycle("20260702", "06"),
+            bbox=request.bbox,
+            forecast_hours=forecast_hour_sequence(request.hours, request.step_hours),
+            output=request.output,
+            byte_count=request.output.stat().st_size,
+            message_count=3,
+            inspection={"stream_valid": True, "message_count": 3, "edition_counts": {2: 3}},
+            urls=[],
+            variables_levels={"variables": list(COPERNICUS_GLOBAL_WAVE_VARIABLES)},
+        )
+
+    monkeypatch.setattr("tidal_current_grib_generator.cli.generate_copernicus_global_wave_grib", fake_waves)
+    monkeypatch.setenv("CURRENTGRIB_COPERNICUS_PASSWORD", "secret-password")
+    rc = main(
+        [
+            "generate-weather",
+            "--provider",
+            "copernicus_global_waves",
+            "--bbox",
+            "-8.5",
+            "50.5",
+            "-2.5",
+            "56.5",
+            "--start",
+            "2026-07-02T06:00:00Z",
+            "--cycle",
+            "auto",
+            "--hours",
+            "6",
+            "--step-hours",
+            "3",
+            "--username",
+            "user@example.com",
+            "--download-directory",
+            str(tmp_path / "downloads"),
+            "--metadata-summary",
+            "--output",
+            str(tmp_path / "waves.grb2"),
+        ]
+    )
+
+    assert rc == 0
+    assert calls[0].username == "user@example.com"
+    assert calls[0].password == "secret-password"
+    assert calls[0].download_directory == tmp_path / "downloads"
+    out = capsys.readouterr().out
+    assert "Source: Copernicus Marine Global Waves forecast" in out
+    assert "secret-password" not in out
+
+
+def test_generate_weather_cli_copernicus_global_waves_accepts_start_without_cycle(monkeypatch, capsys, tmp_path: Path):
+    calls = []
+
+    def fake_waves(request, progress_callback=None):
+        calls.append(request)
+        request.output.write_bytes(_fake_grib2(b"cop-waves"))
+        return WeatherGenerateResult(
+            provider="copernicus_global_waves",
+            source="Copernicus Marine Global Waves forecast",
+            model=COPERNICUS_GLOBAL_WAVE_DATASET_ID,
+            cycle=GFSCycle("20260703", "00"),
+            bbox=request.bbox,
+            forecast_hours=forecast_hour_sequence(request.hours, request.step_hours),
+            output=request.output,
+            byte_count=request.output.stat().st_size,
+            message_count=3,
+            inspection={"stream_valid": True, "message_count": 3, "edition_counts": {2: 3}},
+            urls=[],
+            variables_levels={"variables": list(COPERNICUS_GLOBAL_WAVE_VARIABLES)},
+        )
+
+    monkeypatch.setattr("tidal_current_grib_generator.cli.generate_copernicus_global_wave_grib", fake_waves)
+    monkeypatch.setenv("CURRENTGRIB_COPERNICUS_PASSWORD", "secret-password")
+    rc = main(
+        [
+            "generate-weather",
+            "--provider",
+            "copernicus_global_waves",
+            "--bbox",
+            "-8.5",
+            "50.5",
+            "-2.5",
+            "56.5",
+            "--start",
+            "2026-07-03T00:00:00Z",
+            "--hours",
+            "6",
+            "--step-hours",
+            "3",
+            "--username",
+            "user@example.com",
+            "--metadata-summary",
+            "--output",
+            str(tmp_path / "waves.grb2"),
+        ]
+    )
+
+    assert rc == 0
+    assert calls[0].start == datetime(2026, 7, 3, tzinfo=timezone.utc)
+    assert "secret-password" not in capsys.readouterr().out
+
+
+def _copernicus_wave_netcdf(path: Path, *, all_missing: bool = False) -> None:
+    xr = pytest.importorskip("xarray")
+    np = pytest.importorskip("numpy")
+
+    times = np.array(["2026-07-03T00:00:00"], dtype="datetime64[ns]")
+    latitudes = np.array([-1.0, 0.0, 1.0], dtype=float)
+    longitudes = np.array([-1.0, 0.0, 1.0], dtype=float)
+    base = np.full((1, 3, 3), np.nan, dtype=float)
+    if not all_missing:
+        base[0, 1, 1] = 2.0
+        base[0, 1, 2] = 2.5
+    ds = xr.Dataset(
+        {
+            "VHM0": (("time", "latitude", "longitude"), base, {"units": "m"}),
+            "VTPK": (("time", "latitude", "longitude"), base + 6.0, {"units": "s"}),
+            "VMDR": (("time", "latitude", "longitude"), base * 10.0 + 180.0, {"units": "degree"}),
+        },
+        coords={"time": times, "latitude": latitudes, "longitude": longitudes},
+    )
+    ds.to_netcdf(path)
+
+
+def test_copernicus_global_waves_allows_coastal_land_mask_and_writes_bitmap(monkeypatch, tmp_path: Path):
+    pytest.importorskip("eccodes")
+    np = pytest.importorskip("numpy")
+
+    source = tmp_path / "waves.nc"
+    _copernicus_wave_netcdf(source)
+    monkeypatch.setattr(
+        "tidal_current_grib_generator.weather.download_copernicus_subset",
+        lambda request, progress_callback=None: SimpleNamespace(path=source),
+    )
+
+    output = tmp_path / "waves.grb2"
+    result = generate_copernicus_global_wave_grib(
+        CopernicusGlobalWaveRequest(
+            bbox=BoundingBox(-1.0, -1.0, 1.0, 1.0),
+            output=output,
+            start=datetime(2026, 7, 3, tzinfo=timezone.utc),
+            hours=0,
+            step_hours=3,
+            username="user",
+            password="secret",
+            grid_spacing_deg=1.0,
+        )
+    )
+
+    assert result.message_count == 3
+    assert result.inspection["stream_valid"] is True
+    assert result.inspection["missing_percent"]["f000_swh"] > 50.0
+    assert result.inspection["valid_cell_count"]["f000_swh"] == 2
+
+    import eccodes
+
+    with output.open("rb") as handle:
+        gid = eccodes.codes_grib_new_from_file(handle)
+        try:
+            assert eccodes.codes_get(gid, "bitmapPresent") == 1
+            values = np.asarray(eccodes.codes_get_values(gid), dtype=float)
+            assert np.count_nonzero(np.isfinite(values)) >= 2
+        finally:
+            eccodes.codes_release(gid)
+
+
+def test_copernicus_global_waves_rejects_no_valid_wave_cells(monkeypatch, tmp_path: Path):
+    pytest.importorskip("xarray")
+    source = tmp_path / "waves.nc"
+    _copernicus_wave_netcdf(source, all_missing=True)
+    monkeypatch.setattr(
+        "tidal_current_grib_generator.weather.download_copernicus_subset",
+        lambda request, progress_callback=None: SimpleNamespace(path=source),
+    )
+
+    with pytest.raises(ValidationError, match="no valid wave coverage"):
+        generate_copernicus_global_wave_grib(
+            CopernicusGlobalWaveRequest(
+                bbox=BoundingBox(-1.0, -1.0, 1.0, 1.0),
+                output=tmp_path / "waves.grb2",
+                start=datetime(2026, 7, 3, tzinfo=timezone.utc),
+                hours=0,
+                step_hours=3,
+                username="user",
+                password="secret",
+                grid_spacing_deg=1.0,
+            )
+        )
+
+
 def test_merge_gribs_current_first(monkeypatch, tmp_path: Path):
     current = tmp_path / "current.grb"
     weather = tmp_path / "weather.grb2"
@@ -1332,7 +1570,7 @@ def test_generate_environment_grib_include_waves_requires_gfs(tmp_path: Path, ca
     )
 
     assert rc == 2
-    assert "--include-waves is currently supported only with --weather-provider gfs" in capsys.readouterr().err
+    assert "--include-waves with --wave-provider gfs_wave is currently supported only with --weather-provider gfs" in capsys.readouterr().err
 
 
 def test_generate_environment_grib_ukmo_ukv_weather_only_mocked(monkeypatch, tmp_path: Path):
@@ -1683,6 +1921,74 @@ def test_generate_environment_grib_hourly_weather_with_three_hour_waves(monkeypa
     assert calls["weather"][0].step_hours == 1
     assert calls["waves"][0].step_hours == 3
     assert "Wave fields will be included every 3 hours; weather/current fields remain every 1 hour." in capsys.readouterr().out
+
+
+def test_generate_environment_grib_gfs_with_copernicus_global_waves(monkeypatch, tmp_path: Path, capsys):
+    calls = {"weather": [], "waves": []}
+
+    def fake_weather(request, progress_callback=None):
+        calls["weather"].append(request)
+        return _fake_weather_result(request, provider="gfs", source="NOAA GFS 0.25° forecast via NOMADS", model="gfs_0p25")
+
+    def fake_waves(request, progress_callback=None):
+        calls["waves"].append(request)
+        request.output.write_bytes(_fake_grib2(b"copernicus-waves"))
+        return WeatherGenerateResult(
+            provider="copernicus_global_waves",
+            source="Copernicus Marine Global Waves forecast",
+            model=COPERNICUS_GLOBAL_WAVE_DATASET_ID,
+            cycle=GFSCycle("20260702", "06"),
+            bbox=request.bbox,
+            forecast_hours=forecast_hour_sequence(request.hours, request.step_hours),
+            output=request.output,
+            byte_count=request.output.stat().st_size,
+            message_count=3,
+            inspection={"stream_valid": True, "message_count": 3, "short_name_counts": {"swh": 1, "perpw": 1, "dirpw": 1}},
+            urls=[],
+            variables_levels={"variables": list(COPERNICUS_GLOBAL_WAVE_VARIABLES)},
+        )
+
+    monkeypatch.setattr("tidal_current_grib_generator.cli.generate_gfs_weather_grib", fake_weather)
+    monkeypatch.setattr("tidal_current_grib_generator.cli.generate_copernicus_global_wave_grib", fake_waves)
+    monkeypatch.setenv("CURRENTGRIB_COPERNICUS_PASSWORD", "secret-password")
+
+    rc = main(
+        [
+            "generate-environment-grib",
+            "--bbox",
+            "-8.5",
+            "50.5",
+            "-2.5",
+            "56.5",
+            "--weather-provider",
+            "gfs",
+            "--include-waves",
+            "--wave-provider",
+            "copernicus_global_waves",
+            "--wave-step-hours",
+            "3",
+            "--step-hours",
+            "1",
+            "--hours",
+            "6",
+            "--username",
+            "user@example.com",
+            "--current-source",
+            "none",
+            "--output",
+            str(tmp_path / "environment.grb"),
+            "--metadata-summary",
+        ]
+    )
+
+    assert rc == 0
+    assert calls["weather"][0].step_hours == 1
+    assert calls["waves"][0].step_hours == 3
+    assert calls["waves"][0].username == "user@example.com"
+    assert calls["waves"][0].password == "secret-password"
+    out = capsys.readouterr().out
+    assert "wave_provider: copernicus_global_waves" in out
+    assert "secret-password" not in out
 
 
 def _patch_generated_current(monkeypatch):

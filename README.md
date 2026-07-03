@@ -273,6 +273,7 @@ Implemented providers:
 
 - `gfs`: Source: NOAA GFS 0.25° forecast via NOMADS. Downloads bbox-subset GRIB2 files without credentials.
 - `gfs_wave`: Source: NOAA GFS Wave forecast via NOMADS. Downloads bbox-subset significant wave height, primary wave period, and primary wave direction from the GFS Wave global 0.25 degree grid.
+- `copernicus_global_waves`: Source: Copernicus Marine Global Waves forecast. Downloads Copernicus Marine Global Ocean Waves NetCDF subsets and converts significant wave height, primary/peak wave period, and wave direction to OpenCPN-oriented GRIB2. Requires a Copernicus Marine account.
 - `ukmo_ukv`: Source: Met Office UKV 2 km forecast. Downloads no-account AWS/Open Data NetCDF source files from `s3://met-office-atmospheric-model-data/`, regrids the projected UKV 2 km source to regular latitude/longitude, and writes OpenCPN-oriented GRIB2 weather fields for UK/Ireland short-range use.
 - `ecmwf_ifs_open`: Source: ECMWF IFS Open Data forecast. Uses the optional official `ecmwf-opendata` client. The first implementation retrieves the requested fields from ECMWF Open Data and records the bbox in metadata; spatial cropping is not yet applied by this provider.
 
@@ -405,11 +406,37 @@ tidal-current-grib generate-environment-grib \
   --verbose
 ```
 
+GFS weather with Copernicus Global Waves and TPXO cache currents:
+
+```bash
+CURRENTGRIB_COPERNICUS_PASSWORD='...' \
+tidal-current-grib generate-environment-grib \
+  --bbox -8.5 50.5 -2.5 56.5 \
+  --cycle auto \
+  --hours 72 \
+  --step-hours 1 \
+  --weather-provider gfs \
+  --weather-preset routing \
+  --include-waves \
+  --wave-provider copernicus_global_waves \
+  --wave-step-hours 3 \
+  --username your-copernicus-username \
+  --current-source tpxo-cache \
+  --input-cache ~/.opencpn/tpxo-cache/tpxo10_irish_sea_bristol_north_channel_0p05.tpxocache \
+  --output ~/.opencpn/grib/generated/environment_gfs_copernicus_waves_tpxo_irish_sea_72h.grb \
+  --metadata-summary \
+  --verbose
+```
+
+Do not pass the Copernicus password on the command line in normal use; provide it through `CURRENTGRIB_COPERNICUS_PASSWORD` or the plugin password field.
+
 Weather presets:
 
 - `minimal`: 10 m U/V wind only.
 - `routing`: 10 m U/V wind, mean sea-level pressure, 2 m temperature.
 - `marine`: routing fields plus gusts, precipitation, and cloud cover where available. NOMADS applies variable and level selections independently, so this preset can include a few extra harmless surface/atmosphere messages.
+
+See [docs/data_workflow_worldwide_beta.md](docs/data_workflow_worldwide_beta.md) for the provider-completion roadmap toward a worldwide beta.
 
 ECMWF Open Data example:
 
