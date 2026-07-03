@@ -59,6 +59,7 @@ from tidal_current_grib_generator.weather import (
     inspect_ukmo_ukv_netcdf,
     inspect_ukmo_ukv_source,
     list_weather_providers,
+    ukmo_ukv_forecast_hour_sequence,
     verify_ukmo_ukv_grib,
 )
 
@@ -239,7 +240,7 @@ def build_parser() -> argparse.ArgumentParser:
     generate_weather.add_argument("--provider", choices=["gfs", "gfs_wave", "ukmo_ukv", "ecmwf_ifs_open", "dwd_icon_eu"], required=True)
     generate_weather.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"))
     generate_weather.add_argument("--date", help="GFS cycle date YYYYMMDD for explicit cycles.")
-    generate_weather.add_argument("--cycle", required=True, help="auto or explicit cycle 00, 06, 12, 18.")
+    generate_weather.add_argument("--cycle", required=True, help="auto or explicit cycle such as 00, 03, 06, 09, 12, 15, 18, or 21.")
     generate_weather.add_argument("--hours", type=int, required=True)
     generate_weather.add_argument("--step-hours", type=int, default=3)
     generate_weather.add_argument("--weather-preset", choices=["minimal", "routing", "marine"], default="routing")
@@ -266,7 +267,7 @@ def build_parser() -> argparse.ArgumentParser:
     environment.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"))
     environment.add_argument("--start", help="UTC start time for generated current sources; defaults to weather cycle if weather is generated.")
     environment.add_argument("--date", help="Weather cycle date YYYYMMDD for explicit cycles.")
-    environment.add_argument("--cycle", default="auto", help="auto or explicit cycle 00, 06, 12, 18.")
+    environment.add_argument("--cycle", default="auto", help="auto or explicit cycle such as 00, 03, 06, 09, 12, 15, 18, or 21.")
     environment.add_argument("--hours", type=int, required=True)
     environment.add_argument("--step-hours", type=int, default=3)
     environment.add_argument(
@@ -1216,6 +1217,11 @@ def cmd_generate_weather(args: argparse.Namespace) -> int:
         print(f"bbox: {bbox.west},{bbox.south},{bbox.east},{bbox.north}", flush=True)
         print(f"hours: {args.hours}", flush=True)
         print(f"step_hours: {args.step_hours}", flush=True)
+        if args.provider == "ukmo_ukv":
+            ukv_hours = ukmo_ukv_forecast_hour_sequence(args.hours, args.step_hours)
+            print(f"actual_ukv_weather_forecast_hours: {','.join(str(hour) for hour in ukv_hours)}", flush=True)
+            if args.step_hours == 1 and args.hours > 54:
+                print("UKV weather fields are hourly to 54h and 3-hourly thereafter.", flush=True)
         print(f"output: {args.output.expanduser()}", flush=True)
     result = generate_func(
         request,
@@ -1319,6 +1325,12 @@ def cmd_generate_environment_grib(args: argparse.Namespace) -> int:
             print(f"step_hours: {args.step_hours}", flush=True)
             print(f"weather_provider: {args.weather_provider}", flush=True)
             print(f"weather_preset: {args.weather_preset}", flush=True)
+            if args.weather_provider == "ukmo_ukv":
+                ukv_hours = ukmo_ukv_forecast_hour_sequence(args.hours, args.step_hours)
+                print(f"actual_ukv_weather_forecast_hours: {','.join(str(hour) for hour in ukv_hours)}", flush=True)
+                if args.step_hours == 1 and args.hours > 54:
+                    print("UKV weather fields are hourly to 54h and 3-hourly thereafter.", flush=True)
+                    print(f"current_forecast_hours: {','.join(str(hour) for hour in range(0, args.hours + 1, args.step_hours))}", flush=True)
             print(f"include_waves: {bool(args.include_waves)}", flush=True)
             if args.include_waves:
                 print(f"wave_step_hours: {wave_step_hours}", flush=True)

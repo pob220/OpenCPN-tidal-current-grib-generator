@@ -788,7 +788,8 @@ void CurrentGribDialog::UpdateProviderUi() {
     wxString note =
         "Source: Met Office UKV 2 km forecast. Met Office UKV 2 km is a high-resolution UK/Ireland short-range forecast. "
         "The plugin converts the source NetCDF data to OpenCPN GRIB in the background.\n"
-        "Hourly data is available to about 54h. Requests outside the UK/Ireland domain or beyond available hours will fail clearly.";
+        "UKV weather is hourly to about 54h and 3-hourly thereafter. Currents may remain hourly. "
+        "Requests outside the UK/Ireland domain or beyond available hours will fail clearly.";
     if (m_weatherPreset->GetStringSelection().Contains("Marine")) {
       note += "\nUKV marine extras are not implemented yet; routing fields will be generated.";
     }
@@ -843,10 +844,13 @@ bool CurrentGribDialog::ConfirmLargeCopernicusRequest() {
 bool CurrentGribDialog::ValidateUkvRequest() {
   if (m_stepHours->GetValue() == 1 && m_durationHours->GetValue() > 54) {
     wxString message =
-        "UKV hourly data is normally available to about 54h. Use a shorter duration, use 3-hourly beyond that when supported, or choose GFS/ECMWF.";
+        "Met Office UKV is hourly to about 54h, then 3-hourly to 120h.\n"
+        "Continue with mixed-cadence UKV weather?\n"
+        "Currents will remain at the selected interval where supported.";
     AppendLog(message);
-    wxMessageBox(message, "UKV duration unavailable", wxOK | wxICON_WARNING, this);
-    return false;
+    if (wxMessageBox(message, "Confirm mixed-cadence UKV weather", wxYES_NO | wxICON_WARNING, this) != wxYES) {
+      return false;
+    }
   }
   double west = 0.0;
   double south = 0.0;
@@ -1306,12 +1310,14 @@ wxString CurrentGribDialog::DefaultOutputFilenameForSelection() const {
       m_east->GetValue().ToDouble(&east) && m_north->GetValue().ToDouble(&north) &&
       std::abs(west - -8.5) < 0.01 && std::abs(south - 50.5) < 0.01 &&
       std::abs(east - -2.5) < 0.01 && std::abs(north - 56.5) < 0.01;
+  bool ukvMixedCadence = weatherProvider.Contains("UKV") && m_stepHours->GetValue() == 1 && m_durationHours->GetValue() > 54;
   if (weatherOn && currentOn) {
     prefix = "environment";
     if (weatherProvider.Contains("GFS")) prefix += "_gfs";
     else if (weatherProvider.Contains("UKV")) prefix += "_ukmo_ukv";
     else if (weatherProvider.Contains("ECMWF")) prefix += "_ecmwf";
     else if (weatherProvider.Contains("Existing")) prefix += "_existing_weather";
+    if (ukvMixedCadence) prefix += "_mixed";
     if (m_includeWaves->GetValue() && weatherProvider.Contains("GFS")) prefix += "_wave";
     if (currentSource.Contains("TPXO cache")) prefix += "_tpxo_cache";
     else if (currentSource.Contains("TPXO direct")) prefix += "_tpxo";
@@ -1327,6 +1333,7 @@ wxString CurrentGribDialog::DefaultOutputFilenameForSelection() const {
     else if (weatherProvider.Contains("UKV")) prefix += "_ukmo_ukv";
     else if (weatherProvider.Contains("ECMWF")) prefix += "_ecmwf";
     else prefix += "_existing";
+    if (ukvMixedCadence) prefix += "_mixed";
     if (m_weatherPreset->GetStringSelection().Contains("Marine")) prefix += "_marine";
     if (m_includeWaves->GetValue() && weatherProvider.Contains("GFS")) prefix += "_wave";
     if (looksIrishSea) prefix += "_irish_sea";

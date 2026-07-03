@@ -695,7 +695,7 @@ def generate_ukmo_ukv_weather_grib(
         raise ValidationError("--output must be a file path, not a directory")
     if output.exists() and not request.overwrite:
         raise ValidationError(f"output already exists: {output}; use --overwrite to replace it")
-    forecast_hours = forecast_hour_sequence(request.hours, request.step_hours)
+    forecast_hours = ukmo_ukv_forecast_hour_sequence(request.hours, request.step_hours)
     _progress(
         progress_callback,
         "selecting Met Office UKV source files",
@@ -703,9 +703,16 @@ def generate_ukmo_ukv_weather_grib(
             "bbox": request.bbox.__dict__,
             "hours": request.hours,
             "step_hours": request.step_hours,
+            "actual_forecast_hours": forecast_hours,
             "weather_grid_spacing_deg": request.weather_grid_spacing_deg,
         },
     )
+    if request.step_hours == 1 and request.hours > 54:
+        _progress(
+            progress_callback,
+            "UKV weather fields are hourly to 54h and 3-hourly thereafter.",
+            {"requested_hours": request.hours, "requested_step_hours": request.step_hours, "forecast_hours": forecast_hours},
+        )
 
     if request.dry_run:
         cycle_name = _ukv_cycle_candidates_for_request(
@@ -813,7 +820,7 @@ def inspect_ukmo_ukv_source(request: UKMOUKVInspectRequest) -> dict[str, Any]:
             weather_grid_spacing_deg=request.weather_grid_spacing_deg,
         )
     )
-    candidate_hours = forecast_hour_sequence(request.hours, request.step_hours)
+    candidate_hours = ukmo_ukv_forecast_hour_sequence(request.hours, request.step_hours)
     discovery = discover_ukmo_ukv_source(max_keys=request.max_keys)
     candidate_files = discovery["candidate_files"]
     cycle_candidates = _extract_ukv_cycles(candidate_files)
@@ -875,7 +882,7 @@ def inspect_ukmo_ukv_netcdf(
         )
     )
     http_get = http_get or _http_get
-    requested_hours = forecast_hour_sequence(request.hours, request.step_hours)
+    requested_hours = ukmo_ukv_forecast_hour_sequence(request.hours, request.step_hours)
     selected_cycle, downloaded, file_inspections, cycle_errors = _download_and_inspect_ukv_source_files(
         bbox=request.bbox,
         hours=request.hours,
@@ -956,7 +963,7 @@ def verify_ukmo_ukv_grib(
         cycle_hour = request.cycle
         cycle = f"{date}T{cycle_hour}00Z"
 
-    forecast_hours = forecast_hour_sequence(request.hours, request.step_hours)
+    forecast_hours = ukmo_ukv_forecast_hour_sequence(request.hours, request.step_hours)
     selected_cycle, downloaded, file_inspections, cycle_errors = _download_and_inspect_ukv_source_files(
         bbox=request.bbox,
         hours=request.hours,
@@ -1282,7 +1289,7 @@ def _download_and_inspect_ukv_source_files(
         extract_sample=extract_sample,
         timeout_seconds=timeout_seconds,
     )
-    requested_hours = forecast_hour_sequence(hours, step_hours)
+    requested_hours = ukmo_ukv_forecast_hour_sequence(hours, step_hours)
     selected_cycle, selected_objects, cycle_errors = _select_complete_ukv_cycle(
         request,
         requested_hours,
@@ -2340,6 +2347,24 @@ def forecast_hour_sequence(hours: int, step_hours: int) -> list[int]:
     return list(range(0, hours + 1, step_hours))
 
 
+def ukmo_ukv_forecast_hour_sequence(hours: int, step_hours: int) -> list[int]:
+    if hours < 0:
+        raise ValidationError("--hours must be zero or greater")
+    if step_hours <= 0:
+        raise ValidationError("--step-hours must be greater than zero")
+    if hours > 120:
+        raise ValidationError("UKV forecasts are supported only to 120 hours")
+    if step_hours == 1:
+        if hours <= 54:
+            return list(range(0, hours + 1))
+        return list(range(0, 55)) + list(range(57, hours + 1, 3))
+    if step_hours == 3:
+        if hours % 3 != 0:
+            raise ValidationError("--hours must be evenly divisible by --step-hours")
+        return list(range(0, hours + 1, 3))
+    raise ValidationError("--step-hours must be 1 or 3 for UKV")
+
+
 def gfs_variables_for_preset(preset: str) -> dict[str, str]:
     normalized = preset.strip().lower()
     if normalized == "minimal":
@@ -2536,20 +2561,16 @@ def _validate_ukmo_ukv_request(request: UKMOUKVWeatherRequest) -> None:
         raise ValidationError("UKV bbox is outside the supported UK/Ireland regional domain")
     if request.bbox.south < UKMO_UKV_DOMAIN.south or request.bbox.north > UKMO_UKV_DOMAIN.north:
         raise ValidationError("UKV bbox is outside the supported UK/Ireland regional domain")
-    if request.step_hours != 1:
-        raise ValidationError("UKV initial implementation expects hourly step-hours")
-    if request.hours > 54:
-        raise ValidationError("UKV hourly data is expected only to about 54 hours; use GFS or ECMWF for longer ranges")
+    ukmo_ukv_forecast_hour_sequence(request.hours, request.step_hours)
     if request.weather_grid_spacing_deg <= 0:
         raise ValidationError("--weather-grid-spacing-deg must be greater than zero")
     if request.cycle != "auto":
-        if request.cycle not in {"00", "06", "12", "18"}:
-            raise ValidationError("--cycle must be auto, 00, 06, 12, or 18")
+        if request.cycle not in {"00", "03", "06", "09", "12", "15", "18", "21"}:
+            raise ValidationError("--cycle must be auto, 00, 03, 06, 09, 12, 15, 18, or 21")
         if not request.date:
             raise ValidationError("--date YYYYMMDD is required when --cycle is explicit")
         _validate_date(request.date)
     gfs_variables_for_preset(request.preset)
-    forecast_hour_sequence(request.hours, request.step_hours)
 
 
 def _ecmwf_client_factory(**kwargs: Any) -> Any:

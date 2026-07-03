@@ -29,6 +29,7 @@ from tidal_current_grib_generator.weather import (
     gfs_cycle_candidates,
     inspect_ukmo_ukv_netcdf,
     list_weather_providers,
+    ukmo_ukv_forecast_hour_sequence,
     verify_ukmo_ukv_grib,
     UKMOUKVVerifyRequest,
     wind_speed_direction_to_uv,
@@ -422,14 +423,37 @@ def test_generate_ukmo_ukv_rejects_outside_domain(tmp_path: Path):
         )
 
 
-def test_generate_ukmo_ukv_rejects_long_hourly_request(tmp_path: Path):
-    with pytest.raises(ValidationError, match="about 54 hours"):
+def test_ukmo_ukv_forecast_hour_sequence_hourly_to_24h():
+    assert ukmo_ukv_forecast_hour_sequence(24, 1) == list(range(25))
+
+
+def test_ukmo_ukv_forecast_hour_sequence_hourly_to_54h():
+    assert ukmo_ukv_forecast_hour_sequence(54, 1) == list(range(55))
+
+
+def test_ukmo_ukv_forecast_hour_sequence_mixed_to_72h():
+    assert ukmo_ukv_forecast_hour_sequence(72, 1) == list(range(55)) + [57, 60, 63, 66, 69, 72]
+
+
+def test_ukmo_ukv_forecast_hour_sequence_mixed_to_120h():
+    hours = ukmo_ukv_forecast_hour_sequence(120, 1)
+    assert len(hours) == 77
+    assert hours[:55] == list(range(55))
+    assert hours[55:] == list(range(57, 121, 3))
+
+
+def test_ukmo_ukv_forecast_hour_sequence_three_hourly_to_120h():
+    assert ukmo_ukv_forecast_hour_sequence(120, 3) == list(range(0, 121, 3))
+
+
+def test_generate_ukmo_ukv_rejects_unsupported_step(tmp_path: Path):
+    with pytest.raises(ValidationError, match="--step-hours must be 1 or 3 for UKV"):
         generate_ukmo_ukv_weather_grib(
             UKMOUKVWeatherRequest(
                 bbox=BoundingBox(-8.5, 50.5, -2.5, 56.5),
                 output=tmp_path / "ukv.grb",
                 hours=72,
-                step_hours=1,
+                step_hours=2,
             )
         )
 
@@ -1352,6 +1376,242 @@ def test_generate_environment_grib_ukmo_ukv_weather_only_mocked(monkeypatch, tmp
 
     assert rc == 0
     assert output.read_bytes() == _fake_grib2(b"ukv")
+
+
+def _fake_weather_result(request, *, provider: str, source: str, model: str, cycle: GFSCycle | None = None) -> WeatherGenerateResult:
+    cycle = cycle or GFSCycle("20260702", "06")
+    request.output.write_bytes(_fake_grib2(provider.encode()))
+    return WeatherGenerateResult(
+        provider=provider,
+        source=source,
+        model=model,
+        cycle=cycle,
+        bbox=request.bbox,
+        forecast_hours=forecast_hour_sequence(request.hours, request.step_hours),
+        output=request.output,
+        byte_count=request.output.stat().st_size,
+        message_count=1,
+        inspection={"stream_valid": True, "message_count": 1},
+        urls=[],
+        variables_levels={},
+    )
+
+
+def _poison_ukv_hour_helper(monkeypatch):
+    def fail(*args, **kwargs):
+        raise AssertionError("UKV forecast-hour helper must not be called for this provider")
+
+    monkeypatch.setattr("tidal_current_grib_generator.cli.ukmo_ukv_forecast_hour_sequence", fail)
+    monkeypatch.setattr("tidal_current_grib_generator.weather.ukmo_ukv_forecast_hour_sequence", fail)
+
+
+def test_generate_environment_grib_gfs_copernicus_does_not_call_ukv_helper(monkeypatch, tmp_path: Path):
+    _poison_ukv_hour_helper(monkeypatch)
+    calls = {"weather": [], "current": []}
+
+    def fake_weather(request, progress_callback=None):
+        calls["weather"].append(request)
+        return _fake_weather_result(request, provider="gfs", source="NOAA GFS 0.25° forecast via NOMADS", model="gfs_0p25")
+
+    def fake_current(args, *, current_source, bbox, start, output, temp_dir):
+        calls["current"].append(current_source)
+        output.write_bytes(_fake_grib1(b"copernicus-current"))
+
+    monkeypatch.setattr("tidal_current_grib_generator.cli.generate_gfs_weather_grib", fake_weather)
+    monkeypatch.setattr("tidal_current_grib_generator.cli._generate_environment_current_source", fake_current)
+
+    output = tmp_path / "environment.grb"
+    rc = main(
+        [
+            "generate-environment-grib",
+            "--bbox",
+            "-6.5",
+            "52.8",
+            "-4.5",
+            "54.5",
+            "--cycle",
+            "auto",
+            "--hours",
+            "6",
+            "--step-hours",
+            "1",
+            "--weather-provider",
+            "gfs",
+            "--weather-preset",
+            "routing",
+            "--current-source",
+            "copernicus_nws",
+            "--username",
+            "user@example.invalid",
+            "--output",
+            str(output),
+            "--metadata-summary",
+        ]
+    )
+
+    assert rc == 0
+    assert calls["weather"][0].step_hours == 1
+    assert calls["current"] == ["copernicus_nws"]
+    assert output.exists()
+
+
+def test_generate_environment_grib_gfs_tpxo_cache_does_not_call_ukv_helper(monkeypatch, tmp_path: Path):
+    _poison_ukv_hour_helper(monkeypatch)
+    cache = tmp_path / "cache.tpxocache"
+    cache.write_bytes(b"cache")
+    calls = _patch_generated_current(monkeypatch)
+
+    monkeypatch.setattr(
+        "tidal_current_grib_generator.cli.validate_tpxo_cache",
+        lambda path: {
+            "bbox": {"west": -6.5, "south": 52.8, "east": -4.5, "north": 54.5},
+            "grid_spacing_deg": 0.05,
+            "model_name": "TPXO10-atlas-v2-nc",
+            "stale": False,
+        },
+    )
+    monkeypatch.setattr(
+        "tidal_current_grib_generator.cli.generate_gfs_weather_grib",
+        lambda request, progress_callback=None: _fake_weather_result(
+            request, provider="gfs", source="NOAA GFS 0.25° forecast via NOMADS", model="gfs_0p25"
+        ),
+    )
+
+    rc = main(
+        [
+            "generate-environment-grib",
+            "--bbox",
+            "-6.5",
+            "52.8",
+            "-4.5",
+            "54.5",
+            "--cycle",
+            "auto",
+            "--hours",
+            "6",
+            "--step-hours",
+            "1",
+            "--weather-provider",
+            "gfs",
+            "--current-source",
+            "tpxo-cache",
+            "--input-cache",
+            str(cache),
+            "--grid-spacing-deg",
+            "0.05",
+            "--output",
+            str(tmp_path / "environment.grb"),
+        ]
+    )
+
+    assert rc == 0
+    assert calls[0].source == "tpxo-cache"
+
+
+def test_generate_environment_grib_ecmwf_existing_current_does_not_call_ukv_helper(monkeypatch, tmp_path: Path):
+    _poison_ukv_hour_helper(monkeypatch)
+    current = tmp_path / "current.grb"
+    current.write_bytes(_fake_grib1(b"current"))
+
+    monkeypatch.setattr(
+        "tidal_current_grib_generator.cli.generate_ecmwf_weather_grib",
+        lambda request, progress_callback=None: _fake_weather_result(
+            request,
+            provider="ecmwf_ifs_open",
+            source="ECMWF IFS Open Data forecast",
+            model="ecmwf_ifs_open_0p25",
+            cycle=GFSCycle("20260702", "06"),
+        ),
+    )
+
+    rc = main(
+        [
+            "generate-environment-grib",
+            "--bbox",
+            "-6.5",
+            "52.8",
+            "-4.5",
+            "54.5",
+            "--date",
+            "20260702",
+            "--cycle",
+            "06",
+            "--hours",
+            "6",
+            "--step-hours",
+            "3",
+            "--weather-provider",
+            "ecmwf_ifs_open",
+            "--current-source",
+            "existing-file",
+            "--current-file",
+            str(current),
+            "--output",
+            str(tmp_path / "environment.grb"),
+        ]
+    )
+
+    assert rc == 0
+
+
+def test_generate_environment_grib_ukv_uses_mixed_cadence_helper(monkeypatch, tmp_path: Path):
+    calls = {"helper": []}
+    cache = tmp_path / "cache.tpxocache"
+    cache.write_bytes(b"cache")
+    current_calls = _patch_generated_current(monkeypatch)
+
+    def fake_helper(hours: int, step_hours: int) -> list[int]:
+        calls["helper"].append((hours, step_hours))
+        return [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 15]
+
+    monkeypatch.setattr("tidal_current_grib_generator.cli.ukmo_ukv_forecast_hour_sequence", fake_helper)
+    monkeypatch.setattr(
+        "tidal_current_grib_generator.cli.validate_tpxo_cache",
+        lambda path: {
+            "bbox": {"west": -6.5, "south": 52.8, "east": -4.5, "north": 54.5},
+            "grid_spacing_deg": 0.05,
+            "model_name": "TPXO10-atlas-v2-nc",
+            "stale": False,
+        },
+    )
+    monkeypatch.setattr(
+        "tidal_current_grib_generator.cli.generate_ukmo_ukv_weather_grib",
+        lambda request, progress_callback=None: _fake_weather_result(
+            request, provider="ukmo_ukv", source="Met Office UKV 2 km forecast", model="uk_deterministic_2km"
+        ),
+    )
+
+    rc = main(
+        [
+            "generate-environment-grib",
+            "--bbox",
+            "-6.5",
+            "52.8",
+            "-4.5",
+            "54.5",
+            "--cycle",
+            "auto",
+            "--hours",
+            "72",
+            "--step-hours",
+            "1",
+            "--weather-provider",
+            "ukmo_ukv",
+            "--current-source",
+            "tpxo-cache",
+            "--input-cache",
+            str(cache),
+            "--grid-spacing-deg",
+            "0.05",
+            "--output",
+            str(tmp_path / "environment.grb"),
+            "--metadata-summary",
+        ]
+    )
+
+    assert rc == 0
+    assert calls["helper"] == [(72, 1)]
+    assert current_calls[0].source == "tpxo-cache"
 
 
 def test_generate_environment_grib_hourly_weather_with_three_hour_waves(monkeypatch, tmp_path: Path, capsys):
