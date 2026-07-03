@@ -245,7 +245,7 @@ CurrentGribDialog::CurrentGribDialog(wxWindow* parent)
 
   m_generateWeather = new wxCheckBox(scrolled, wxID_ANY, "Generate/include weather");
   m_generateWeather->SetValue(true);
-  wxString weatherProviders[] = {"NOAA GFS forecast", "ECMWF IFS Open Data forecast",
+  wxString weatherProviders[] = {"NOAA GFS forecast", "Met Office UKV 2 km forecast", "ECMWF IFS Open Data forecast",
                                  "Existing weather GRIB file", "None"};
   m_weatherProvider = new wxChoice(scrolled, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                                    WXSIZEOF(weatherProviders), weatherProviders);
@@ -776,7 +776,9 @@ void CurrentGribDialog::UpdateProviderUi() {
   m_prepareTpxoCacheButton->Enable(currentTpxoCache && !m_processRunning);
   m_localNetcdf->Enable(false);
 
-  if (weatherEnabled && m_weatherProvider->GetStringSelection().Contains("ECMWF")) {
+  if (weatherEnabled && m_weatherProvider->GetStringSelection().Contains("Met Office UKV")) {
+    m_providerNote->SetLabel("Source: Met Office UKV 2 km forecast. High-resolution UK/Ireland short-range forecast. Regional domain only; NetCDF-to-GRIB conversion is not implemented in this build.");
+  } else if (weatherEnabled && m_weatherProvider->GetStringSelection().Contains("ECMWF")) {
     m_providerNote->SetLabel("Source: ECMWF IFS Open Data forecast. Warning: this provider is not spatially cropped yet, so files may be large.");
   } else if (weatherGfs) {
     wxString note = "Source: NOAA GFS forecast via NOMADS. Bbox-subset weather is compact; optional GFS Wave adds significant wave height, primary wave period, and primary wave direction.";
@@ -1081,6 +1083,7 @@ wxString CurrentGribDialog::BuildGenerateCommand() const {
   if (m_generateWeather->GetValue()) {
     wxString selected = m_weatherProvider->GetStringSelection();
     if (selected.Contains("NOAA GFS")) weatherProvider = "gfs";
+    else if (selected.Contains("Met Office UKV")) weatherProvider = "ukmo_ukv";
     else if (selected.Contains("ECMWF")) weatherProvider = "ecmwf_ifs_open";
     else if (selected.Contains("Existing")) weatherProvider = "existing-file";
   }
@@ -1108,6 +1111,7 @@ wxString CurrentGribDialog::BuildGenerateCommand() const {
                      " --step-hours " + wxString::Format("%d", m_stepHours->GetValue()) +
                      " --weather-provider " + weatherProvider +
                      " --weather-preset " + weatherPreset +
+                     " --weather-grid-spacing-deg 0.025" +
                      " --current-source " + currentSource +
                      " --output " + ShellQuote(OutputPath()) +
                      " --overwrite --metadata-summary --verbose";

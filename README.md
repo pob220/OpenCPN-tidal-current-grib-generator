@@ -263,7 +263,7 @@ OpenCPN workflow:
 
 ## Weather GRIB providers
 
-Weather GRIB support is CLI-only for now. It does not change the OpenCPN plugin.
+Weather GRIB support is available from the CLI and through the Environmental GRIB Generator plugin wrapper.
 
 ```bash
 tidal-current-grib weather-providers
@@ -275,9 +275,32 @@ Implemented providers:
 - `gfs_wave`: Source: NOAA GFS Wave forecast via NOMADS. Downloads bbox-subset significant wave height, primary wave period, and primary wave direction from the GFS Wave global 0.25 degree grid.
 - `ecmwf_ifs_open`: Source: ECMWF IFS Open Data forecast. Uses the optional official `ecmwf-opendata` client. The first implementation retrieves the requested fields from ECMWF Open Data and records the bbox in metadata; spatial cropping is not yet applied by this provider.
 
-Planned provider:
+Experimental/planned providers:
 
+- `ukmo_ukv`: Source: Met Office UKV 2 km forecast. Planned high-resolution UK/Ireland short-range provider. The no-account AWS/Open Data source is `s3://met-office-atmospheric-model-data/` in `eu-west-2`. Discovery is implemented, but generation remains disabled until NetCDF coordinate/projection handling, field mapping, regridding, and source-to-GRIB verification are complete.
 - `dwd_icon_eu`: Source: DWD ICON-EU forecast.
+
+UKV discovery helpers:
+
+```bash
+tidal-current-grib discover-ukv-source --max-keys 200 --verbose
+```
+
+```bash
+tidal-current-grib inspect-ukv-source \
+  --cycle auto \
+  --bbox -8.5 50.5 -2.5 56.5 \
+  --hours 6 \
+  --verbose
+```
+
+The discovery command lists the public S3 object layout anonymously, equivalent in access model to:
+
+```bash
+aws s3 ls --no-sign-request s3://met-office-atmospheric-model-data/
+```
+
+The Met Office dataset layout changed around January 2026, so the code validates object structure dynamically instead of hard-coding a brittle path. `inspect-ukv-source` reports discovered prefixes, candidate NetCDF objects, sizes, inferred cycles/forecast hours, and the current blocker instead of producing a fake GRIB.
 
 Install the optional ECMWF client with:
 

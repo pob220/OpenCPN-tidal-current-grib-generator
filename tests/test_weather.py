@@ -13,13 +13,17 @@ from tidal_current_grib_generator.weather import (
     GFSCycle,
     GFSWaveRequest,
     GFSWeatherRequest,
+    UKMOUKVInspectRequest,
+    UKMOUKVWeatherRequest,
     WeatherGenerateResult,
     build_gfs_filter_url,
     build_gfs_wave_filter_url,
+    discover_ukmo_ukv_source,
     forecast_hour_sequence,
     generate_gfs_wave_grib,
     generate_ecmwf_weather_grib,
     generate_gfs_weather_grib,
+    generate_ukmo_ukv_weather_grib,
     gfs_variables_for_preset,
     gfs_cycle_candidates,
     list_weather_providers,
@@ -40,12 +44,14 @@ def test_weather_provider_registry_includes_gfs():
     providers = list_weather_providers()
 
     by_id = {provider.id: provider for provider in providers}
-    assert {"gfs", "ecmwf_ifs_open", "dwd_icon_eu"} <= set(by_id)
+    assert {"gfs", "ukmo_ukv", "ecmwf_ifs_open", "dwd_icon_eu"} <= set(by_id)
     assert by_id["gfs"].source == "NOAA NOMADS"
     assert by_id["gfs"].format == "GRIB2"
     assert by_id["gfs"].account == "free/no account"
     assert by_id["ecmwf_ifs_open"].source == "ECMWF Open Data"
     assert by_id["ecmwf_ifs_open"].implemented is True
+    assert by_id["ukmo_ukv"].source == "Met Office AWS/Open Data"
+    assert by_id["ukmo_ukv"].implemented is False
     assert by_id["dwd_icon_eu"].implemented is False
 
 
@@ -394,8 +400,197 @@ def test_weather_providers_cli(capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "gfs: NOAA GFS 0.25 degree global forecast" in out
+    assert "ukmo_ukv: Met Office UKV 2 km forecast" in out
     assert "ecmwf_ifs_open: ECMWF IFS Open Data forecast" in out
     assert "source: NOAA NOMADS" in out
+
+
+def test_generate_ukmo_ukv_rejects_outside_domain(tmp_path: Path):
+    with pytest.raises(ValidationError, match="outside the supported UK/Ireland regional domain"):
+        generate_ukmo_ukv_weather_grib(
+            UKMOUKVWeatherRequest(
+                bbox=BoundingBox(-40, 30, -39, 31),
+                output=tmp_path / "ukv.grb",
+                hours=24,
+                step_hours=1,
+            )
+        )
+
+
+def test_generate_ukmo_ukv_rejects_long_hourly_request(tmp_path: Path):
+    with pytest.raises(ValidationError, match="about 54 hours"):
+        generate_ukmo_ukv_weather_grib(
+            UKMOUKVWeatherRequest(
+                bbox=BoundingBox(-8.5, 50.5, -2.5, 56.5),
+                output=tmp_path / "ukv.grb",
+                hours=72,
+                step_hours=1,
+            )
+        )
+
+
+def test_generate_ukmo_ukv_reports_not_implemented(tmp_path: Path):
+    with pytest.raises(ValidationError, match="Met Office UKV provider is not implemented yet"):
+        generate_ukmo_ukv_weather_grib(
+            UKMOUKVWeatherRequest(
+                bbox=BoundingBox(-8.5, 50.5, -2.5, 56.5),
+                output=tmp_path / "ukv.grb",
+                hours=24,
+                step_hours=1,
+            )
+        )
+
+
+def test_discover_ukv_source_parses_unsigned_s3_listing():
+    root_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+      <Name>met-office-atmospheric-model-data</Name>
+      <Prefix></Prefix>
+      <CommonPrefixes><Prefix>uk-deterministic/</Prefix></CommonPrefixes>
+      <CommonPrefixes><Prefix>other/</Prefix></CommonPrefixes>
+    </ListBucketResult>"""
+    ukv_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+      <Contents>
+        <Key>uk-deterministic/ukv/20260702/0600/10u_f006.nc</Key>
+        <LastModified>2026-07-02T09:00:00.000Z</LastModified>
+        <Size>123456</Size>
+      </Contents>
+      <Contents>
+        <Key>uk-deterministic/ukv/20260702/0600/t2m_f006.nc</Key>
+        <LastModified>2026-07-02T09:01:00.000Z</LastModified>
+        <Size>234567</Size>
+      </Contents>
+    </ListBucketResult>"""
+    other_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/" />"""
+
+    def fake_get(url: str, timeout_seconds: float) -> bytes:
+        if "prefix=uk-deterministic%2F" in url:
+            return ukv_xml
+        if "prefix=other%2F" in url:
+            return other_xml
+        if "prefix=" in url:
+            return other_xml
+        return root_xml
+
+    result = discover_ukmo_ukv_source(max_keys=100, http_get=fake_get, now=datetime(2026, 7, 3, tzinfo=timezone.utc))
+
+    assert result["anonymous_listing"] is True
+    assert result["top_level_prefixes"] == ["uk-deterministic/", "other/"]
+    assert "uk-deterministic/" in result["likely_ukv_prefixes"]
+    assert result["candidate_files"][0]["key"].endswith("10u_f006.nc")
+    assert result["candidate_files"][0]["size"] == 123456
+
+
+def test_discover_ukv_source_reports_listing_error():
+    def fake_get(url: str, timeout_seconds: float) -> bytes:
+        raise OSError("network unavailable")
+
+    result = discover_ukmo_ukv_source(max_keys=20, http_get=fake_get)
+
+    assert result["anonymous_listing"] is False
+    assert "network unavailable" in result["error"]
+    assert result["candidate_files"] == []
+
+
+def test_inspect_ukv_source_reports_blocker(monkeypatch, capsys):
+    def fake_inspect(request: UKMOUKVInspectRequest) -> dict[str, object]:
+        return {
+            "provider": "ukmo_ukv",
+            "source": "Met Office UKV 2 km forecast",
+            "status": "blocked",
+            "implemented": False,
+            "selected_cycle": "20260702T0600Z",
+            "source_bucket": "s3://met-office-atmospheric-model-data/",
+            "source_region": "eu-west-2",
+            "anonymous_listing": True,
+            "listing_error": None,
+            "top_level_prefixes": ["uk-deterministic/"],
+            "likely_ukv_prefixes": ["uk-deterministic/"],
+            "available_model_runs": ["20260702T0600Z"],
+            "source_paths_or_urls": ["https://met-office-atmospheric-model-data.s3.eu-west-2.amazonaws.com/uk-deterministic/ukv/20260702/0600/10u_f006.nc"],
+            "requested_forecast_hours": [0, 1, 2, 3, 4, 5, 6],
+            "available_forecast_hours": [6],
+            "available_near_surface_variables": ["uk-deterministic/ukv/20260702/0600/10u_f006.nc"],
+            "coordinate_variables": "(requires sample NetCDF download)",
+            "grid_mapping": "(requires sample NetCDF download)",
+            "source_grid_shape": None,
+            "source_lat_lon_coverage": None,
+            "bbox_intersects_domain": True,
+            "candidate_variables": {"wind_u": ["uk-deterministic/ukv/20260702/0600/10u_f006.nc"]},
+            "candidate_files": [{"key": "uk-deterministic/ukv/20260702/0600/10u_f006.nc", "size": 123456}],
+            "blocker": "UKV source discovery can list anonymous S3 objects, but GRIB generation remains disabled.",
+        }
+
+    monkeypatch.setattr("tidal_current_grib_generator.cli.inspect_ukmo_ukv_source", fake_inspect)
+    rc = main(
+        [
+            "inspect-ukv-source",
+            "--cycle",
+            "auto",
+            "--bbox",
+            "-8.5",
+            "50.5",
+            "-2.5",
+            "56.5",
+            "--hours",
+            "6",
+            "--verbose",
+        ]
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "provider: ukmo_ukv" in out
+    assert "status: blocked" in out
+    assert "source_bucket: s3://met-office-atmospheric-model-data/" in out
+    assert "anonymous_listing: True" in out
+    assert "top_level_prefixes: ['uk-deterministic/']" in out
+    assert "candidate_variables:" in out
+    assert "GRIB generation remains disabled" in out
+
+
+def test_discover_ukv_source_cli(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "tidal_current_grib_generator.cli.discover_ukmo_ukv_source",
+        lambda max_keys: {
+            "bucket": "met-office-atmospheric-model-data",
+            "region": "eu-west-2",
+            "anonymous_listing": True,
+            "top_level_prefixes": ["uk-deterministic/"],
+            "likely_ukv_prefixes": ["uk-deterministic/"],
+            "candidate_files": [{"key": "uk-deterministic/ukv/20260702/0600/10u_f006.nc", "size": 123456}],
+            "object_count_seen": 1,
+            "error": None,
+        },
+    )
+
+    rc = main(["discover-ukv-source", "--max-keys", "20"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "bucket: s3://met-office-atmospheric-model-data/" in out
+    assert "anonymous_listing: True" in out
+    assert "uk-deterministic/ukv/20260702/0600/10u_f006.nc (123456 bytes)" in out
+
+
+def test_inspect_ukv_source_rejects_outside_domain(capsys):
+    rc = main(
+        [
+            "inspect-ukv-source",
+            "--bbox",
+            "-40",
+            "30",
+            "-39",
+            "31",
+            "--hours",
+            "6",
+        ]
+    )
+
+    assert rc == 2
+    assert "outside the supported UK/Ireland regional domain" in capsys.readouterr().err
 
 
 def test_generate_weather_cli_metadata(monkeypatch, tmp_path: Path, capsys):
@@ -525,6 +720,34 @@ def test_generate_weather_cli_dwd_reports_not_implemented(capsys, tmp_path: Path
 
     assert rc == 2
     assert "DWD ICON-EU provider is not implemented yet" in capsys.readouterr().err
+
+
+def test_generate_weather_cli_ukmo_ukv_reports_not_implemented(capsys, tmp_path: Path):
+    rc = main(
+        [
+            "generate-weather",
+            "--provider",
+            "ukmo_ukv",
+            "--bbox",
+            "-8.5",
+            "50.5",
+            "-2.5",
+            "56.5",
+            "--cycle",
+            "auto",
+            "--hours",
+            "24",
+            "--step-hours",
+            "1",
+            "--weather-preset",
+            "routing",
+            "--output",
+            str(tmp_path / "ukv.grb"),
+        ]
+    )
+
+    assert rc == 2
+    assert "Met Office UKV provider is not implemented yet" in capsys.readouterr().err
 
 
 def test_merge_gribs_current_first(monkeypatch, tmp_path: Path):
@@ -684,6 +907,36 @@ def test_generate_environment_grib_include_waves_requires_gfs(tmp_path: Path, ca
 
     assert rc == 2
     assert "--include-waves is currently supported only with --weather-provider gfs" in capsys.readouterr().err
+
+
+def test_generate_environment_grib_ukmo_ukv_reports_not_implemented(tmp_path: Path, capsys):
+    cache = tmp_path / "cache.tpxocache"
+    cache.write_bytes(b"cache")
+    rc = main(
+        [
+            "generate-environment-grib",
+            "--bbox",
+            "-8.5",
+            "50.5",
+            "-2.5",
+            "56.5",
+            "--weather-provider",
+            "ukmo_ukv",
+            "--current-source",
+            "tpxo-cache",
+            "--input-cache",
+            str(cache),
+            "--hours",
+            "24",
+            "--step-hours",
+            "1",
+            "--output",
+            str(tmp_path / "environment.grb"),
+        ]
+    )
+
+    assert rc == 2
+    assert "Met Office UKV provider is not implemented yet" in capsys.readouterr().err
 
 
 def test_generate_environment_grib_hourly_weather_with_three_hour_waves(monkeypatch, tmp_path: Path, capsys):

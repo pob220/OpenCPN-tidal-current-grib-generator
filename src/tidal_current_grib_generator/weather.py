@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import tempfile
 import time
+import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 from tidal_current_grib_generator.errors import MissingDependencyError, ValidationError
@@ -21,6 +23,11 @@ GFS_WAVE_FILTER_ENDPOINT = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfswave.
 GFS_SOURCE_LABEL = "NOAA GFS 0.25° forecast via NOMADS"
 GFS_WAVE_SOURCE_LABEL = "NOAA GFS Wave forecast via NOMADS"
 ECMWF_SOURCE_LABEL = "ECMWF IFS Open Data forecast"
+UKMO_UKV_SOURCE_LABEL = "Met Office UKV 2 km forecast"
+UKMO_UKV_DOMAIN = BoundingBox(west=-12.0, south=48.0, east=4.0, north=62.0)
+UKMO_UKV_BUCKET = "met-office-atmospheric-model-data"
+UKMO_UKV_REGION = "eu-west-2"
+UKMO_UKV_S3_ENDPOINT = f"https://{UKMO_UKV_BUCKET}.s3.{UKMO_UKV_REGION}.amazonaws.com/"
 GFS_ROUTING_VARIABLES_LEVELS = {
     "var_UGRD": "on",
     "var_VGRD": "on",
@@ -133,6 +140,33 @@ class ECMWFWeatherRequest:
 
 
 @dataclass(frozen=True)
+class UKMOUKVWeatherRequest:
+    bbox: BoundingBox
+    output: Path
+    hours: int
+    step_hours: int = 1
+    cycle: str = "auto"
+    date: str | None = None
+    overwrite: bool = False
+    timeout_seconds: float = 180.0
+    dry_run: bool = False
+    preset: str = "routing"
+    weather_grid_spacing_deg: float = 0.025
+
+
+@dataclass(frozen=True)
+class UKMOUKVInspectRequest:
+    bbox: BoundingBox
+    hours: int
+    cycle: str = "auto"
+    date: str | None = None
+    step_hours: int = 1
+    weather_grid_spacing_deg: float = 0.025
+    max_keys: int = 200
+    refresh_source_index: bool = False
+
+
+@dataclass(frozen=True)
 class GFSWaveRequest:
     bbox: BoundingBox
     output: Path
@@ -181,6 +215,28 @@ class WeatherGenerateResult:
         }
 
 
+@dataclass(frozen=True)
+class S3ObjectInfo:
+    key: str
+    size: int
+    last_modified: str | None = None
+
+    @property
+    def url(self) -> str:
+        return UKMO_UKV_S3_ENDPOINT + quote(self.key)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"key": self.key, "size": self.size, "last_modified": self.last_modified, "url": self.url}
+
+
+@dataclass(frozen=True)
+class S3ListResult:
+    prefixes: list[str]
+    objects: list[S3ObjectInfo]
+    truncated: bool
+    next_token: str | None = None
+
+
 def list_weather_providers() -> list[WeatherProvider]:
     return [
         WeatherProvider(
@@ -198,6 +254,18 @@ def list_weather_providers() -> list[WeatherProvider]:
             format="GRIB2",
             account="free/no account",
             description="GFS Wave global 0.25 degree GRIB2 subsets from the official NOMADS wave filter.",
+        ),
+        WeatherProvider(
+            id="ukmo_ukv",
+            label="Met Office UKV 2 km forecast",
+            source="Met Office AWS/Open Data",
+            format="NetCDF source, converted to OpenCPN GRIB",
+            account="free/no account if using AWS/Open Data",
+            description=(
+                "High-resolution UK/Ireland short-range forecast. Good candidate for Irish Sea coastal routing. "
+                "Provider discovery is present, but NetCDF-to-GRIB conversion is not implemented in this CLI build."
+            ),
+            implemented=False,
         ),
         WeatherProvider(
             id="ecmwf_ifs_open",
@@ -553,6 +621,302 @@ def generate_ecmwf_weather_grib(
     )
 
 
+def generate_ukmo_ukv_weather_grib(
+    request: UKMOUKVWeatherRequest,
+    *,
+    progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+) -> WeatherGenerateResult:
+    request.bbox.validate()
+    _validate_ukmo_ukv_request(request)
+    _progress(
+        progress_callback,
+        "checking Met Office UKV provider",
+        {
+            "bbox": request.bbox.__dict__,
+            "hours": request.hours,
+            "step_hours": request.step_hours,
+            "weather_grid_spacing_deg": request.weather_grid_spacing_deg,
+        },
+    )
+    raise ValidationError(
+        "Met Office UKV provider is not implemented yet. The no-account AWS/Open Data dataset appears to be "
+        "NetCDF on a regional projected grid; safe OpenCPN output needs source layout discovery, "
+        "projection-aware crop/regrid, and a weather NetCDF-to-GRIB writer. Use GFS for compact cropped output "
+        "or ECMWF Open Data for global medium-range output."
+    )
+
+
+def inspect_ukmo_ukv_source(request: UKMOUKVInspectRequest) -> dict[str, Any]:
+    request.bbox.validate()
+    _validate_ukmo_ukv_request(
+        UKMOUKVWeatherRequest(
+            bbox=request.bbox,
+            output=Path("ukmo_ukv_inspect.grb"),
+            hours=request.hours,
+            step_hours=request.step_hours,
+            cycle=request.cycle,
+            date=request.date,
+            weather_grid_spacing_deg=request.weather_grid_spacing_deg,
+        )
+    )
+    candidate_hours = forecast_hour_sequence(request.hours, request.step_hours)
+    discovery = discover_ukmo_ukv_source(max_keys=request.max_keys)
+    candidate_files = discovery["candidate_files"]
+    cycle_candidates = _extract_ukv_cycles(candidate_files)
+    variable_candidates = _candidate_variables_from_keys(candidate_files)
+    return {
+        "provider": "ukmo_ukv",
+        "source": UKMO_UKV_SOURCE_LABEL,
+        "status": "blocked",
+        "implemented": False,
+        "selected_cycle": _select_discovered_ukv_cycle(cycle_candidates, request),
+        "source_bucket": f"s3://{UKMO_UKV_BUCKET}/",
+        "source_region": UKMO_UKV_REGION,
+        "source_paths_or_urls": [item["url"] for item in candidate_files[:20]],
+        "top_level_prefixes": discovery["top_level_prefixes"],
+        "likely_ukv_prefixes": discovery["likely_ukv_prefixes"],
+        "available_model_runs": cycle_candidates,
+        "available_forecast_hours": _extract_forecast_hours(candidate_files),
+        "requested_forecast_hours": candidate_hours,
+        "candidate_files": candidate_files[:50],
+        "available_near_surface_variables": sorted({v for values in variable_candidates.values() for v in values}),
+        "coordinate_variables": "(requires sample NetCDF download)",
+        "grid_mapping": "(requires sample NetCDF download)",
+        "source_grid_shape": None,
+        "source_lat_lon_coverage": None,
+        "bbox_intersects_domain": True,
+        "candidate_variables": variable_candidates,
+        "domain": UKMO_UKV_DOMAIN.__dict__,
+        "weather_grid_spacing_deg": request.weather_grid_spacing_deg,
+        "anonymous_listing": discovery["anonymous_listing"],
+        "listing_error": discovery["error"],
+        "blocker": (
+            "UKV source discovery can list anonymous S3 objects, but GRIB generation remains disabled until "
+            "sample NetCDF coordinate/projection metadata, variable mappings, and numeric source-to-GRIB "
+            "roundtrip verification are implemented."
+        ),
+    }
+
+
+def discover_ukmo_ukv_source(
+    *,
+    max_keys: int = 200,
+    http_get: HttpGet | None = None,
+    timeout_seconds: float = 30.0,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    http_get = http_get or _http_get
+    max_keys = max(1, min(max_keys, 1000))
+    top_level_prefixes: list[str] = []
+    visited_prefixes: list[str] = []
+    likely_prefixes: list[str] = []
+    objects: list[S3ObjectInfo] = []
+    error: str | None = None
+    anonymous_listing = False
+    try:
+        root = _list_s3_prefix("", delimiter="/", max_keys=max_keys, http_get=http_get, timeout_seconds=timeout_seconds)
+        anonymous_listing = True
+        top_level_prefixes = root.prefixes
+        has_likely_top_level = any(_looks_like_ukv_prefix(prefix) for prefix in root.prefixes)
+        recent_prefixes = _recent_ukv_run_prefixes(now or datetime.now(timezone.utc))
+        queue = recent_prefixes + sorted(root.prefixes, key=lambda prefix: (not _looks_like_ukv_prefix(prefix), prefix))
+        objects.extend(root.objects)
+        while queue and len(visited_prefixes) < max_keys:
+            prefix = queue.pop(0)
+            if prefix in visited_prefixes:
+                continue
+            if has_likely_top_level and not _looks_like_ukv_prefix(prefix):
+                continue
+            if len(visited_prefixes) >= max_keys:
+                break
+            visited_prefixes.append(prefix)
+            try:
+                listing = _list_s3_prefix(prefix, delimiter="/", max_keys=max_keys, http_get=http_get, timeout_seconds=timeout_seconds)
+            except ValidationError:
+                continue
+            if _looks_like_ukv_prefix(prefix) and (listing.objects or listing.prefixes or prefix in top_level_prefixes):
+                likely_prefixes.append(prefix)
+            objects.extend(listing.objects)
+            for child in listing.prefixes:
+                if len(visited_prefixes) + len(queue) >= max_keys * 2:
+                    break
+                if child not in visited_prefixes and child not in queue:
+                    queue.append(child)
+                if _looks_like_ukv_prefix(child):
+                    likely_prefixes.append(child)
+            if len(objects) >= max_keys:
+                break
+    except ValidationError as exc:
+        error = str(exc)
+    candidate_objects = [obj for obj in objects if _looks_like_ukv_file(obj.key)]
+    if not candidate_objects:
+        likely_object_prefixes = tuple(sorted(set(likely_prefixes)))
+        candidate_objects = [
+            obj
+            for obj in objects
+            if obj.key.lower().endswith((".nc", ".nc4", ".netcdf"))
+            and (not likely_object_prefixes or obj.key.startswith(likely_object_prefixes))
+        ]
+    return {
+        "bucket": UKMO_UKV_BUCKET,
+        "region": UKMO_UKV_REGION,
+        "anonymous_listing": anonymous_listing,
+        "top_level_prefixes": top_level_prefixes,
+        "visited_prefixes": visited_prefixes,
+        "likely_ukv_prefixes": sorted(set(likely_prefixes)),
+        "candidate_files": [obj.as_dict() for obj in candidate_objects[:max_keys]],
+        "object_count_seen": len(objects),
+        "error": error,
+    }
+
+
+def _list_s3_prefix(
+    prefix: str,
+    *,
+    delimiter: str | None,
+    max_keys: int,
+    http_get: HttpGet,
+    timeout_seconds: float,
+) -> S3ListResult:
+    query: dict[str, str] = {"list-type": "2", "max-keys": str(max(1, min(max_keys, 1000)))}
+    if prefix:
+        query["prefix"] = prefix
+    if delimiter is not None:
+        query["delimiter"] = delimiter
+    url = UKMO_UKV_S3_ENDPOINT + "?" + urlencode(query)
+    try:
+        data = http_get(url, timeout_seconds)
+    except HTTPError as exc:
+        raise ValidationError(f"UKV S3 listing failed for prefix {prefix!r}: HTTP {exc.code}") from exc
+    except URLError as exc:
+        raise ValidationError(f"UKV S3 listing failed for prefix {prefix!r}: {exc.reason}") from exc
+    except OSError as exc:
+        raise ValidationError(f"UKV S3 listing failed for prefix {prefix!r}: {exc}") from exc
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError as exc:
+        sample = data[:200].decode("utf-8", errors="replace")
+        raise ValidationError(f"UKV S3 listing returned non-XML data for prefix {prefix!r}: {sample!r}") from exc
+
+    prefixes: list[str] = []
+    objects: list[S3ObjectInfo] = []
+    truncated = False
+    next_token: str | None = None
+    for child in root:
+        tag = _xml_local_name(child.tag)
+        if tag == "CommonPrefixes":
+            value = _xml_child_text(child, "Prefix")
+            if value:
+                prefixes.append(value)
+        elif tag == "Contents":
+            key = _xml_child_text(child, "Key")
+            if not key:
+                continue
+            size_text = _xml_child_text(child, "Size") or "0"
+            try:
+                size = int(size_text)
+            except ValueError:
+                size = 0
+            objects.append(S3ObjectInfo(key=key, size=size, last_modified=_xml_child_text(child, "LastModified")))
+        elif tag == "IsTruncated":
+            truncated = (child.text or "").strip().lower() == "true"
+        elif tag == "NextContinuationToken":
+            next_token = (child.text or "").strip() or None
+    return S3ListResult(prefixes=prefixes, objects=objects, truncated=truncated, next_token=next_token)
+
+
+def _xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _xml_child_text(element: ET.Element, child_name: str) -> str | None:
+    for child in element:
+        if _xml_local_name(child.tag) == child_name:
+            return (child.text or "").strip()
+    return None
+
+
+def _looks_like_ukv_prefix(prefix: str) -> bool:
+    lower = prefix.lower()
+    return any(token in lower for token in ("ukv", "uk-deterministic", "uk_deterministic", "uk-deterministic-2km", "uk/"))
+
+
+def _looks_like_ukv_file(key: str) -> bool:
+    lower = key.lower()
+    if not lower.endswith((".nc", ".nc4", ".netcdf")):
+        return False
+    return any(token in lower for token in ("ukv", "uk-deterministic", "uk_deterministic", "deterministic"))
+
+
+def _recent_ukv_run_prefixes(now: datetime) -> list[str]:
+    dt = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    cycles = ("00", "03", "06", "09", "12", "15", "18", "21")
+    prefixes: list[str] = []
+    for day_offset in range(0, 5):
+        day = (dt - timedelta(days=day_offset)).strftime("%Y%m%d")
+        for cycle in reversed(cycles):
+            prefixes.append(f"uk-deterministic-2km/{day}T{cycle}00Z/")
+    return prefixes
+
+
+def _extract_ukv_cycles(candidate_files: list[dict[str, Any]]) -> list[str]:
+    cycles: set[str] = set()
+    for item in candidate_files:
+        key = str(item.get("key", ""))
+        match = re.search(r"(?:^|/)uk-deterministic-2km/(20\d{6})T([012]\d)00Z/", key)
+        if match and match.group(2) in {"00", "03", "06", "09", "12", "15", "18", "21"}:
+            cycles.add(f"{match.group(1)}T{match.group(2)}00Z")
+    return sorted(cycles, reverse=True)
+
+
+def _extract_forecast_hours(candidate_files: list[dict[str, Any]]) -> list[int]:
+    hours: set[int] = set()
+    patterns = (
+        re.compile(r"(?:^|[_.\-/])f(\d{1,3})(?:[_.\-/]|$)", re.IGNORECASE),
+        re.compile(r"(?:^|[_.\-/])t\+?(\d{1,3})(?:[_.\-/]|$)", re.IGNORECASE),
+        re.compile(r"pt0*(\d{1,3})h", re.IGNORECASE),
+        re.compile(r"(?:forecast|fcst|step)[_.\-]?(\d{1,3})", re.IGNORECASE),
+    )
+    for item in candidate_files:
+        key = str(item.get("key", ""))
+        for pattern in patterns:
+            for match in pattern.finditer(key):
+                value = int(match.group(1))
+                if 0 <= value <= 240:
+                    hours.add(value)
+    return sorted(hours)
+
+
+def _candidate_variables_from_keys(candidate_files: list[dict[str, Any]]) -> dict[str, list[str]]:
+    fields = {
+        "wind_u": ("10u", "u10", "uwind", "u_wind", "x_wind", "eastward_wind", "u-component"),
+        "wind_v": ("10v", "v10", "vwind", "v_wind", "y_wind", "northward_wind", "v-component"),
+        "wind_speed": ("wind_speed_at_10m", "wind_speed"),
+        "wind_direction": ("wind_direction_at_10m", "wind_direction"),
+        "pressure_msl": ("mslp", "prmsl", "msl", "mean_sea_level_pressure", "pressure"),
+        "temperature_near_surface": ("t2m", "2t", "tas", "air_temperature", "temperature", "temp"),
+        "gust": ("gust", "wind_gust"),
+        "cloud_cover": ("tcc", "cloud", "cloud_area_fraction"),
+        "precipitation": ("precip", "rain", "apcp", "tp", "precipitation"),
+    }
+    result: dict[str, list[str]] = {name: [] for name in fields}
+    for item in candidate_files:
+        key = str(item.get("key", ""))
+        lower = key.lower()
+        for name, tokens in fields.items():
+            if any(token in lower for token in tokens) and key not in result[name]:
+                result[name].append(key)
+    return {name: values[:10] for name, values in result.items()}
+
+
+def _select_discovered_ukv_cycle(cycles: list[str], request: UKMOUKVInspectRequest) -> str:
+    if request.cycle != "auto":
+        if not request.date:
+            return "(explicit cycle requested but --date missing)"
+        return f"{request.date}T{request.cycle}00Z"
+    return cycles[0] if cycles else "(not discovered)"
+
+
 def forecast_hour_sequence(hours: int, step_hours: int) -> list[int]:
     if hours < 0:
         raise ValidationError("--hours must be zero or greater")
@@ -751,6 +1115,27 @@ def _validate_ecmwf_request(request: ECMWFWeatherRequest) -> None:
         if not request.date:
             raise ValidationError("--date YYYYMMDD is required when --cycle is explicit")
         _validate_date(request.date)
+    forecast_hour_sequence(request.hours, request.step_hours)
+
+
+def _validate_ukmo_ukv_request(request: UKMOUKVWeatherRequest) -> None:
+    if request.bbox.west < UKMO_UKV_DOMAIN.west or request.bbox.east > UKMO_UKV_DOMAIN.east:
+        raise ValidationError("UKV bbox is outside the supported UK/Ireland regional domain")
+    if request.bbox.south < UKMO_UKV_DOMAIN.south or request.bbox.north > UKMO_UKV_DOMAIN.north:
+        raise ValidationError("UKV bbox is outside the supported UK/Ireland regional domain")
+    if request.step_hours != 1:
+        raise ValidationError("UKV initial implementation expects hourly step-hours")
+    if request.hours > 54:
+        raise ValidationError("UKV hourly data is expected only to about 54 hours; use GFS or ECMWF for longer ranges")
+    if request.weather_grid_spacing_deg <= 0:
+        raise ValidationError("--weather-grid-spacing-deg must be greater than zero")
+    if request.cycle != "auto":
+        if request.cycle not in {"00", "06", "12", "18"}:
+            raise ValidationError("--cycle must be auto, 00, 06, 12, or 18")
+        if not request.date:
+            raise ValidationError("--date YYYYMMDD is required when --cycle is explicit")
+        _validate_date(request.date)
+    gfs_variables_for_preset(request.preset)
     forecast_hour_sequence(request.hours, request.step_hours)
 
 

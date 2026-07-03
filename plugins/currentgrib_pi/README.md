@@ -15,7 +15,7 @@ This is a v1 plugin scaffold:
 - dependency check command is wired
 - the main dialog is user-facing as Environmental GRIB Generator
 - complete weather/current GRIB generation is wired through `tidal-current-grib generate-environment-grib`
-- NOAA GFS weather, optional GFS Wave fields, existing weather files, TPXO cache currents, and existing current GRIB files are exposed as CLI-backed workflow choices
+- NOAA GFS weather, optional GFS Wave fields, Met Office UKV placeholder, ECMWF Open Data, existing weather files, TPXO cache currents, and existing current GRIB files are exposed as CLI-backed workflow choices
 - synthetic/local NetCDF generation is wired through the Python CLI
 - Copernicus NWS and Global live generation are wired through the Python CLI
 - Marine Institute Ireland ready-made Irish Sea current GRIB download is wired

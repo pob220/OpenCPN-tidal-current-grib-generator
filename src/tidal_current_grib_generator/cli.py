@@ -45,10 +45,16 @@ from tidal_current_grib_generator.weather import (
     ECMWFWeatherRequest,
     GFSWaveRequest,
     GFSWeatherRequest,
+    UKMO_UKV_SOURCE_LABEL,
+    UKMOUKVInspectRequest,
+    UKMOUKVWeatherRequest,
     gfs_cycle_candidates,
     generate_gfs_weather_grib,
     generate_ecmwf_weather_grib,
     generate_gfs_wave_grib,
+    generate_ukmo_ukv_weather_grib,
+    discover_ukmo_ukv_source,
+    inspect_ukmo_ukv_source,
     list_weather_providers,
 )
 
@@ -175,14 +181,35 @@ def build_parser() -> argparse.ArgumentParser:
     weather_providers.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     weather_providers.set_defaults(func=cmd_weather_providers)
 
+    inspect_ukv = subparsers.add_parser("inspect-ukv-source", help="Inspect Met Office UKV source availability without writing GRIB.")
+    inspect_ukv.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"))
+    inspect_ukv.add_argument("--date", help="UKV cycle date YYYYMMDD for explicit cycles.")
+    inspect_ukv.add_argument("--cycle", default="auto", help="auto or explicit cycle 00, 06, 12, 18.")
+    inspect_ukv.add_argument("--hours", type=int, required=True)
+    inspect_ukv.add_argument("--step-hours", type=int, default=1)
+    inspect_ukv.add_argument("--weather-grid-spacing-deg", type=float, default=0.025)
+    inspect_ukv.add_argument("--max-keys", type=int, default=200, help="Maximum S3 prefixes/objects to inspect.")
+    inspect_ukv.add_argument("--refresh-source-index", action="store_true", help="Reserved for future cached source indexes.")
+    inspect_ukv.add_argument("--json", action="store_true")
+    inspect_ukv.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    inspect_ukv.set_defaults(func=cmd_inspect_ukv_source)
+
+    discover_ukv = subparsers.add_parser("discover-ukv-source", help="Discover Met Office UKV AWS/Open Data object layout.")
+    discover_ukv.add_argument("--max-keys", type=int, default=200, help="Maximum S3 prefixes/objects to inspect.")
+    discover_ukv.add_argument("--refresh-source-index", action="store_true", help="Reserved for future cached source indexes.")
+    discover_ukv.add_argument("--json", action="store_true")
+    discover_ukv.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    discover_ukv.set_defaults(func=cmd_discover_ukv_source)
+
     generate_weather = subparsers.add_parser("generate-weather", help="Download/generate a weather GRIB.")
-    generate_weather.add_argument("--provider", choices=["gfs", "gfs_wave", "ecmwf_ifs_open", "dwd_icon_eu"], required=True)
+    generate_weather.add_argument("--provider", choices=["gfs", "gfs_wave", "ukmo_ukv", "ecmwf_ifs_open", "dwd_icon_eu"], required=True)
     generate_weather.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"))
     generate_weather.add_argument("--date", help="GFS cycle date YYYYMMDD for explicit cycles.")
     generate_weather.add_argument("--cycle", required=True, help="auto or explicit cycle 00, 06, 12, 18.")
     generate_weather.add_argument("--hours", type=int, required=True)
     generate_weather.add_argument("--step-hours", type=int, default=3)
     generate_weather.add_argument("--weather-preset", choices=["minimal", "routing", "marine"], default="routing")
+    generate_weather.add_argument("--weather-grid-spacing-deg", type=float, default=0.025)
     generate_weather.add_argument("--output", type=Path, required=True)
     generate_weather.add_argument("--overwrite", action="store_true")
     generate_weather.add_argument("--dry-run", action="store_true")
@@ -210,11 +237,12 @@ def build_parser() -> argparse.ArgumentParser:
     environment.add_argument("--step-hours", type=int, default=3)
     environment.add_argument(
         "--weather-provider",
-        choices=["none", "existing-file", "gfs", "ecmwf_ifs_open", "dwd_icon_eu"],
+        choices=["none", "existing-file", "gfs", "ukmo_ukv", "ecmwf_ifs_open", "dwd_icon_eu"],
         default="gfs",
     )
     environment.add_argument("--weather-file", type=Path)
     environment.add_argument("--weather-preset", choices=["minimal", "routing", "marine"], default="routing")
+    environment.add_argument("--weather-grid-spacing-deg", type=float, default=0.025)
     environment.add_argument("--include-waves", action="store_true")
     environment.add_argument("--wave-step-hours", type=int)
     environment.add_argument(
@@ -908,6 +936,78 @@ def cmd_weather_providers(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_inspect_ukv_source(args: argparse.Namespace) -> int:
+    bbox = BoundingBox.from_values(args.bbox)
+    inspection = inspect_ukmo_ukv_source(
+        UKMOUKVInspectRequest(
+            bbox=bbox,
+            hours=args.hours,
+            step_hours=args.step_hours,
+            cycle=args.cycle,
+            date=args.date,
+            weather_grid_spacing_deg=args.weather_grid_spacing_deg,
+            max_keys=args.max_keys,
+            refresh_source_index=args.refresh_source_index,
+        )
+    )
+    if args.json:
+        print(json.dumps(inspection, indent=2, sort_keys=True))
+    else:
+        print(f"provider: {inspection['provider']}", flush=True)
+        print(f"source: {inspection['source']}", flush=True)
+        print(f"status: {inspection['status']}", flush=True)
+        print(f"implemented: {inspection['implemented']}", flush=True)
+        print(f"selected_cycle: {inspection['selected_cycle']}", flush=True)
+        print(f"source_bucket: {inspection['source_bucket'] or '(not discovered)'}", flush=True)
+        print(f"source_region: {inspection['source_region']}", flush=True)
+        print(f"anonymous_listing: {inspection['anonymous_listing']}", flush=True)
+        if inspection.get("listing_error"):
+            print(f"listing_error: {inspection['listing_error']}", flush=True)
+        print(f"top_level_prefixes: {inspection['top_level_prefixes'] or '(none)'}", flush=True)
+        print(f"likely_ukv_prefixes: {inspection['likely_ukv_prefixes'] or '(none)'}", flush=True)
+        print(f"available_model_runs: {inspection['available_model_runs'] or '(not discovered)'}", flush=True)
+        print(f"source_paths_or_urls: {inspection['source_paths_or_urls'] or '(none)'}", flush=True)
+        print(f"requested_forecast_hours: {inspection['requested_forecast_hours']}", flush=True)
+        print(f"available_forecast_hours: {inspection['available_forecast_hours'] or '(not discovered)'}", flush=True)
+        print(f"available_near_surface_variables: {inspection['available_near_surface_variables'] or '(not discovered)'}", flush=True)
+        print(f"coordinate_variables: {inspection['coordinate_variables'] or '(not discovered)'}", flush=True)
+        print(f"grid_mapping: {inspection['grid_mapping'] or '(not discovered)'}", flush=True)
+        print(f"source_grid_shape: {inspection['source_grid_shape'] or '(not discovered)'}", flush=True)
+        print(f"source_lat_lon_coverage: {inspection['source_lat_lon_coverage'] or '(not discovered)'}", flush=True)
+        print(f"bbox_intersects_domain: {inspection['bbox_intersects_domain']}", flush=True)
+        print("candidate_variables:", flush=True)
+        for key, values in inspection["candidate_variables"].items():
+            print(f"  {key}: {values or '(not discovered)'}", flush=True)
+        print("candidate_files:", flush=True)
+        for item in inspection["candidate_files"][:20]:
+            print(f"  {item['key']} ({item['size']} bytes)", flush=True)
+        print(f"blocker: {inspection['blocker']}", flush=True)
+    return 0
+
+
+def cmd_discover_ukv_source(args: argparse.Namespace) -> int:
+    discovery = discover_ukmo_ukv_source(max_keys=args.max_keys)
+    if args.json:
+        print(json.dumps(discovery, indent=2, sort_keys=True))
+    else:
+        print(f"bucket: s3://{discovery['bucket']}/", flush=True)
+        print(f"region: {discovery['region']}", flush=True)
+        print(f"anonymous_listing: {discovery['anonymous_listing']}", flush=True)
+        if discovery.get("error"):
+            print(f"error: {discovery['error']}", flush=True)
+        print("top_level_prefixes:", flush=True)
+        for prefix in discovery["top_level_prefixes"]:
+            print(f"  {prefix}", flush=True)
+        print("likely_ukv_prefixes:", flush=True)
+        for prefix in discovery["likely_ukv_prefixes"]:
+            print(f"  {prefix}", flush=True)
+        print(f"object_count_seen: {discovery['object_count_seen']}", flush=True)
+        print("candidate_files:", flush=True)
+        for item in discovery["candidate_files"][:50]:
+            print(f"  {item['key']} ({item['size']} bytes)", flush=True)
+    return 0
+
+
 def cmd_generate_weather(args: argparse.Namespace) -> int:
     bbox = BoundingBox.from_values(args.bbox)
     if args.provider == "gfs":
@@ -951,6 +1051,21 @@ def cmd_generate_weather(args: argparse.Namespace) -> int:
             preset=args.weather_preset,
         )
         generate_func = generate_ecmwf_weather_grib
+    elif args.provider == "ukmo_ukv":
+        source_label = UKMO_UKV_SOURCE_LABEL
+        request = UKMOUKVWeatherRequest(
+            bbox=bbox,
+            output=args.output,
+            hours=args.hours,
+            step_hours=args.step_hours,
+            cycle=args.cycle,
+            date=args.date,
+            overwrite=args.overwrite,
+            dry_run=args.dry_run,
+            preset=args.weather_preset,
+            weather_grid_spacing_deg=args.weather_grid_spacing_deg,
+        )
+        generate_func = generate_ukmo_ukv_weather_grib
     elif args.provider == "dwd_icon_eu":
         raise ValidationError(
             "DWD ICON-EU provider is not implemented yet; ECMWF Open Data and GFS are available in this CLI build"
@@ -1108,7 +1223,7 @@ def cmd_generate_environment_grib(args: argparse.Namespace) -> int:
             scan_grib_messages(weather_path)
             inputs.append(("weather", weather_path))
             intermediates["weather"] = str(weather_path)
-        elif args.weather_provider in {"gfs", "ecmwf_ifs_open"}:
+        elif args.weather_provider in {"gfs", "ukmo_ukv", "ecmwf_ifs_open"}:
             weather_output = temp_dir / f"weather_{args.weather_provider}.grb2"
             if args.weather_provider == "gfs":
                 if args.metadata_summary:
@@ -1140,6 +1255,23 @@ def cmd_generate_environment_grib(args: argparse.Namespace) -> int:
                         progress_callback=_weather_progress_callback(args.verbose or args.metadata_summary),
                     )
                     wave_result = None
+            elif args.weather_provider == "ukmo_ukv":
+                if args.metadata_summary:
+                    print("generating Met Office UKV weather GRIB", flush=True)
+                weather_result = generate_ukmo_ukv_weather_grib(
+                    UKMOUKVWeatherRequest(
+                        bbox=bbox,
+                        output=weather_output,
+                        hours=args.hours,
+                        step_hours=args.step_hours,
+                        cycle=args.cycle,
+                        date=args.date,
+                        overwrite=True,
+                        preset=args.weather_preset,
+                        weather_grid_spacing_deg=args.weather_grid_spacing_deg,
+                    ),
+                    progress_callback=_weather_progress_callback(args.verbose or args.metadata_summary),
+                )
             else:
                 if args.metadata_summary:
                     print("generating ECMWF Open Data weather GRIB", flush=True)
