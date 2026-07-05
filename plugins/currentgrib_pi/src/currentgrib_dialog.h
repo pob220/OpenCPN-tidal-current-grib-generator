@@ -42,6 +42,7 @@ private:
   bool ConfirmLargeCopernicusRequest();
   bool ValidateUkvRequest();
   bool AutoWouldUseMarineIe() const;
+  bool NeedsCopernicusCredentials() const;
   void UpdateProviderUi();
   void RefreshOutputFilenameDefault();
   void LoadSettings();

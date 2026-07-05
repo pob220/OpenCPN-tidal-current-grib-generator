@@ -629,29 +629,54 @@ def generate_copernicus_global_wave_grib(
     if output.exists() and not request.overwrite:
         raise ValidationError(f"output already exists: {output}; use --overwrite to replace it")
 
-    forecast_hours = forecast_hour_sequence(request.hours, request.step_hours)
     download_dir = (request.download_directory or output.parent / "copernicus_wave_downloads").expanduser()
-    start = request.start.astimezone(timezone.utc)
-    end = start + timedelta(hours=request.hours)
-    download_filename = f"copernicus_global_waves_{start:%Y%m%dT%H%MZ}_{request.hours}h.nc"
+    requested_start = request.start.astimezone(timezone.utc)
+    requested_end = requested_start + timedelta(hours=request.hours)
+    wave_start, wave_end, forecast_hours = _copernicus_wave_time_window(
+        requested_start,
+        requested_end,
+        request.step_hours,
+    )
+    download_filename = f"copernicus_global_waves_{wave_start:%Y%m%dT%H%MZ}_{int((wave_end - wave_start).total_seconds() // 3600)}h.nc"
 
     if request.dry_run:
         return WeatherGenerateResult(
             provider="copernicus_global_waves",
             source=COPERNICUS_GLOBAL_WAVE_SOURCE_LABEL,
             model=COPERNICUS_GLOBAL_WAVE_DATASET_ID,
-            cycle=WeatherCycle(start.strftime("%Y%m%d"), f"{start.hour:02d}"),
+            cycle=WeatherCycle(wave_start.strftime("%Y%m%d"), f"{wave_start.hour:02d}"),
             bbox=request.bbox,
             forecast_hours=forecast_hours,
             output=output,
             byte_count=0,
             message_count=0,
-            inspection={"stream_valid": False, "message_count": 0, "dry_run": True},
+            inspection={
+                "stream_valid": False,
+                "message_count": 0,
+                "dry_run": True,
+                "requested_start": requested_start.isoformat(),
+                "requested_end": requested_end.isoformat(),
+                "actual_wave_valid_times": _wave_valid_time_strings(wave_start, forecast_hours),
+            },
             urls=[],
             variables_levels={
                 "product": COPERNICUS_GLOBAL_WAVE_PRODUCT_ID,
                 "dataset_id": COPERNICUS_GLOBAL_WAVE_DATASET_ID,
                 "variables": list(COPERNICUS_GLOBAL_WAVE_VARIABLES),
+            },
+        )
+
+    if wave_start != requested_start:
+        _progress(
+            progress_callback,
+            "adjusted Copernicus Global Waves time range",
+            {
+                "requested_start": requested_start.isoformat(),
+                "requested_end": requested_end.isoformat(),
+                "wave_start": wave_start.isoformat(),
+                "wave_end": wave_end.isoformat(),
+                "step_hours": request.step_hours,
+                "valid_times": _wave_valid_time_strings(wave_start, forecast_hours),
             },
         )
 
@@ -662,15 +687,17 @@ def generate_copernicus_global_wave_grib(
             "dataset_id": COPERNICUS_GLOBAL_WAVE_DATASET_ID,
             "variables": list(COPERNICUS_GLOBAL_WAVE_VARIABLES),
             "bbox": request.bbox.__dict__,
-            "start": start.isoformat(),
-            "end": end.isoformat(),
+            "requested_start": requested_start.isoformat(),
+            "requested_end": requested_end.isoformat(),
+            "start": wave_start.isoformat(),
+            "end": wave_end.isoformat(),
         },
     )
     download = download_copernicus_subset(
         CopernicusDownloadRequest(
             bbox=request.bbox,
-            start=start,
-            end=end,
+            start=wave_start,
+            end=wave_end,
             output_directory=download_dir,
             output_filename=download_filename,
             username=request.username,
@@ -687,7 +714,7 @@ def generate_copernicus_global_wave_grib(
     dataset = _load_copernicus_wave_dataset(
         download.path,
         request.bbox,
-        start,
+        wave_start,
         forecast_hours,
         request.grid_spacing_deg,
     )
@@ -696,7 +723,7 @@ def generate_copernicus_global_wave_grib(
     try:
         with tempfile.NamedTemporaryFile(prefix=output.name + ".", suffix=".tmp", dir=output.parent, delete=False) as tmp:
             tmp_path = Path(tmp.name)
-        _write_wave_grib2(dataset, start, tmp_path, progress_callback=progress_callback)
+        _write_wave_grib2(dataset, wave_start, tmp_path, progress_callback=progress_callback)
         scan = scan_grib_messages(tmp_path)
         expected_messages = len(forecast_hours) * 3
         if scan.message_count != expected_messages:
@@ -712,6 +739,9 @@ def generate_copernicus_global_wave_grib(
             f"f{hour:03d}_{short_name}": count
             for (hour, short_name), count in dataset.valid_cell_count.items()
         }
+        inspection["requested_start"] = requested_start.isoformat()
+        inspection["requested_end"] = requested_end.isoformat()
+        inspection["actual_wave_valid_times"] = _wave_valid_time_strings(wave_start, forecast_hours)
         tmp_path.replace(output)
         tmp_path = None
     finally:
@@ -722,7 +752,7 @@ def generate_copernicus_global_wave_grib(
         provider="copernicus_global_waves",
         source=COPERNICUS_GLOBAL_WAVE_SOURCE_LABEL,
         model=COPERNICUS_GLOBAL_WAVE_DATASET_ID,
-        cycle=WeatherCycle(start.strftime("%Y%m%d"), f"{start.hour:02d}"),
+        cycle=WeatherCycle(wave_start.strftime("%Y%m%d"), f"{wave_start.hour:02d}"),
         bbox=request.bbox,
         forecast_hours=forecast_hours,
         output=output,
@@ -736,6 +766,9 @@ def generate_copernicus_global_wave_grib(
             "variables": list(COPERNICUS_GLOBAL_WAVE_VARIABLES),
             "output_short_names": ["swh", "perpw", "dirpw"],
             "missing_values": "GRIB2 bitmap/missingValue for masked or NaN land cells",
+            "requested_start": requested_start.isoformat(),
+            "requested_end": requested_end.isoformat(),
+            "actual_wave_valid_times": _wave_valid_time_strings(wave_start, forecast_hours),
         },
     )
 
@@ -2702,6 +2735,47 @@ def forecast_hour_sequence(hours: int, step_hours: int) -> list[int]:
     if hours % step_hours != 0:
         raise ValidationError("--hours must be evenly divisible by --step-hours")
     return list(range(0, hours + 1, step_hours))
+
+
+def _copernicus_wave_time_window(
+    requested_start: datetime,
+    requested_end: datetime,
+    step_hours: int,
+) -> tuple[datetime, datetime, list[int]]:
+    wave_start = _ceil_datetime_to_hour_cadence(requested_start, step_hours)
+    wave_end = _floor_datetime_to_hour_cadence(requested_end, step_hours)
+    if wave_start > wave_end:
+        raise ValidationError(
+            "requested time window contains no Copernicus Global Waves valid times "
+            f"on the {step_hours}-hour cadence"
+        )
+    duration_hours = int((wave_end - wave_start).total_seconds() // 3600)
+    return wave_start, wave_end, forecast_hour_sequence(duration_hours, step_hours)
+
+
+def _ceil_datetime_to_hour_cadence(value: datetime, step_hours: int) -> datetime:
+    base = value.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    if value.astimezone(timezone.utc) != base:
+        base += timedelta(hours=1)
+    remainder = base.hour % step_hours
+    if remainder:
+        base += timedelta(hours=step_hours - remainder)
+    return base
+
+
+def _floor_datetime_to_hour_cadence(value: datetime, step_hours: int) -> datetime:
+    base = value.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    remainder = base.hour % step_hours
+    if remainder:
+        base -= timedelta(hours=remainder)
+    return base
+
+
+def _wave_valid_time_strings(reference: datetime, forecast_hours: list[int]) -> list[str]:
+    return [
+        (reference + timedelta(hours=hour)).isoformat().replace("+00:00", "Z")
+        for hour in forecast_hours
+    ]
 
 
 def ukmo_ukv_forecast_hour_sequence(hours: int, step_hours: int) -> list[int]:

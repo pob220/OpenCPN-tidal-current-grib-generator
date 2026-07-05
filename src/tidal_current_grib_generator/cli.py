@@ -1324,7 +1324,7 @@ def cmd_generate_environment_grib(args: argparse.Namespace) -> int:
         raise ValidationError("--output must be a file path, not a directory")
     if output.exists() and not args.overwrite:
         raise ValidationError(f"output already exists: {output}; use --overwrite to replace it")
-    if args.weather_provider == "none" and args.current_source == "none":
+    if args.weather_provider == "none" and args.current_source == "none" and not args.include_waves:
         raise ValidationError("at least one of weather or current must be enabled")
     if args.include_waves and args.wave_provider == "gfs_wave" and args.weather_provider not in {"gfs"}:
         raise ValidationError("--include-waves with --wave-provider gfs_wave is currently supported only with --weather-provider gfs")
@@ -1352,6 +1352,8 @@ def cmd_generate_environment_grib(args: argparse.Namespace) -> int:
     if warnings_for_validation:
         warnings.append(warnings_for_validation)
     weather_cycle_time: str | None = None
+    weather_result = None
+    wave_result = None
     try:
         if args.metadata_summary:
             print("generating environmental GRIB", flush=True)
@@ -1370,6 +1372,7 @@ def cmd_generate_environment_grib(args: argparse.Namespace) -> int:
             if args.include_waves:
                 print(f"wave_provider: {args.wave_provider}", flush=True)
                 print(f"wave_step_hours: {wave_step_hours}", flush=True)
+                print(f"requested_wave_forecast_offsets: {','.join(str(hour) for hour in range(0, args.hours + 1, wave_step_hours))}", flush=True)
                 if args.step_hours != wave_step_hours:
                     print(
                         f"Wave fields will be included every {wave_step_hours} hours; "
@@ -1481,53 +1484,30 @@ def cmd_generate_environment_grib(args: argparse.Namespace) -> int:
             inputs.append(("weather", weather_output))
             intermediates["weather"] = str(weather_output)
 
-            if args.include_waves:
-                wave_output = temp_dir / f"weather_{args.wave_provider}.grb2"
-                if wave_result is None:
-                    if args.metadata_summary:
-                        print(f"generating wave GRIB provider: {args.wave_provider}", flush=True)
-                    if args.wave_provider == "gfs_wave":
-                        wave_result = generate_gfs_wave_grib(
-                            GFSWaveRequest(
-                                bbox=bbox,
-                                output=wave_output,
-                                hours=args.hours,
-                                step_hours=wave_step_hours,
-                                cycle=weather_result.cycle.cycle if weather_result.cycle.cycle != "auto" else args.cycle,
-                                date=weather_result.cycle.date if weather_result.cycle.date != "auto" else args.date,
-                                overwrite=True,
-                            ),
-                            progress_callback=_weather_progress_callback(args.verbose or args.metadata_summary),
-                        )
-                    elif args.wave_provider == "copernicus_global_waves":
-                        wave_start = parse_utc_datetime(_environment_current_start(args.start, weather_cycle_time))
-                        username = args.username or os.environ.get(args.username_env)
-                        password = os.environ.get(args.password_env)
-                        if not username:
-                            raise ValidationError("--username or username environment variable is required for Copernicus Global Waves")
-                        if not password:
-                            raise ValidationError(f"{args.password_env} is required for Copernicus Global Waves")
-                        wave_result = generate_copernicus_global_wave_grib(
-                            CopernicusGlobalWaveRequest(
-                                bbox=bbox,
-                                output=wave_output,
-                                start=wave_start,
-                                hours=args.hours,
-                                step_hours=wave_step_hours,
-                                username=username,
-                                password=password,
-                                download_directory=(args.download_directory / "waves") if args.download_directory else temp_dir / "wave_downloads",
-                                overwrite=True,
-                                grid_spacing_deg=args.weather_grid_spacing_deg,
-                            ),
-                            progress_callback=_weather_progress_callback(args.verbose or args.metadata_summary),
-                        )
-                    else:
-                        raise ValidationError(f"unsupported wave provider: {args.wave_provider}")
-                inputs.append(("waves", wave_output))
-                intermediates["waves"] = str(wave_output)
         elif args.weather_provider == "dwd_icon_eu":
             raise ValidationError("DWD ICON-EU provider is not implemented yet")
+
+        if args.include_waves:
+            wave_output = temp_dir / f"weather_{args.wave_provider}.grb2"
+            if wave_result is None:
+                wave_result = _generate_environment_wave_source(
+                    args,
+                    bbox=bbox,
+                    output=wave_output,
+                    hours=args.hours,
+                    wave_step_hours=wave_step_hours,
+                    weather_cycle_time=weather_cycle_time,
+                    weather_result=weather_result,
+                    temp_dir=temp_dir,
+                )
+            inputs.append(("waves", wave_output))
+            intermediates["waves"] = str(wave_output)
+            if args.metadata_summary:
+                print(f"wave forecast hours: {','.join(str(hour) for hour in wave_result.forecast_hours)}", flush=True)
+                valid_times = wave_result.variables_levels.get("actual_wave_valid_times") if wave_result.variables_levels else None
+                if valid_times:
+                    print(f"actual_wave_valid_times: {','.join(str(value) for value in valid_times)}", flush=True)
+                print(f"wave messages: {wave_result.message_count}", flush=True)
 
         if current_source in {
             "tpxo-cache",
@@ -1622,6 +1602,60 @@ def _copernicus_wave_start_from_args(args: argparse.Namespace) -> datetime:
     if args.date is None:
         raise ValidationError("--date YYYYMMDD is required when --cycle is explicit")
     return parse_utc_datetime(f"{args.date}T{args.cycle}:00:00Z")
+
+
+def _generate_environment_wave_source(
+    args: argparse.Namespace,
+    *,
+    bbox: BoundingBox,
+    output: Path,
+    hours: int,
+    wave_step_hours: int,
+    weather_cycle_time: str | None,
+    weather_result: Any,
+    temp_dir: Path,
+) -> WeatherGenerateResult:
+    if args.metadata_summary:
+        print(f"generating wave GRIB provider: {args.wave_provider}", flush=True)
+    if args.wave_provider == "gfs_wave":
+        if weather_result is None:
+            raise ValidationError("--wave-provider gfs_wave requires generated GFS weather")
+        return generate_gfs_wave_grib(
+            GFSWaveRequest(
+                bbox=bbox,
+                output=output,
+                hours=hours,
+                step_hours=wave_step_hours,
+                cycle=weather_result.cycle.cycle if weather_result.cycle.cycle != "auto" else args.cycle,
+                date=weather_result.cycle.date if weather_result.cycle.date != "auto" else args.date,
+                overwrite=True,
+            ),
+            progress_callback=_weather_progress_callback(args.verbose or args.metadata_summary),
+        )
+    if args.wave_provider == "copernicus_global_waves":
+        wave_start = parse_utc_datetime(_environment_current_start(args.start, weather_cycle_time))
+        username = args.username or os.environ.get(args.username_env)
+        password = os.environ.get(args.password_env)
+        if not username:
+            raise ValidationError("--username or username environment variable is required for Copernicus Global Waves")
+        if not password:
+            raise ValidationError(f"{args.password_env} is required for Copernicus Global Waves")
+        return generate_copernicus_global_wave_grib(
+            CopernicusGlobalWaveRequest(
+                bbox=bbox,
+                output=output,
+                start=wave_start,
+                hours=hours,
+                step_hours=wave_step_hours,
+                username=username,
+                password=password,
+                download_directory=(args.download_directory / "waves") if args.download_directory else temp_dir / "wave_downloads",
+                overwrite=True,
+                grid_spacing_deg=args.weather_grid_spacing_deg,
+            ),
+            progress_callback=_weather_progress_callback(args.verbose or args.metadata_summary),
+        )
+    raise ValidationError(f"unsupported wave provider: {args.wave_provider}")
 
 
 def _generate_gfs_environment_with_waves(
@@ -2473,6 +2507,14 @@ def _weather_progress_callback(verbose: bool):
             print(
                 f"downloading Copernicus Global Waves NetCDF "
                 f"{details.get('start')} to {details.get('end')}",
+                flush=True,
+            )
+        elif step == "adjusted Copernicus Global Waves time range":
+            print(
+                "Copernicus Global Waves is "
+                f"{details.get('step_hours')}-hourly; requested start {details.get('requested_start')} "
+                "is not on the wave cadence. "
+                f"Using wave valid times from {details.get('wave_start')} to {details.get('wave_end')}.",
                 flush=True,
             )
         elif step == "downloaded Copernicus Global Waves NetCDF":

@@ -533,11 +533,7 @@ void CurrentGribDialog::OnGenerate(wxCommandEvent&) {
     wxMessageBox(message, "Missing TPXO model", wxOK | wxICON_WARNING, this);
     return;
   }
-  bool copernicusWaves = m_generateWeather->GetValue() && m_includeWaves->GetValue() &&
-      m_waveProvider->GetStringSelection().Contains("Copernicus");
-  bool copernicusForecast = copernicusWaves || (m_generateCurrents->GetValue() &&
-      (currentSource.Contains("Copernicus") ||
-       (currentSource.Contains("Auto") && !AutoWouldUseMarineIe())));
+  bool copernicusForecast = NeedsCopernicusCredentials();
   if (copernicusForecast && (m_username->GetValue().empty() || m_password->GetValue().empty())) {
     wxString message = "Enter your Copernicus Marine username and password for this operation. The password is held in memory only and is not passed on the command line.";
     AppendLog(message);
@@ -730,6 +726,20 @@ bool CurrentGribDialog::AutoWouldUseMarineIe() const {
          m_durationHours->GetValue() <= 72;
 }
 
+bool CurrentGribDialog::NeedsCopernicusCredentials() const {
+  bool waveCopernicus = m_generateWeather->GetValue() &&
+      m_includeWaves->GetValue() &&
+      m_waveProvider->GetStringSelection().Contains("Copernicus");
+  if (waveCopernicus) {
+    return true;
+  }
+  if (!m_generateCurrents->GetValue()) {
+    return false;
+  }
+  wxString currentSource = m_currentSource->GetStringSelection();
+  return currentSource.Contains("Copernicus") || currentSource.Contains("Auto");
+}
+
 void CurrentGribDialog::UpdateProviderUi() {
   int mode = m_mode->GetSelection();
   wxString provider = m_provider->GetStringSelection();
@@ -748,10 +758,11 @@ void CurrentGribDialog::UpdateProviderUi() {
   bool weatherUkv = weatherEnabled && m_weatherProvider->GetStringSelection().Contains("Met Office UKV");
   bool weatherGenerated = weatherEnabled && !weatherExisting;
   bool waveEnabled = weatherGenerated && m_includeWaves->GetValue();
+  if (waveEnabled && !weatherGfs && m_waveProvider->GetStringSelection().Contains("NOAA")) {
+    m_waveProvider->SetSelection(1);
+  }
   bool waveCopernicus = waveEnabled && m_waveProvider->GetStringSelection().Contains("Copernicus");
-  bool currentCopernicus = waveCopernicus || (currentsEnabled &&
-      (m_currentSource->GetStringSelection().Contains("Copernicus") ||
-       (m_currentSource->GetStringSelection().Contains("Auto") && !AutoWouldUseMarineIe())));
+  bool needsCopernicusCredentials = NeedsCopernicusCredentials();
   bool showTpxoModel = currentTpxoDirect || currentTpxoCache;
 
   auto showPair = [](wxWindow* label, wxWindow* control, bool show) {
@@ -770,15 +781,12 @@ void CurrentGribDialog::UpdateProviderUi() {
   if (!weatherGenerated) {
     m_includeWaves->SetValue(false);
   }
-  if (!weatherGfs && m_waveProvider->GetStringSelection().Contains("NOAA")) {
-    m_waveProvider->SetSelection(1);
-  }
   m_waveProvider->Enable(waveEnabled);
   m_existingWeatherFile->Enable(weatherExisting);
   m_currentSource->Enable(m_generateCurrents->GetValue());
   showPair(m_existingCurrentFileLabel, m_existingCurrentFile, currentExisting);
-  showPair(m_usernameLabel, m_username, currentCopernicus);
-  showPair(m_passwordLabel, m_password, currentCopernicus);
+  showPair(m_usernameLabel, m_username, needsCopernicusCredentials);
+  showPair(m_passwordLabel, m_password, needsCopernicusCredentials);
   showPair(m_tpxoModelDirLabel, m_tpxoModelDir, showTpxoModel);
   showPair(m_tpxoModelNameLabel, m_tpxoModelName, showTpxoModel);
   showPair(m_tpxoGridSpacingLabel, m_tpxoGridSpacing, showTpxoModel);
@@ -786,11 +794,11 @@ void CurrentGribDialog::UpdateProviderUi() {
   showPair(m_tpxoCacheFileLabel, m_tpxoCacheFile, currentTpxoCache);
   showPair(m_prepareTpxoCacheLabel, m_prepareTpxoCacheButton, currentTpxoCache);
   showPair(m_localNetcdfLabel, m_localNetcdf, false);
-  m_rememberUsername->Show(currentCopernicus);
+  m_rememberUsername->Show(needsCopernicusCredentials);
   m_existingCurrentFile->Enable(currentExisting);
-  m_username->Enable(currentCopernicus);
-  m_password->Enable(currentCopernicus);
-  m_rememberUsername->Enable(currentCopernicus);
+  m_username->Enable(needsCopernicusCredentials);
+  m_password->Enable(needsCopernicusCredentials);
+  m_rememberUsername->Enable(needsCopernicusCredentials);
   m_tpxoModelDir->Enable(showTpxoModel);
   m_tpxoModelName->Enable(showTpxoModel);
   m_tpxoGridSpacing->Enable(showTpxoModel);
@@ -835,8 +843,8 @@ void CurrentGribDialog::UpdateProviderUi() {
     m_providerNote->SetLabel("Source: TPXO10 astronomical tide model. Astronomical tide only; does not include surge, wind residual current, river flow, or forecast-model corrections.");
   } else if (currentMarine) {
     m_providerNote->SetLabel("Source: Marine.ie Irish Sea latest run. No credentials; valid time range depends on provider run time.");
-  } else if (currentCopernicus) {
-    m_providerNote->SetLabel("Source: Copernicus Marine forecast/model currents. Username/password are used for this operation only; password is passed via environment, not command line.");
+  } else if (needsCopernicusCredentials) {
+    m_providerNote->SetLabel("Source: Copernicus Marine data. Username/password are used for this operation only; password is passed via environment, not command line.");
   } else if (!currentsEnabled) {
     m_providerNote->SetLabel("Currents disabled. Output will be weather-only if weather is enabled.");
   } else {
@@ -1208,7 +1216,8 @@ wxString CurrentGribDialog::BuildGenerateCommand() const {
     command += " --model-dir " + ShellQuote(m_tpxoModelDir->GetPath()) +
                " --model-name " + ShellQuote(m_tpxoModelName->GetValue()) +
                " --grid-spacing-deg " + ShellQuote(m_tpxoGridSpacing->GetValue());
-  } else if (currentSource == "copernicus_nws" || currentSource == "copernicus_global" || currentSource == "auto") {
+  }
+  if (NeedsCopernicusCredentials()) {
     wxFileName downloadDir;
     downloadDir.AssignDir(m_outputDir->GetPath());
     downloadDir.AppendDir("currentgrib_downloads");
@@ -1285,24 +1294,11 @@ wxString CurrentGribDialog::OutputPath() const {
 wxString CurrentGribDialog::SourceLabel() const {
   wxString weather = m_generateWeather->GetValue() ? m_weatherProvider->GetStringSelection() : "None";
   wxString current = m_generateCurrents->GetValue() ? m_currentSource->GetStringSelection() : "None";
-  return "Environmental GRIB: weather=" + weather + ", currents=" + current;
-
-  int mode = m_mode->GetSelection();
-  if (mode == 1 && m_useTpxoCache->GetValue()) return "TPXO10 astronomical tide model cache";
-  if (mode == 1) return "TPXO10 astronomical tide model";
-  if (mode == 2) return "Local NetCDF model current";
-  if (mode == 3) return "Synthetic test current";
-  wxString provider = m_provider->GetStringSelection();
-  if (IsMarineIeProvider(provider) || (provider == "Auto" && AutoWouldUseMarineIe())) {
-    return "Marine Institute Ireland Irish Sea forecast/model current";
+  wxString waves = "None";
+  if (m_generateWeather->GetValue() && m_includeWaves->GetValue()) {
+    waves = m_waveProvider->GetStringSelection();
   }
-  if (provider.Contains("North-West Shelf")) {
-    return "Copernicus Marine NWS forecast/model current";
-  }
-  if (provider.Contains("Global")) {
-    return "Copernicus Marine Global forecast/model current";
-  }
-  return "Auto forecast/model current provider";
+  return "Environmental GRIB: weather=" + weather + ", currents=" + current + ", waves=" + waves;
 }
 
 wxString CurrentGribDialog::ValidTimeSummary() const {
