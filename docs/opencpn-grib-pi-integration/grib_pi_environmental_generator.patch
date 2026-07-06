@@ -13,10 +13,10 @@ index 0416e34b8..8ab34e15c 100644
      src/GribSettingsDialog.cpp
 diff --git a/plugins/grib_pi/src/EnvironmentalGribDialog.cpp b/plugins/grib_pi/src/EnvironmentalGribDialog.cpp
 new file mode 100644
-index 000000000..427e4f04e
+index 000000000..93f5027d7
 --- /dev/null
 +++ b/plugins/grib_pi/src/EnvironmentalGribDialog.cpp
-@@ -0,0 +1,1537 @@
+@@ -0,0 +1,1495 @@
 +#include "EnvironmentalGribDialog.h"
 +
 +#include <wx/config.h>
@@ -247,11 +247,10 @@ index 000000000..427e4f04e
 +  m_south = new wxTextCtrl(scrolled, wxID_ANY, "50.5");
 +  m_east = new wxTextCtrl(scrolled, wxID_ANY, "-2.5");
 +  m_north = new wxTextCtrl(scrolled, wxID_ANY, "56.5");
-+  wxString presets[] = {"Custom bbox", "Current chart area", "Irish Sea TPXO test area",
-+                        "Irish Sea Marine Institute 3 day current GRIB",
-+                        "Irish Sea / North Channel Copernicus example",
-+                        "Tiny Copernicus connection test",
-+                        "Global Copernicus tiny connection test"};
++  wxString presets[] = {"Custom bbox", "Current chart area", "Irish Sea / North Channel",
++                        "Western English Channel", "North Sea", "Bay of Biscay",
++                        "Gulf Stream / Florida Straits", "US East Coast / Gulf Stream",
++                        "Caribbean"};
 +  m_presetChoice = new wxChoice(scrolled, wxID_ANY, wxDefaultPosition, wxDefaultSize, WXSIZEOF(presets), presets);
 +  m_presetChoice->SetSelection(0);
 +  m_startUtc = new wxTextCtrl(scrolled, wxID_ANY, DefaultStartUtc());
@@ -303,7 +302,7 @@ index 000000000..427e4f04e
 +  wxString modes[] = {"Forecast/model current GRIB",
 +                      "Tidal stream prediction from local TPXO model",
 +                      "Local NetCDF file",
-+                      "Synthetic test source"};
++                      "Synthetic source"};
 +  m_mode = new wxChoice(scrolled, wxID_ANY, wxDefaultPosition, wxDefaultSize, WXSIZEOF(modes), modes);
 +  m_mode->SetSelection(0);
 +
@@ -660,79 +659,37 @@ index 000000000..427e4f04e
 +    m_presetChoice->SetSelection(0);
 +    return;
 +  }
-+  if (selection == 2) {
-+    m_west->SetValue("-6.0");
-+    m_south->SetValue("53.0");
-+    m_east->SetValue("-5.5");
-+    m_north->SetValue("53.5");
-+    m_startUtc->SetValue("2026-07-04T00:00:00Z");
-+    m_durationHours->SetValue(6);
-+    m_stepHours->SetValue(1);
-+    m_tpxoGridSpacing->SetValue("0.05");
++  struct AreaPreset {
++    double west;
++    double south;
++    double east;
++    double north;
++    int currentSourceSelection;
++  };
++  const AreaPreset presets[] = {
++      {-8.5, 50.5, -2.5, 56.5, 5},
++      {-7.0, 48.0, -1.0, 51.5, 5},
++      {-5.0, 51.0, 9.0, 60.0, 5},
++      {-10.5, 43.0, -1.0, 48.5, 6},
++      {-81.0, 24.0, -77.0, 28.0, 7},
++      {-81.0, 24.0, -70.0, 36.0, 7},
++      {-85.0, 10.0, -60.0, 25.0, 7},
++  };
++  int areaIndex = selection - 2;
++  if (areaIndex >= 0 && areaIndex < static_cast<int>(WXSIZEOF(presets))) {
++    const AreaPreset& area = presets[areaIndex];
++    m_west->SetValue(wxString::Format("%.1f", area.west));
++    m_south->SetValue(wxString::Format("%.1f", area.south));
++    m_east->SetValue(wxString::Format("%.1f", area.east));
++    m_north->SetValue(wxString::Format("%.1f", area.north));
 +    m_generateCurrents->SetValue(true);
-+    m_currentSource->SetSelection(3);
++    if (area.currentSourceSelection >= 0 &&
++        area.currentSourceSelection < static_cast<int>(m_currentSource->GetCount())) {
++      m_currentSource->SetSelection(area.currentSourceSelection);
++    }
 +    RefreshOutputFilenameDefault();
 +    UpdateProviderUi();
-+    AppendLog("Applied Irish Sea TPXO test area preset.");
-+    return;
-+  }
-+  if (selection == 3) {
-+    m_west->SetValue("-6.994");
-+    m_south->SetValue("51.506");
-+    m_east->SetValue("-4.006");
-+    m_north->SetValue("55.494");
-+    m_durationHours->SetValue(72);
-+    m_stepHours->SetValue(1);
-+    m_generateCurrents->SetValue(true);
-+    m_currentSource->SetSelection(4);
-+    RefreshOutputFilenameDefault();
-+    UpdateProviderUi();
-+    AppendLog("Applied Irish Sea Marine Institute 3 day current GRIB preset.");
-+    return;
-+  }
-+  if (selection == 4) {
-+    m_west->SetValue("-8.5");
-+    m_south->SetValue("50.5");
-+    m_east->SetValue("-2.5");
-+    m_north->SetValue("56.5");
-+    m_startUtc->SetValue("2026-07-01T00:00:00Z");
-+    m_durationHours->SetValue(72);
-+    m_stepHours->SetValue(1);
-+    m_generateCurrents->SetValue(true);
-+    m_currentSource->SetSelection(5);
-+    RefreshOutputFilenameDefault();
-+    UpdateProviderUi();
-+    AppendLog("Applied Irish Sea / North Channel example preset.");
-+    return;
-+  }
-+  if (selection == 5) {
-+    m_west->SetValue("-5.5");
-+    m_south->SetValue("53.0");
-+    m_east->SetValue("-5.0");
-+    m_north->SetValue("53.5");
-+    m_startUtc->SetValue("2026-07-01T00:00:00Z");
-+    m_durationHours->SetValue(3);
-+    m_stepHours->SetValue(1);
-+    m_generateCurrents->SetValue(true);
-+    m_currentSource->SetSelection(5);
-+    RefreshOutputFilenameDefault();
-+    UpdateProviderUi();
-+    AppendLog("Applied Tiny Copernicus connection test preset.");
-+    return;
-+  }
-+  if (selection == 6) {
-+    m_west->SetValue("-40.5");
-+    m_south->SetValue("30.0");
-+    m_east->SetValue("-40.0");
-+    m_north->SetValue("30.5");
-+    m_startUtc->SetValue("2026-07-01T00:00:00Z");
-+    m_durationHours->SetValue(6);
-+    m_stepHours->SetValue(1);
-+    m_generateCurrents->SetValue(true);
-+    m_currentSource->SetSelection(6);
-+    RefreshOutputFilenameDefault();
-+    UpdateProviderUi();
-+    AppendLog("Applied Global Copernicus tiny connection test preset.");
++    AppendLog("Applied area preset: " + m_presetChoice->GetString(selection));
 +  }
 +}
 +
@@ -835,11 +792,12 @@ index 000000000..427e4f04e
 +  if (currentRtofs) {
 +    currentNote =
 +        "Current source: NOAA RTOFS Global ocean-current forecast. Global/no account. "
-+        "Useful for offshore ocean-current routing, including Gulf Stream-type circulation where model guidance is available.";
++        "Useful for offshore ocean-current routing, including Gulf Stream-type circulation where model guidance is available. "
++        "Current guidance is typically 6-hourly.";
 +  } else if (currentOfs) {
 +    currentNote =
-+        "Current source: NOAA OFS/S-111 coastal current forecast. U.S. coastal waters and Great Lakes. "
-+        "Experimental stub; not yet a complete GRIB generator.";
++        "Current source: NOAA OFS/S-111 coastal current forecast. Experimental stub. "
++        "U.S. coastal waters and Great Lakes. Not yet a complete GRIB generator.";
 +  }
 +
 +  if (weatherUkv) {
@@ -875,15 +833,15 @@ index 000000000..427e4f04e
 +    if (!currentNote.empty()) note += "\n" + currentNote;
 +    m_providerNote->SetLabel(note);
 +  } else if (currentTpxoCache) {
-+    m_providerNote->SetLabel("Source: TPXO10 astronomical tide model cache. Produces astronomical tidal currents from a local derived cache.");
++    m_providerNote->SetLabel("Source: TPXO10 astronomical tide model cache. TPXO provides astronomical tidal currents from local licensed model/cache data. It does not model Gulf Stream, surge, wind residuals, or river flow.");
 +  } else if (currentTpxoDirect) {
-+    m_providerNote->SetLabel("Source: TPXO10 astronomical tide model. Astronomical tide only; does not include surge, wind residual current, river flow, or forecast-model corrections.");
++    m_providerNote->SetLabel("Source: TPXO10 astronomical tide model. TPXO provides astronomical tidal currents from local licensed model/cache data. It does not model Gulf Stream, surge, wind residuals, or river flow.");
 +  } else if (currentMarine) {
-+    m_providerNote->SetLabel("Source: Marine.ie Irish Sea latest run. No credentials; valid time range depends on provider run time.");
++    m_providerNote->SetLabel("Source: Marine.ie Irish Sea model current GRIB. No Copernicus credentials required. Valid time range depends on provider run time.");
 +  } else if (!currentNote.empty()) {
 +    m_providerNote->SetLabel(currentNote);
 +  } else if (needsCopernicusCredentials) {
-+    m_providerNote->SetLabel("Source: Copernicus Marine data. Username/password are used for this operation only; password is passed via environment, not command line.");
++    m_providerNote->SetLabel("Source: Copernicus Marine model ocean currents. Account required. Username/password are used for this operation only; password is passed via environment, not command line.");
 +  } else if (!currentsEnabled) {
 +    m_providerNote->SetLabel("Currents disabled. Output will be weather-only if weather is enabled.");
 +  } else {
