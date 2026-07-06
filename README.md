@@ -511,3 +511,13 @@ The example CSV contains synthetic placeholder values only. Replace it with vali
 Generated current GRIBs are for planning and experimentation. They are not official navigation products. Local tidal races, overfalls, harbour entrances, wind-driven residuals, storm surge, river flow, and bathymetric effects may not be represented. Mariners must cross-check against official sources and local knowledge.
 
 Accuracy depends entirely on the source model.
+
+## Experimental OpenCPN grib_pi integration
+
+An experimental patch integrating the Environmental GRIB Generator workflow into OpenCPN's stock grib_pi plugin is available here:
+
+docs/opencpn-grib-pi-integration/
+
+This adds a Generate GRIB action inside grib_pi. The dialog calls the tidal-current-grib helper to generate one combined weather, wave, and current GRIB, then opens it in grib_pi for normal display and Weather Routing use.
+
+This is source-build experimental work, not a Plugin Catalogue release.
