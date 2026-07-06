@@ -21,6 +21,8 @@ sources. It does not replace official navigation products.
 | --- | --- | --- | --- | --- |
 | Copernicus Marine NWS currents | North-West European Shelf | Copernicus account | NetCDF converted to GRIB1 current fields | High-resolution forecast/model currents for UK/Ireland/North Sea/Celtic Sea region. |
 | Copernicus Marine Global currents | Global ocean | Copernicus account | NetCDF converted to GRIB1 current fields | Lower-resolution global forecast/model currents. |
+| NOAA RTOFS Global currents | Global ocean model; current generator uses NOAA regional high-value NetCDF domains where available | No account | NetCDF converted to GRIB1 current fields | NOAA operational model currents, useful for offshore/Gulf Stream-type circulation where RTOFS guidance is available. |
+| NOAA OFS / S-111 coastal currents | U.S. coastal waters and Great Lakes | No account | S-111/HDF5 | Experimental stub; not yet a complete GRIB generator. |
 | Marine.ie Irish Sea currents | Irish Sea | No user account | Ready-made GRIB1 current file | Latest ~3-day Irish Sea provider GRIB, normalized and validated before use. |
 | TPXO direct | Global where local licensed model covers | User-supplied licensed model files | Harmonic model converted to GRIB1 currents | Astronomical tidal-current prediction only. |
 | TPXO cache | User-prepared local cache | User-supplied licensed model files | Derived local cache converted to GRIB1 currents | Fast repeated astronomical tidal-current generation for a fixed area/grid. Do not redistribute cache unless permitted by the TPXO licence. |
@@ -41,10 +43,9 @@ sources. It does not replace official navigation products.
 
 - Expected value: no-account global operational ocean currents, useful fallback where Copernicus credentials are not available.
 - Coverage: global ocean.
-- Account requirement: no account expected.
-- Likely data format: NOAA GRIB2 or NetCDF depending on source endpoint.
-- Likely effort: medium to high. Need current component mapping and OpenCPN compatibility validation.
-- Beta status: strong beta candidate, but after Copernicus Global Waves.
+- Account requirement: no account.
+- Data format: NOAA/NCEP RTOFS NetCDF source files converted to OpenCPN-compatible GRIB1 current fields 49/50.
+- Beta status: implemented for RTOFS regional high-value NetCDF domains; live validation is required before wider testing.
 
 ### 3. NOAA OFS / S-111 Regional Coastal Currents
 
@@ -53,7 +54,16 @@ sources. It does not replace official navigation products.
 - Account requirement: no account expected for NOAA open products.
 - Likely data format: model GRIB/NetCDF and/or S-111 products.
 - Likely effort: high. Multiple regional models, changing grids, and S-111 ingestion/mapping need careful validation.
-- Beta status: after Stage 1 beta unless a single OFS domain is prioritized.
+- Beta status: experimental stub unless a single OFS/S-111 domain is prioritized and validated.
+
+## Which Current Source Should I Choose?
+
+- TPXO cache: astronomical tidal streams for arbitrary dates from local licensed TPXO model data.
+- Copernicus Global: global ocean model currents; should include large-scale circulation such as Gulf Stream flow.
+- NOAA RTOFS Global: NOAA global ocean model currents; a no-account candidate for offshore/Gulf Stream routing where RTOFS regional extraction is available.
+- Copernicus NWS: high-resolution Northwest European shelf model currents.
+- Marine.ie: ready-made Irish Sea model current GRIB.
+- NOAA OFS/S-111: U.S. coastal and Great Lakes forecast currents; experimental stub in this build.
 
 ### 4. ECMWF AIFS / ECMWF Wave Open Data
 
@@ -89,6 +99,7 @@ Minimum capability:
 - Global weather via NOAA GFS.
 - Global weather alternative via ECMWF IFS Open Data.
 - Global currents via Copernicus Marine Global currents.
+- Global/offshore currents via NOAA RTOFS Global where the requested RTOFS domain is supported.
 - Global waves via NOAA GFS Wave or Copernicus Marine Global Waves.
 - Regional high-resolution weather via Met Office UKV 2 km.
 - TPXO cache for astronomical tidal streams from local licensed TPXO files.
@@ -104,4 +115,3 @@ Operational expectations:
 - Copernicus credentials are provided by the user and used only for the current operation.
 - Generated NetCDF, GRIB, cache, and log files remain ignored by Git.
 - Mixed-cadence GRIBs are documented clearly: weather, waves, and currents may have different valid-time intervals in the same merged stream.
-

@@ -96,6 +96,8 @@ Remote providers:
 - `marine_ie_irish_sea`: Marine Institute Ireland ready-made Irish Sea current GRIB, about 3 days, no Copernicus login required.
 - `copernicus_nws`: North-West Shelf high-resolution currents for the UK/Ireland/North Sea/English Channel/Celtic Sea area, using `NWSHELF_ANALYSISFORECAST_PHY_004_013` / `cmems_mod_nws_phy-cur_anfc_1.5km-2D_PT1H-i`.
 - `copernicus_global`: lower-resolution rest-of-world currents, using `GLOBAL_ANALYSISFORECAST_PHY_001_024` / `cmems_mod_glo_phy_anfc_0.083deg_PT1H-m`.
+- `noaa_rtofs_global`: NOAA RTOFS Global ocean-current forecast, no account required. Useful for offshore model currents including Gulf Stream-type circulation where RTOFS guidance is available.
+- `noaa_ofs_s111`: NOAA OFS/S-111 coastal currents. Experimental stub in this build; not yet a complete GRIB generator.
 - `auto`: selects Marine Institute Ireland inside its Irish Sea coverage for up to 72 hours, then NWS, otherwise Global.
 
 | Provider | Best for | Data type | Duration | Login |
@@ -103,12 +105,24 @@ Remote providers:
 | Marine Institute Ireland Irish Sea currents | Irish Sea/North Channel where covered | ready-made current GRIB | about 3 days | no Copernicus login |
 | Copernicus NWS | UK/Ireland/North Sea/English Channel/Celtic Sea area | NetCDF model currents converted to GRIB | user selected | Copernicus login |
 | Copernicus Global | rest-of-world | NetCDF model currents converted to GRIB | user selected | Copernicus login |
+| NOAA RTOFS Global | Global ocean model, current implementation uses NOAA regional high-value NetCDF domains where available | NetCDF model currents converted to GRIB | up to about 8 days | no login |
+| NOAA OFS/S-111 | U.S. coastal waters and Great Lakes | S-111/HDF5 model products | not implemented | no login |
+
+Which current source should I choose?
+
+- TPXO cache: astronomical tidal streams for arbitrary dates from local licensed TPXO data.
+- Copernicus Global: global ocean model currents; should include large-scale circulation such as Gulf Stream flow.
+- NOAA RTOFS Global: NOAA global ocean model currents; a no-account candidate for offshore/Gulf Stream routing where RTOFS regional extraction is available.
+- Copernicus NWS: high-resolution Northwest European shelf model currents.
+- Marine.ie: ready-made Irish Sea model current GRIB.
+- NOAA OFS/S-111: U.S. coastal/Great Lakes forecast currents; experimental stub in this build.
 
 Source labels used in CLI summaries and the OpenCPN plugin:
 
 - Source: Marine Institute Ireland Irish Sea forecast/model current
 - Source: Copernicus Marine NWS forecast/model current
 - Source: Copernicus Marine Global forecast/model current
+- Source: NOAA RTOFS Global ocean-current forecast
 - Source: TPXO10 astronomical tide model
 
 Register for a Copernicus Marine account at <https://data.marine.copernicus.eu/register>. Users are responsible for complying with Copernicus Marine terms.
@@ -239,6 +253,24 @@ tidal-current-grib generate-provider \
 ```
 
 The downloaded file is already an OpenCPN-compatible current GRIB. The command validates the GRIB stream before moving it to the output path.
+
+## Generate directly from NOAA RTOFS Global currents
+
+NOAA RTOFS does not require credentials. The provider selects a complete recent RTOFS cycle, downloads the needed current NetCDF files, and converts u/v components in m/s to OpenCPN-compatible GRIB1 current parameters 49/50.
+
+```bash
+tidal-current-grib generate-provider \
+  --provider noaa_rtofs_global \
+  --bbox -81.0 24.0 -70.0 36.0 \
+  --cycle auto \
+  --hours 72 \
+  --step-hours 3 \
+  --download-directory ~/.opencpn/grib/generated/currentgrib_downloads \
+  --output ~/.opencpn/grib/generated/rtofs_gulf_stream_current_72h.grb \
+  --overwrite \
+  --metadata-summary \
+  --verbose
+```
 
 Global fallback example:
 

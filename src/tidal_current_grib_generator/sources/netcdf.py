@@ -16,12 +16,18 @@ from tidal_current_grib_generator.model import CurrentGrid
 from tidal_current_grib_generator.sources.base import CurrentSource, SourceDescription
 
 U_CANDIDATES = (
+    "u",
+    "water_u",
+    "u_velocity",
     "eastward_sea_water_velocity",
     "uo",
     "surface_eastward_sea_water_velocity",
     "barotropic_eastward_sea_water_velocity",
 )
 V_CANDIDATES = (
+    "v",
+    "water_v",
+    "v_velocity",
     "northward_sea_water_velocity",
     "vo",
     "surface_northward_sea_water_velocity",

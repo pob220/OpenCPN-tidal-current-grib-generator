@@ -76,6 +76,44 @@ COPERNICUS_GLOBAL = Provider(
     source_grid_regularity_tolerance=5e-5,
 )
 
+NOAA_RTOFS_GLOBAL = Provider(
+    id="noaa_rtofs_global",
+    label="NOAA RTOFS Global ocean currents",
+    coverage=BoundingBox(-180.0, -80.0, 180.0, 90.0),
+    dataset_id="rtofs",
+    variables=("u", "v"),
+    implemented=True,
+    resolution="about 1/12 degree native HYCOM grid; converted to requested regular output grid when needed",
+    description=(
+        "NOAA Real-Time Ocean Forecast System global ocean-current forecast. "
+        "No account required. Useful for offshore ocean-current routing, including Gulf Stream-type circulation."
+    ),
+    product_id="NOAA/NCEP RTOFS",
+    default_step_hours=6,
+    minimum_depth=0.0,
+    maximum_depth=0.0,
+    provider_type="model",
+    nominal_duration_hours=192,
+    max_duration_hours=192,
+    source_url="https://nomads.ncep.noaa.gov/pub/data/nccf/com/rtofs/prod/",
+)
+
+NOAA_OFS_S111 = Provider(
+    id="noaa_ofs_s111",
+    label="NOAA OFS / S-111 coastal currents",
+    coverage=None,
+    dataset_id="noaa_ofs_s111",
+    variables=("surfaceCurrentSpeed", "surfaceCurrentDirection"),
+    implemented=False,
+    resolution="regional NOAA OFS/S-111 product native grids",
+    description=(
+        "NOAA/NOS Operational Forecast System S-111 coastal current forecast. "
+        "U.S. coastal waters and Great Lakes; experimental discovery only in this build."
+    ),
+    provider_type="experimental_discovery",
+    source_url="https://registry.opendata.aws/noaa-nos-ofs/",
+)
+
 MARINE_IE_IRISH_SEA = Provider(
     id="marine_ie_irish_sea",
     label="Marine Institute Ireland Irish Sea currents",
@@ -119,7 +157,15 @@ class ProviderRegistry:
     def __init__(self) -> None:
         self.providers = {
             provider.id: provider
-            for provider in (MARINE_IE_IRISH_SEA, COPERNICUS_NWS, COPERNICUS_GLOBAL, LOCAL_NETCDF, SYNTHETIC)
+            for provider in (
+                MARINE_IE_IRISH_SEA,
+                COPERNICUS_NWS,
+                COPERNICUS_GLOBAL,
+                NOAA_RTOFS_GLOBAL,
+                NOAA_OFS_S111,
+                LOCAL_NETCDF,
+                SYNTHETIC,
+            )
         }
 
     def get(self, provider_id: str) -> Provider:

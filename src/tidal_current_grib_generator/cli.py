@@ -27,6 +27,7 @@ from tidal_current_grib_generator.grib.read import sample_current_components
 from tidal_current_grib_generator.grib.writer import EccodesGrib1CurrentWriter
 from tidal_current_grib_generator.model import components_to_speed_direction
 from tidal_current_grib_generator.marine_ie import download_marine_ie_irish_sea_grib
+from tidal_current_grib_generator.noaa import generate_noaa_rtofs_current_grib
 from tidal_current_grib_generator.reference import compare_reference_csv
 from tidal_current_grib_generator.sources import create_source
 from tidal_current_grib_generator.sources.netcdf import NetCDFCurrentSource, inspect_netcdf, netcdf_time_metadata
@@ -302,6 +303,8 @@ def build_parser() -> argparse.ArgumentParser:
             "marine_ie_irish_sea",
             "copernicus_nws",
             "copernicus_global",
+            "noaa_rtofs_global",
+            "noaa_ofs_s111",
             "auto",
         ],
         default="existing-file",
@@ -391,11 +394,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     generate_provider.add_argument(
         "--provider",
-        choices=["auto", "marine_ie_irish_sea", "copernicus_nws", "copernicus_global"],
+        choices=["auto", "marine_ie_irish_sea", "copernicus_nws", "copernicus_global", "noaa_rtofs_global", "noaa_ofs_s111"],
         required=True,
     )
     generate_provider.add_argument("--bbox", nargs=4, type=float, metavar=("W", "S", "E", "N"))
     generate_provider.add_argument("--start")
+    generate_provider.add_argument("--date", help="NOAA RTOFS cycle date YYYYMMDD for explicit cycles.")
+    generate_provider.add_argument("--cycle", default="auto", help="auto or explicit NOAA RTOFS cycle such as 00.")
     generate_provider_end = generate_provider.add_mutually_exclusive_group()
     generate_provider_end.add_argument("--end")
     generate_provider_end.add_argument("--hours", type=int)
@@ -1400,6 +1405,8 @@ def cmd_generate_environment_grib(args: argparse.Namespace) -> int:
             "marine_ie_irish_sea",
             "copernicus_nws",
             "copernicus_global",
+            "noaa_rtofs_global",
+            "noaa_ofs_s111",
         }:
             # Generated after weather so an omitted --start can align to the
             # selected weather cycle, while merge order still puts current first.
@@ -1515,6 +1522,8 @@ def cmd_generate_environment_grib(args: argparse.Namespace) -> int:
             "marine_ie_irish_sea",
             "copernicus_nws",
             "copernicus_global",
+            "noaa_rtofs_global",
+            "noaa_ofs_s111",
         }:
             current_output = temp_dir / f"current_{current_source}.grb"
             current_start = _environment_current_start(args.start, weather_cycle_time)
@@ -1881,6 +1890,38 @@ def _generate_environment_current_source(
         cmd_generate_copernicus(copernicus_args)
         return
 
+    if current_source == "noaa_rtofs_global":
+        download_dir = args.download_directory.expanduser() if args.download_directory else temp_dir / "current_downloads"
+        if args.metadata_summary:
+            print("generating NOAA RTOFS Global ocean currents", flush=True)
+        result = generate_noaa_rtofs_current_grib(
+            bbox=bbox,
+            output=output,
+            hours=args.hours,
+            step_hours=args.step_hours,
+            cycle=args.cycle,
+            date=args.date,
+            download_directory=download_dir,
+            grid_spacing_deg=args.grid_spacing_deg,
+            overwrite=True,
+            dry_run=False,
+            metadata_summary=args.metadata_summary,
+            progress_callback=_download_progress_callback(args.verbose or args.metadata_summary),
+        )
+        if args.metadata_summary:
+            print(f"selected NOAA RTOFS cycle: {result.selected_cycle}", flush=True)
+            print(f"actual current forecast hours: {','.join(str(hour) for hour in result.forecast_hours)}", flush=True)
+            print("source fields used: u,v", flush=True)
+            print("units: m/s", flush=True)
+            print(f"current messages: {result.message_count}", flush=True)
+        return
+
+    if current_source == "noaa_ofs_s111":
+        raise ValidationError(
+            "NOAA OFS/S-111 coastal currents are listed as an experimental stub in this build; "
+            "NOAA RTOFS Global, Copernicus, Marine.ie, TPXO, and existing-file currents are available."
+        )
+
     raise ValidationError(f"unsupported environmental current source: {current_source}")
 
 
@@ -2047,6 +2088,56 @@ def cmd_generate_provider(args: argparse.Namespace) -> int:
             raise ValidationError("--download-directory is required for Copernicus providers")
         args.provider = provider_id
         return cmd_generate_copernicus(args)
+
+    if provider_id == "noaa_rtofs_global":
+        if not args.bbox:
+            raise ValidationError("--bbox is required for NOAA RTOFS")
+        if args.hours is None:
+            raise ValidationError("--hours is required for NOAA RTOFS")
+        if args.download_directory is None:
+            raise ValidationError("--download-directory is required for NOAA RTOFS")
+        bbox = BoundingBox.from_values(args.bbox)
+        if args.metadata_summary or args.dry_run:
+            print("checking inputs", flush=True)
+            print("selected provider: noaa_rtofs_global (NOAA RTOFS Global ocean currents)", flush=True)
+            print("source: NOAA/NCEP RTOFS high-value regional NetCDF via NOMADS", flush=True)
+            print("credentials: none required", flush=True)
+            print(f"bbox: {bbox.west},{bbox.south},{bbox.east},{bbox.north}", flush=True)
+            print(f"hours: {args.hours}", flush=True)
+            print(f"step_hours: {args.step_hours or 6}", flush=True)
+        result = generate_noaa_rtofs_current_grib(
+            bbox=bbox,
+            output=args.output,
+            hours=args.hours,
+            step_hours=args.step_hours or 6,
+            cycle=args.cycle,
+            date=args.date,
+            download_directory=args.download_directory,
+            grid_spacing_deg=args.grid_spacing_deg,
+            overwrite=args.overwrite,
+            dry_run=args.dry_run,
+            metadata_summary=args.metadata_summary,
+            progress_callback=_download_progress_callback(args.verbose or args.metadata_summary),
+        )
+        if args.json:
+            print(json.dumps(result.as_dict(), indent=2, sort_keys=True))
+        else:
+            if args.dry_run:
+                print(f"planned output: {result.output}", flush=True)
+            else:
+                print(f"wrote current GRIB: {result.output}", flush=True)
+                print(f"selected cycle: {result.selected_cycle}", flush=True)
+                print(f"forecast hours: {','.join(str(hour) for hour in result.forecast_hours)}", flush=True)
+                print(f"validated GRIB stream: {result.message_count} messages", flush=True)
+                print("current components: u_49/v_50", flush=True)
+                print("complete", flush=True)
+        return 0
+
+    if provider_id == "noaa_ofs_s111":
+        raise ValidationError(
+            "NOAA OFS/S-111 coastal currents are listed as an experimental stub in this build; "
+            "they are not yet a complete GRIB generator."
+        )
 
     raise ValidationError(f"unsupported provider for generate-provider: {provider_id}")
 
