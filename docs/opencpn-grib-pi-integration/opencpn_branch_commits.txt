@@ -1,3 +1,4 @@
-0d99b3f79 (HEAD -> grib-pi-environmental-generator, tag: grib-pi-environmental-generator-polished-v1-tested-20260706, origin/grib-pi-environmental-generator) Polish grib_pi Environmental GRIB integration
+fb1d5ab57 (HEAD -> grib-pi-environmental-generator, tag: grib-pi-environmental-generator-weather-providers-v1-tested-20260707, origin/grib-pi-environmental-generator) Expose additional weather providers in grib_pi
+0d99b3f79 (tag: grib-pi-environmental-generator-polished-v1-tested-20260706) Polish grib_pi Environmental GRIB integration
 7416126e3 (tag: grib-pi-environmental-generator-noaa-rtofs-v1-tested-20260706) Add Environmental GRIB Generator to grib_pi
 cf8b9bad6 (tag: grib-pi-environmental-generator-v1-tested-20260706) Add Environmental GRIB Generator to grib_pi

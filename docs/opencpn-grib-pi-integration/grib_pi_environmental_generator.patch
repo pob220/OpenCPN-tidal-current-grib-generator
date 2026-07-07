@@ -13,10 +13,10 @@ index 0416e34b8..8ab34e15c 100644
      src/GribSettingsDialog.cpp
 diff --git a/plugins/grib_pi/src/EnvironmentalGribDialog.cpp b/plugins/grib_pi/src/EnvironmentalGribDialog.cpp
 new file mode 100644
-index 000000000..93f5027d7
+index 000000000..41f0d9e16
 --- /dev/null
 +++ b/plugins/grib_pi/src/EnvironmentalGribDialog.cpp
-@@ -0,0 +1,1495 @@
+@@ -0,0 +1,1570 @@
 +#include "EnvironmentalGribDialog.h"
 +
 +#include <wx/config.h>
@@ -263,8 +263,14 @@ index 000000000..93f5027d7
 +
 +  m_generateWeather = new wxCheckBox(scrolled, wxID_ANY, "Generate/include weather");
 +  m_generateWeather->SetValue(true);
-+  wxString weatherProviders[] = {"NOAA GFS forecast", "Met Office UKV 2 km forecast", "ECMWF IFS Open Data forecast",
-+                                 "Existing weather GRIB file", "None"};
++  wxString weatherProviders[] = {"NOAA GFS forecast",
++                                 "NOAA HRRR 3 km forecast",
++                                 "Met Office UKV 2 km forecast",
++                                 "DWD ICON-EU 13 km forecast",
++                                 "ECMWF IFS Open Data forecast",
++                                 "ECMWF AIFS Open Data forecast (experimental)",
++                                 "Existing weather GRIB file",
++                                 "None"};
 +  m_weatherProvider = new wxChoice(scrolled, wxID_ANY, wxDefaultPosition, wxDefaultSize,
 +                                   WXSIZEOF(weatherProviders), weatherProviders);
 +  m_weatherProvider->SetSelection(0);
@@ -274,7 +280,7 @@ index 000000000..93f5027d7
 +  m_weatherPreset->SetSelection(1);
 +  m_weatherPreset->SetToolTip("Minimal: wind only. Routing: wind, pressure, and air temperature. Marine: routing fields plus gusts, precipitation, cloud cover, and optional waves.");
 +  m_includeWaves = new wxCheckBox(scrolled, wxID_ANY, "Include wave fields");
-+  m_includeWaves->SetToolTip("Adds significant wave height, primary wave period, and primary wave direction. NOAA GFS Wave requires NOAA GFS weather; Copernicus Global Waves requires a Copernicus account.");
++  m_includeWaves->SetToolTip("Adds significant wave height, primary wave period, and primary wave direction. NOAA GFS Wave requires no account; Copernicus Global Waves requires a Copernicus account.");
 +  wxString waveProviders[] = {"NOAA GFS Wave", "Copernicus Marine Global Waves"};
 +  m_waveProvider = new wxChoice(scrolled, wxID_ANY, wxDefaultPosition, wxDefaultSize,
 +                                WXSIZEOF(waveProviders), waveProviders);
@@ -568,6 +574,36 @@ index 000000000..93f5027d7
 +    AppendLog("Generation cancelled before launch.");
 +    return;
 +  }
++  if (m_generateWeather->GetValue() &&
++      (weatherProvider.Contains("HRRR") || weatherProvider.Contains("ICON-EU"))) {
++    double west = 0.0;
++    double south = 0.0;
++    double east = 0.0;
++    double north = 0.0;
++    bool parsed = m_west->GetValue().ToDouble(&west) && m_south->GetValue().ToDouble(&south) &&
++                  m_east->GetValue().ToDouble(&east) && m_north->GetValue().ToDouble(&north);
++    if (parsed && weatherProvider.Contains("HRRR") &&
++        (west < -130.0 || east > -60.0 || south < 20.0 || north > 55.0)) {
++      wxString message =
++          "The requested bbox is outside the normal NOAA HRRR contiguous United States domain. "
++          "Choose a US area or select a global/regional provider that covers this area.";
++      AppendLog(message);
++      wxMessageBox(message, "HRRR area unavailable", wxOK | wxICON_WARNING, this);
++      return;
++    }
++    if (parsed && weatherProvider.Contains("ICON-EU") &&
++        (west < -32.5 || east > 42.5 || south < 20.0 || north > 72.5)) {
++      wxString message =
++          "The requested bbox is outside the normal DWD ICON-EU Europe domain. "
++          "Choose a European area or select a global provider that covers this area.";
++      AppendLog(message);
++      wxMessageBox(message, "ICON-EU area unavailable", wxOK | wxICON_WARNING, this);
++      return;
++    }
++  }
++  if (m_generateWeather->GetValue() && weatherProvider.Contains("AIFS")) {
++    AppendLog("ECMWF AIFS Open Data files may be large if the helper cannot spatially crop the request.");
++  }
 +  wxString command = BuildGenerateCommand();
 +  wxFileName output(OutputPath());
 +  if (!output.DirExists()) {
@@ -735,12 +771,12 @@ index 000000000..93f5027d7
 +  bool currentRtofs = currentsEnabled && m_currentSource->GetStringSelection().Contains("RTOFS");
 +  bool currentOfs = currentsEnabled && m_currentSource->GetStringSelection().Contains("OFS");
 +  bool weatherGfs = weatherEnabled && m_weatherProvider->GetStringSelection().Contains("GFS");
++  bool weatherHrrr = weatherEnabled && m_weatherProvider->GetStringSelection().Contains("HRRR");
 +  bool weatherUkv = weatherEnabled && m_weatherProvider->GetStringSelection().Contains("Met Office UKV");
++  bool weatherIconEu = weatherEnabled && m_weatherProvider->GetStringSelection().Contains("ICON-EU");
++  bool weatherAifs = weatherEnabled && m_weatherProvider->GetStringSelection().Contains("AIFS");
 +  bool weatherGenerated = weatherEnabled && !weatherExisting;
 +  bool waveEnabled = weatherGenerated && m_includeWaves->GetValue();
-+  if (waveEnabled && !weatherGfs && m_waveProvider->GetStringSelection().Contains("NOAA")) {
-+    m_waveProvider->SetSelection(1);
-+  }
 +  bool waveCopernicus = waveEnabled && m_waveProvider->GetStringSelection().Contains("Copernicus");
 +  bool needsCopernicusCredentials = NeedsCopernicusCredentials();
 +  bool showTpxoModel = currentTpxoDirect || currentTpxoCache;
@@ -809,6 +845,36 @@ index 000000000..93f5027d7
 +    if (m_weatherPreset->GetStringSelection().Contains("Marine")) {
 +      note += "\nUKV marine extras are not implemented yet; routing fields will be generated.";
 +    }
++    if (waveCopernicus) {
++      note += "\nWave source: Copernicus Marine Global Waves forecast. Account required; global 3-hourly wave fields.";
++    }
++    if (!currentNote.empty()) note += "\n" + currentNote;
++    m_providerNote->SetLabel(note);
++  } else if (weatherHrrr) {
++    wxString note =
++        "Source: NOAA HRRR 3 km forecast. Short-range hourly NOAA HRRR for the contiguous United States. "
++        "No account. Currently uses full-grid GRIB messages; files may be large because bbox cropping is not yet implemented.";
++    if (waveCopernicus) {
++      note += "\nWave source: Copernicus Marine Global Waves forecast. Account required; global 3-hourly wave fields.";
++    }
++    if (!currentNote.empty()) note += "\n" + currentNote;
++    m_providerNote->SetLabel(note);
++  } else if (weatherIconEu) {
++    wxString note =
++        "Source: DWD ICON-EU regional forecast. DWD ICON-EU regional forecast for Europe. "
++        "No account. Currently uses full-domain DWD field files; files may be large because bbox cropping is not yet implemented.";
++    if (m_weatherPreset->GetStringSelection().Contains("Marine")) {
++      note += "\nICON-EU marine extras currently generate routing fields only.";
++    }
++    if (waveCopernicus) {
++      note += "\nWave source: Copernicus Marine Global Waves forecast. Account required; global 3-hourly wave fields.";
++    }
++    if (!currentNote.empty()) note += "\n" + currentNote;
++    m_providerNote->SetLabel(note);
++  } else if (weatherAifs) {
++    wxString note =
++        "Source: ECMWF AIFS Open Data forecast. Global AI forecast, no account. "
++        "Experimental in this build; live retrieval still needs validation. Files may be large if not cropped.";
 +    if (waveCopernicus) {
 +      note += "\nWave source: Copernicus Marine Global Waves forecast. Account required; global 3-hourly wave fields.";
 +    }
@@ -1161,7 +1227,10 @@ index 000000000..93f5027d7
 +  if (m_generateWeather->GetValue()) {
 +    wxString selected = m_weatherProvider->GetStringSelection();
 +    if (selected.Contains("NOAA GFS")) weatherProvider = "gfs";
++    else if (selected.Contains("HRRR")) weatherProvider = "noaa_hrrr";
 +    else if (selected.Contains("Met Office UKV")) weatherProvider = "ukmo_ukv";
++    else if (selected.Contains("ICON-EU")) weatherProvider = "dwd_icon_eu";
++    else if (selected.Contains("AIFS")) weatherProvider = "ecmwf_aifs_open";
 +    else if (selected.Contains("ECMWF")) weatherProvider = "ecmwf_ifs_open";
 +    else if (selected.Contains("Existing")) weatherProvider = "existing-file";
 +  }
@@ -1340,9 +1409,12 @@ index 000000000..93f5027d7
 +  bool ukvMixedCadence = weatherProvider.Contains("UKV") && m_stepHours->GetValue() == 1 && m_durationHours->GetValue() > 54;
 +  if (weatherOn && currentOn) {
 +    prefix = "environment";
-+    if (weatherProvider.Contains("GFS")) prefix += "_gfs";
++    if (weatherProvider.Contains("HRRR")) prefix += "_hrrr";
++    else if (weatherProvider.Contains("GFS")) prefix += "_gfs";
 +    else if (weatherProvider.Contains("UKV")) prefix += "_ukmo_ukv";
-+    else if (weatherProvider.Contains("ECMWF")) prefix += "_ecmwf";
++    else if (weatherProvider.Contains("ICON-EU")) prefix += "_icon_eu";
++    else if (weatherProvider.Contains("AIFS")) prefix += "_ecmwf_aifs";
++    else if (weatherProvider.Contains("ECMWF")) prefix += "_ecmwf_ifs";
 +    else if (weatherProvider.Contains("Existing")) prefix += "_existing_weather";
 +    if (ukvMixedCadence) prefix += "_mixed";
 +    if (m_includeWaves->GetValue()) {
@@ -1361,9 +1433,12 @@ index 000000000..93f5027d7
 +    if (currentSource.Contains("RTOFS") && looksGulfStream) prefix += "_gulf_stream";
 +  } else if (weatherOn) {
 +    prefix = "weather";
-+    if (weatherProvider.Contains("GFS")) prefix += "_gfs";
++    if (weatherProvider.Contains("HRRR")) prefix += "_hrrr";
++    else if (weatherProvider.Contains("GFS")) prefix += "_gfs";
 +    else if (weatherProvider.Contains("UKV")) prefix += "_ukmo_ukv";
-+    else if (weatherProvider.Contains("ECMWF")) prefix += "_ecmwf";
++    else if (weatherProvider.Contains("ICON-EU")) prefix += "_icon_eu";
++    else if (weatherProvider.Contains("AIFS")) prefix += "_ecmwf_aifs";
++    else if (weatherProvider.Contains("ECMWF")) prefix += "_ecmwf_ifs";
 +    else prefix += "_existing";
 +    if (ukvMixedCadence) prefix += "_mixed";
 +    if (m_weatherPreset->GetStringSelection().Contains("Marine")) prefix += "_marine";
