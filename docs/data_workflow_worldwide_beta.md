@@ -11,9 +11,12 @@ sources. It does not replace official navigation products.
 | Provider | Coverage | Account | Format | Notes |
 | --- | --- | --- | --- | --- |
 | NOAA GFS | Global | No account | GRIB2 from NOMADS | Default provider. Spatially cropped, compact, reliable for worldwide beta. |
+| NOAA HRRR 3 km | Contiguous United States | No account | GRIB2 from NOMADS | Implemented and live-smoked. Short-range, hourly updated high-resolution provider. Currently full-grid/uncropped, so files can be large. |
 | NOAA GFS Wave | Global | No account | GRIB2 from NOMADS | Significant wave height, primary wave period, primary wave direction. Usually 3-hourly. |
 | ECMWF IFS Open Data | Global | No account | GRIB2 | Higher-quality global/medium-range option. Current implementation is not spatially cropped, so files may be large. |
+| ECMWF AIFS Open Data | Global | No account | GRIB2 | Experimental/unverified. Live retrieval failed in smoke testing; ECMWF IFS remains the tested ECMWF option. Not spatially cropped when retrieval succeeds. |
 | Met Office UKV 2 km | UK/Ireland | No account for AWS/Open Data | NetCDF converted to GRIB2 | High-resolution short-range provider. Hourly to about 54h, then 3-hourly to 120h. |
+| DWD ICON-EU 13 km | Europe | No account | GRIB2 from DWD Open Data | Implemented and live-smoked. Regional European forecast. Currently downloads full-domain field files, so files can be large. |
 
 ### Currents
 
@@ -67,12 +70,12 @@ sources. It does not replace official navigation products.
 
 ### 4. ECMWF AIFS / ECMWF Wave Open Data
 
-- Expected value: alternative global forecast and wave source from ECMWF.
+- AIFS weather is experimental/unverified in this build. Live retrieval failed during smoke testing using the current ECMWF Open Data request.
 - Coverage: global.
-- Account requirement: no account for available open data, depending on product.
-- Likely data format: GRIB2.
-- Likely effort: medium. Need field discovery, subsetting/cropping strategy, wave field mapping, and file-size control.
-- Beta status: useful after beta; current ECMWF IFS provider already covers core weather.
+- Account requirement: no account for available open data.
+- Data format: GRIB2.
+- Current limitation: live retrieval still needs validation; spatial cropping is not yet applied when retrieval succeeds, so files may be large.
+- ECMWF wave open-data support remains future work.
 
 ### 5. MET Norway / Nordic Provider
 
@@ -85,19 +88,19 @@ sources. It does not replace official navigation products.
 
 ### 6. DWD ICON / ICON-EU
 
-- Expected value: high-resolution Europe weather alternative.
-- Coverage: Europe for ICON-EU, global for ICON global.
+- ICON-EU weather is implemented for the regular latitude/longitude single-level GRIB2 products.
+- Coverage: Europe for ICON-EU. ICON global remains future work.
 - Account requirement: no account for DWD Open Data.
-- Likely data format: GRIB2.
-- Likely effort: medium. Need robust file discovery, domain handling, and OpenCPN field validation.
-- Beta status: after Stage 1 beta; currently listed as a stub.
+- Data format: GRIB2, downloaded as `.bz2` field files and decompressed before merging.
+- Current limitation: provider downloads complete requested full-domain field files rather than byte-range bbox subsets, so files can be large.
 
 ## Stage 1 Worldwide Beta Acceptance Criteria
 
 Minimum capability:
 
 - Global weather via NOAA GFS.
-- Global weather alternative via ECMWF IFS Open Data.
+- Global weather alternatives via ECMWF IFS Open Data; ECMWF AIFS is experimental/unverified until live retrieval is fixed.
+- Regional weather via live-smoked NOAA HRRR for the contiguous United States and DWD ICON-EU for Europe, with current full-grid/full-domain file-size limitations.
 - Global currents via Copernicus Marine Global currents.
 - Global/offshore currents via NOAA RTOFS Global where the requested RTOFS domain is supported.
 - Global waves via NOAA GFS Wave or Copernicus Marine Global Waves.

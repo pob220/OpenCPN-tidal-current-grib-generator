@@ -42,8 +42,13 @@ from tidal_current_grib_generator.providers import (
 from tidal_current_grib_generator.api import GenerateCurrentGribRequest, generate_current_grib_from_netcdf
 from tidal_current_grib_generator.security import redact_text
 from tidal_current_grib_generator.weather import (
+    DWD_ICON_EU_SOURCE_LABEL,
+    DWDIconEUWeatherRequest,
+    ECMWF_AIFS_SOURCE_LABEL,
     ECMWF_SOURCE_LABEL,
     ECMWFWeatherRequest,
+    HRRR_SOURCE_LABEL,
+    HRRRWeatherRequest,
     CopernicusGlobalWaveRequest,
     GFSWaveRequest,
     GFSWeatherRequest,
@@ -55,7 +60,10 @@ from tidal_current_grib_generator.weather import (
     gfs_cycle_candidates,
     generate_gfs_weather_grib,
     generate_copernicus_global_wave_grib,
+    generate_dwd_icon_eu_weather_grib,
+    generate_ecmwf_aifs_weather_grib,
     generate_ecmwf_weather_grib,
+    generate_hrrr_weather_grib,
     generate_gfs_wave_grib,
     generate_ukmo_ukv_weather_grib,
     discover_ukmo_ukv_source,
@@ -242,7 +250,7 @@ def build_parser() -> argparse.ArgumentParser:
     generate_weather = subparsers.add_parser("generate-weather", help="Download/generate a weather GRIB.")
     generate_weather.add_argument(
         "--provider",
-        choices=["gfs", "gfs_wave", "copernicus_global_waves", "ukmo_ukv", "ecmwf_ifs_open", "dwd_icon_eu"],
+        choices=["gfs", "gfs_wave", "copernicus_global_waves", "noaa_hrrr", "ukmo_ukv", "dwd_icon_eu", "ecmwf_ifs_open", "ecmwf_aifs_open"],
         required=True,
     )
     generate_weather.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"))
@@ -284,7 +292,7 @@ def build_parser() -> argparse.ArgumentParser:
     environment.add_argument("--step-hours", type=int, default=3)
     environment.add_argument(
         "--weather-provider",
-        choices=["none", "existing-file", "gfs", "ukmo_ukv", "ecmwf_ifs_open", "dwd_icon_eu"],
+        choices=["none", "existing-file", "gfs", "noaa_hrrr", "ukmo_ukv", "dwd_icon_eu", "ecmwf_ifs_open", "ecmwf_aifs_open"],
         default="gfs",
     )
     environment.add_argument("--weather-file", type=Path)
@@ -1216,6 +1224,20 @@ def cmd_generate_weather(args: argparse.Namespace) -> int:
             grid_spacing_deg=args.weather_grid_spacing_deg,
         )
         generate_func = generate_copernicus_global_wave_grib
+    elif args.provider == "noaa_hrrr":
+        source_label = HRRR_SOURCE_LABEL
+        request = HRRRWeatherRequest(
+            bbox=bbox,
+            output=args.output,
+            hours=args.hours,
+            step_hours=args.step_hours,
+            cycle=_required_weather_cycle(args),
+            date=args.date,
+            overwrite=args.overwrite,
+            dry_run=args.dry_run,
+            preset=args.weather_preset,
+        )
+        generate_func = generate_hrrr_weather_grib
     elif args.provider == "ecmwf_ifs_open":
         source_label = ECMWF_SOURCE_LABEL
         request = ECMWFWeatherRequest(
@@ -1230,6 +1252,20 @@ def cmd_generate_weather(args: argparse.Namespace) -> int:
             preset=args.weather_preset,
         )
         generate_func = generate_ecmwf_weather_grib
+    elif args.provider == "ecmwf_aifs_open":
+        source_label = ECMWF_AIFS_SOURCE_LABEL
+        request = ECMWFWeatherRequest(
+            bbox=bbox,
+            output=args.output,
+            hours=args.hours,
+            step_hours=args.step_hours,
+            cycle=_required_weather_cycle(args),
+            date=args.date,
+            overwrite=args.overwrite,
+            dry_run=args.dry_run,
+            preset=args.weather_preset,
+        )
+        generate_func = generate_ecmwf_aifs_weather_grib
     elif args.provider == "ukmo_ukv":
         source_label = UKMO_UKV_SOURCE_LABEL
         request = UKMOUKVWeatherRequest(
@@ -1246,9 +1282,19 @@ def cmd_generate_weather(args: argparse.Namespace) -> int:
         )
         generate_func = generate_ukmo_ukv_weather_grib
     elif args.provider == "dwd_icon_eu":
-        raise ValidationError(
-            "DWD ICON-EU provider is not implemented yet; ECMWF Open Data and GFS are available in this CLI build"
+        source_label = DWD_ICON_EU_SOURCE_LABEL
+        request = DWDIconEUWeatherRequest(
+            bbox=bbox,
+            output=args.output,
+            hours=args.hours,
+            step_hours=args.step_hours,
+            cycle=_required_weather_cycle(args),
+            date=args.date,
+            overwrite=args.overwrite,
+            dry_run=args.dry_run,
+            preset=args.weather_preset,
         )
+        generate_func = generate_dwd_icon_eu_weather_grib
     else:
         raise ValidationError(f"unsupported weather provider: {args.provider}")
     if args.metadata_summary or args.dry_run:
@@ -1331,8 +1377,6 @@ def cmd_generate_environment_grib(args: argparse.Namespace) -> int:
         raise ValidationError(f"output already exists: {output}; use --overwrite to replace it")
     if args.weather_provider == "none" and args.current_source == "none" and not args.include_waves:
         raise ValidationError("at least one of weather or current must be enabled")
-    if args.include_waves and args.wave_provider == "gfs_wave" and args.weather_provider not in {"gfs"}:
-        raise ValidationError("--include-waves with --wave-provider gfs_wave is currently supported only with --weather-provider gfs")
     wave_step_hours = args.wave_step_hours if args.wave_step_hours is not None else 3
     if args.include_waves and (wave_step_hours < 3 or wave_step_hours % 3 != 0):
         warnings_for_validation = (
@@ -1419,7 +1463,7 @@ def cmd_generate_environment_grib(args: argparse.Namespace) -> int:
             scan_grib_messages(weather_path)
             inputs.append(("weather", weather_path))
             intermediates["weather"] = str(weather_path)
-        elif args.weather_provider in {"gfs", "ukmo_ukv", "ecmwf_ifs_open"}:
+        elif args.weather_provider in {"gfs", "noaa_hrrr", "ukmo_ukv", "dwd_icon_eu", "ecmwf_ifs_open", "ecmwf_aifs_open"}:
             weather_output = temp_dir / f"weather_{args.weather_provider}.grb2"
             if args.weather_provider == "gfs":
                 if args.metadata_summary:
@@ -1451,6 +1495,22 @@ def cmd_generate_environment_grib(args: argparse.Namespace) -> int:
                         progress_callback=_weather_progress_callback(args.verbose or args.metadata_summary),
                     )
                     wave_result = None
+            elif args.weather_provider == "noaa_hrrr":
+                if args.metadata_summary:
+                    print("generating NOAA HRRR weather GRIB", flush=True)
+                weather_result = generate_hrrr_weather_grib(
+                    HRRRWeatherRequest(
+                        bbox=bbox,
+                        output=weather_output,
+                        hours=args.hours,
+                        step_hours=args.step_hours,
+                        cycle=args.cycle,
+                        date=args.date,
+                        overwrite=True,
+                        preset=args.weather_preset,
+                    ),
+                    progress_callback=_weather_progress_callback(args.verbose or args.metadata_summary),
+                )
             elif args.weather_provider == "ukmo_ukv":
                 if args.metadata_summary:
                     print("generating Met Office UKV weather GRIB", flush=True)
@@ -1468,6 +1528,41 @@ def cmd_generate_environment_grib(args: argparse.Namespace) -> int:
                     ),
                     progress_callback=_weather_progress_callback(args.verbose or args.metadata_summary),
                 )
+            elif args.weather_provider == "dwd_icon_eu":
+                if args.metadata_summary:
+                    print("generating DWD ICON-EU weather GRIB", flush=True)
+                weather_result = generate_dwd_icon_eu_weather_grib(
+                    DWDIconEUWeatherRequest(
+                        bbox=bbox,
+                        output=weather_output,
+                        hours=args.hours,
+                        step_hours=args.step_hours,
+                        cycle=args.cycle,
+                        date=args.date,
+                        overwrite=True,
+                        preset=args.weather_preset,
+                    ),
+                    progress_callback=_weather_progress_callback(args.verbose or args.metadata_summary),
+                )
+            elif args.weather_provider == "ecmwf_aifs_open":
+                if args.metadata_summary:
+                    print("generating ECMWF AIFS Open Data weather GRIB", flush=True)
+                    print("warning: ECMWF AIFS Open Data output is not spatially cropped yet; files may be large.", flush=True)
+                warnings.append("ECMWF AIFS Open Data output is not spatially cropped yet; files may be large.")
+                weather_result = generate_ecmwf_aifs_weather_grib(
+                    ECMWFWeatherRequest(
+                        bbox=bbox,
+                        output=weather_output,
+                        hours=args.hours,
+                        step_hours=args.step_hours,
+                        cycle=args.cycle,
+                        date=args.date,
+                        overwrite=True,
+                        preset=args.weather_preset,
+                    ),
+                    progress_callback=_weather_progress_callback(args.verbose or args.metadata_summary),
+                )
+                warnings.extend(weather_result.warnings or [])
             else:
                 if args.metadata_summary:
                     print("generating ECMWF Open Data weather GRIB", flush=True)
@@ -1491,8 +1586,6 @@ def cmd_generate_environment_grib(args: argparse.Namespace) -> int:
             inputs.append(("weather", weather_output))
             intermediates["weather"] = str(weather_output)
 
-        elif args.weather_provider == "dwd_icon_eu":
-            raise ValidationError("DWD ICON-EU provider is not implemented yet")
 
         if args.include_waves:
             wave_output = temp_dir / f"weather_{args.wave_provider}.grb2"
@@ -1627,16 +1720,21 @@ def _generate_environment_wave_source(
     if args.metadata_summary:
         print(f"generating wave GRIB provider: {args.wave_provider}", flush=True)
     if args.wave_provider == "gfs_wave":
-        if weather_result is None:
-            raise ValidationError("--wave-provider gfs_wave requires generated GFS weather")
+        cycle = args.cycle
+        date = args.date
+        if args.weather_provider == "gfs" and weather_result is not None:
+            cycle = weather_result.cycle.cycle if weather_result.cycle.cycle != "auto" else args.cycle
+            date = weather_result.cycle.date if weather_result.cycle.date != "auto" else args.date
+        elif args.metadata_summary:
+            print("GFS Wave will use its own available forecast cycle.", flush=True)
         return generate_gfs_wave_grib(
             GFSWaveRequest(
                 bbox=bbox,
                 output=output,
                 hours=hours,
                 step_hours=wave_step_hours,
-                cycle=weather_result.cycle.cycle if weather_result.cycle.cycle != "auto" else args.cycle,
-                date=weather_result.cycle.date if weather_result.cycle.date != "auto" else args.date,
+                cycle=cycle,
+                date=date,
                 overwrite=True,
             ),
             progress_callback=_weather_progress_callback(args.verbose or args.metadata_summary),

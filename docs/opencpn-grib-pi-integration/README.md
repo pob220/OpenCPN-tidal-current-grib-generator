@@ -26,9 +26,12 @@ tidal-current-grib generate-environment-grib
 Weather:
 
 - NOAA GFS
+- NOAA HRRR 3 km: implemented/live-smoked; currently full-grid, so files can be large
 - NOAA GFS Wave
 - ECMWF IFS Open Data
+- ECMWF AIFS Open Data: experimental/unverified; live retrieval still needs validation
 - Met Office UKV 2 km
+- DWD ICON-EU 13 km: implemented/live-smoked; currently full-domain, so files can be large
 
 Waves:
 
@@ -130,5 +133,6 @@ tidal-current-grib check-dependencies --output-directory ~/.opencpn/grib/generat
 - TPXO is astronomical tide only; it does not model the Gulf Stream.
 - Copernicus Global and NOAA RTOFS are model-current providers suitable for ocean-current routing.
 - RTOFS currently uses available 6-hourly current guidance.
+- HRRR, ICON-EU, and AIFS do not require Copernicus credentials. HRRR and ICON-EU are live-smoked but currently uncropped/large-file; AIFS is experimental/unverified.
 - Copernicus credentials are passed through environment variables, not command-line passwords.
 - Generated GRIB, NetCDF, HDF5, cache, and log files should not be committed.

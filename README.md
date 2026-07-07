@@ -331,14 +331,25 @@ tidal-current-grib weather-providers
 Implemented providers:
 
 - `gfs`: Source: NOAA GFS 0.25° forecast via NOMADS. Downloads bbox-subset GRIB2 files without credentials.
+- `noaa_hrrr`: Source: NOAA HRRR 3 km forecast via NOMADS. Implemented and live-smoked. Short-range CONUS GRIB2 weather without credentials. Currently uses full-grid byte-range GRIB messages; bbox cropping is not yet implemented, so files can be large.
 - `gfs_wave`: Source: NOAA GFS Wave forecast via NOMADS. Downloads bbox-subset significant wave height, primary wave period, and primary wave direction from the GFS Wave global 0.25 degree grid.
 - `copernicus_global_waves`: Source: Copernicus Marine Global Waves forecast. Downloads Copernicus Marine Global Ocean Waves NetCDF subsets and converts significant wave height, primary/peak wave period, and wave direction to OpenCPN-oriented GRIB2. Requires a Copernicus Marine account.
 - `ukmo_ukv`: Source: Met Office UKV 2 km forecast. Downloads no-account AWS/Open Data NetCDF source files from `s3://met-office-atmospheric-model-data/`, regrids the projected UKV 2 km source to regular latitude/longitude, and writes OpenCPN-oriented GRIB2 weather fields for UK/Ireland short-range use.
+- `dwd_icon_eu`: Source: DWD ICON-EU 13 km forecast. Implemented and live-smoked. Downloads regular-lat/lon GRIB2 field files from DWD Open Data, decompresses them, and concatenates requested routing fields. Currently uses full-domain DWD field files; bbox cropping is not yet implemented, so files can be large.
 - `ecmwf_ifs_open`: Source: ECMWF IFS Open Data forecast. Uses the optional official `ecmwf-opendata` client. The first implementation retrieves the requested fields from ECMWF Open Data and records the bbox in metadata; spatial cropping is not yet applied by this provider.
+- `ecmwf_aifs_open`: Source: ECMWF AIFS Open Data forecast. Experimental/unverified in this build after live retrieval failed during smoke testing. Uses the optional official `ecmwf-opendata` client with the AIFS model and records the bbox in metadata when retrieval succeeds; spatial cropping is not yet applied by this provider. ECMWF IFS remains the tested ECMWF option.
 
-Experimental/planned providers:
+Which weather provider should I choose?
 
-- `dwd_icon_eu`: Source: DWD ICON-EU forecast.
+- GFS: global default and compact bbox-subset big-picture forecast.
+- ECMWF IFS: global/medium-range alternative; currently larger files if uncropped.
+- ECMWF AIFS: experimental/unverified global AI forecast for comparison or an alternative to IFS/GFS; live retrieval still needs validation and files may be large if uncropped.
+- UKV: high-resolution UK/Ireland short-range forecast.
+- ICON-EU: European regional forecast for coastal and mountain wind detail; live-smoked, currently full-domain/large-file.
+- HRRR: short-range, rapid-update weather for the contiguous United States; live-smoked, currently full-grid/large-file.
+- Existing GRIB: user-supplied weather GRIB merged without modifying the data.
+
+"Best model" is not a downloadable model source. A future Auto/Recommended selector could choose among available models by region and duration.
 
 UKV discovery helpers:
 

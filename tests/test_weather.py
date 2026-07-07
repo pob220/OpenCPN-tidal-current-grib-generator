@@ -11,7 +11,9 @@ from tidal_current_grib_generator.grib.merge import merge_grib_files
 from tidal_current_grib_generator.grib.validation import inspect_grib
 from tidal_current_grib_generator.geo import BoundingBox
 from tidal_current_grib_generator.weather import (
+    DWDIconEUWeatherRequest,
     ECMWFWeatherRequest,
+    HRRRWeatherRequest,
     CopernicusGlobalWaveRequest,
     GFSCycle,
     GFSWaveRequest,
@@ -20,19 +22,27 @@ from tidal_current_grib_generator.weather import (
     UKMOUKVNetCDFInspectRequest,
     UKMOUKVWeatherRequest,
     WeatherGenerateResult,
+    build_dwd_icon_eu_url,
     build_gfs_filter_url,
     build_gfs_wave_filter_url,
+    build_hrrr_filter_url,
     COPERNICUS_GLOBAL_WAVE_DATASET_ID,
     COPERNICUS_GLOBAL_WAVE_VARIABLES,
     discover_ukmo_ukv_source,
     forecast_hour_sequence,
+    generate_dwd_icon_eu_weather_grib,
+    generate_ecmwf_aifs_weather_grib,
     generate_gfs_wave_grib,
     generate_ecmwf_weather_grib,
     generate_gfs_weather_grib,
+    generate_hrrr_weather_grib,
     generate_copernicus_global_wave_grib,
     generate_ukmo_ukv_weather_grib,
+    dwd_icon_eu_forecast_hour_sequence,
+    ecmwf_aifs_forecast_hour_sequence,
     gfs_variables_for_preset,
     gfs_cycle_candidates,
+    hrrr_forecast_hour_sequence,
     inspect_ukmo_ukv_netcdf,
     list_weather_providers,
     ukmo_ukv_forecast_hour_sequence,
@@ -56,7 +66,16 @@ def test_weather_provider_registry_includes_gfs():
     providers = list_weather_providers()
 
     by_id = {provider.id: provider for provider in providers}
-    assert {"gfs", "gfs_wave", "copernicus_global_waves", "ukmo_ukv", "ecmwf_ifs_open", "dwd_icon_eu"} <= set(by_id)
+    assert {
+        "gfs",
+        "gfs_wave",
+        "copernicus_global_waves",
+        "noaa_hrrr",
+        "ukmo_ukv",
+        "dwd_icon_eu",
+        "ecmwf_ifs_open",
+        "ecmwf_aifs_open",
+    } <= set(by_id)
     assert by_id["gfs"].source == "NOAA NOMADS"
     assert by_id["gfs"].format == "GRIB2"
     assert by_id["gfs"].account == "free/no account"
@@ -66,7 +85,17 @@ def test_weather_provider_registry_includes_gfs():
     assert by_id["ukmo_ukv"].implemented is True
     assert by_id["copernicus_global_waves"].source == "Copernicus Marine"
     assert by_id["copernicus_global_waves"].account == "Copernicus Marine account required"
-    assert by_id["dwd_icon_eu"].implemented is False
+    assert by_id["noaa_hrrr"].account == "free/no account"
+    assert by_id["noaa_hrrr"].implemented is True
+    assert "live-smoked" in by_id["noaa_hrrr"].description
+    assert "full-grid" in by_id["noaa_hrrr"].description
+    assert by_id["dwd_icon_eu"].implemented is True
+    assert "live-smoked" in by_id["dwd_icon_eu"].description
+    assert "full-domain" in by_id["dwd_icon_eu"].description
+    assert by_id["ecmwf_aifs_open"].source == "ECMWF Open Data"
+    assert by_id["ecmwf_aifs_open"].account == "free/no account"
+    assert "experimental" in by_id["ecmwf_aifs_open"].label.lower()
+    assert "Experimental/unverified" in by_id["ecmwf_aifs_open"].description
 
 
 def test_gfs_url_construction_for_known_cycle_bbox():
@@ -81,7 +110,7 @@ def test_gfs_url_construction_for_known_cycle_bbox():
     assert "dir=%2Fgfs.20260701%2F00%2Fatmos" in url
     assert "var_UGRD=on" in url
     assert "var_VGRD=on" in url
-    assert "var_PRMSL=on" in url
+    assert "var_PRES=on" in url
     assert "var_TMP=on" in url
     assert "lev_10_m_above_ground=on" in url
     assert "lev_mean_sea_level=on" in url
@@ -1136,7 +1165,26 @@ def test_generate_weather_cli_ecmwf_metadata(monkeypatch, tmp_path: Path, capsys
     assert "validated GRIB stream: 2 messages, 40 bytes" in out
 
 
-def test_generate_weather_cli_dwd_reports_not_implemented(capsys, tmp_path: Path):
+def test_generate_weather_cli_dwd_icon_eu_mocked(monkeypatch, capsys, tmp_path: Path):
+    def fake_generate(request, *, progress_callback=None):
+        request.output.write_bytes(_fake_grib2(b"icon"))
+        return WeatherGenerateResult(
+            provider="dwd_icon_eu",
+            source="DWD ICON-EU 13 km forecast via Open Data",
+            model="icon_eu_regular_lat_lon_13km",
+            cycle=GFSCycle("20260701", "00"),
+            bbox=request.bbox,
+            forecast_hours=[0, 3],
+            output=request.output,
+            byte_count=request.output.stat().st_size,
+            message_count=1,
+            inspection={"stream_valid": True, "message_count": 1},
+            urls=[],
+            variables_levels={},
+        )
+
+    monkeypatch.setattr("tidal_current_grib_generator.cli.generate_dwd_icon_eu_weather_grib", fake_generate)
+
     rc = main(
         [
             "generate-weather",
@@ -1155,11 +1203,14 @@ def test_generate_weather_cli_dwd_reports_not_implemented(capsys, tmp_path: Path
             "3",
             "--output",
             str(tmp_path / "dwd.grb2"),
+            "--metadata-summary",
         ]
     )
 
-    assert rc == 2
-    assert "DWD ICON-EU provider is not implemented yet" in capsys.readouterr().err
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Source: DWD ICON-EU 13 km forecast via Open Data" in out
+    assert "provider: dwd_icon_eu" in out
 
 
 def test_generate_weather_cli_ukmo_ukv_metadata(monkeypatch, capsys, tmp_path: Path):
@@ -1628,7 +1679,44 @@ def test_generate_environment_grib_weather_only(monkeypatch, tmp_path: Path):
     assert output.read_bytes() == weather.read_bytes()
 
 
-def test_generate_environment_grib_include_waves_requires_gfs(tmp_path: Path, capsys):
+def test_generate_environment_grib_gfs_wave_can_pair_with_non_gfs_weather(monkeypatch, tmp_path: Path, capsys):
+    def fake_weather(request, *, progress_callback=None):
+        request.output.write_bytes(_fake_grib2(b"ecmwf"))
+        return WeatherGenerateResult(
+            provider="ecmwf_ifs_open",
+            source="ECMWF IFS Open Data forecast",
+            model="ecmwf_ifs_open_0p25",
+            cycle=GFSCycle("20260701", "00"),
+            bbox=request.bbox,
+            forecast_hours=[0, 3],
+            output=request.output,
+            byte_count=request.output.stat().st_size,
+            message_count=1,
+            inspection={"stream_valid": True, "message_count": 1},
+            urls=[],
+            variables_levels={},
+        )
+
+    def fake_wave(request, *, progress_callback=None):
+        request.output.write_bytes(_fake_grib2(b"wave"))
+        return WeatherGenerateResult(
+            provider="gfs_wave",
+            source="NOAA GFS Wave forecast via NOMADS",
+            model="gfswave_global_0p25",
+            cycle=GFSCycle("20260701", "00"),
+            bbox=request.bbox,
+            forecast_hours=[0, 3],
+            output=request.output,
+            byte_count=request.output.stat().st_size,
+            message_count=1,
+            inspection={"stream_valid": True, "message_count": 1},
+            urls=[],
+            variables_levels={},
+        )
+
+    monkeypatch.setattr("tidal_current_grib_generator.cli.generate_ecmwf_weather_grib", fake_weather)
+    monkeypatch.setattr("tidal_current_grib_generator.cli.generate_gfs_wave_grib", fake_wave)
+
     rc = main(
         [
             "generate-environment-grib",
@@ -1646,11 +1734,16 @@ def test_generate_environment_grib_include_waves_requires_gfs(tmp_path: Path, ca
             "3",
             "--output",
             str(tmp_path / "out.grb"),
+            "--overwrite",
+            "--metadata-summary",
         ]
     )
 
-    assert rc == 2
-    assert "--include-waves with --wave-provider gfs_wave is currently supported only with --weather-provider gfs" in capsys.readouterr().err
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "weather_provider: ecmwf_ifs_open" in out
+    assert "GFS Wave will use its own available forecast cycle." in out
+    assert (tmp_path / "out.grb").exists()
 
 
 def test_generate_environment_grib_ukmo_ukv_weather_only_mocked(monkeypatch, tmp_path: Path):
@@ -2648,3 +2741,220 @@ def test_live_ecmwf_tiny_download(tmp_path: Path):
     assert result.output.exists()
     assert result.inspection["stream_valid"] is True
     assert result.inspection["edition_counts"].get(2, 0) > 0
+
+
+def test_hrrr_url_construction_for_known_cycle_bbox():
+    url = build_hrrr_filter_url(
+        GFSCycle("20260701", "12"),
+        18,
+        BoundingBox(-82.0, 25.0, -73.0, 35.0),
+    )
+
+    assert url.startswith("https://nomads.ncep.noaa.gov/cgi-bin/filter_hrrr_2d.pl?")
+    assert "file=hrrr.t12z.wrfsfcf18.grib2" in url
+    assert "dir=%2Fhrrr.20260701%2Fconus" in url
+    assert "var_UGRD=on" in url
+    assert "var_VGRD=on" in url
+    assert "var_PRES=on" in url
+    assert "var_TMP=on" in url
+    assert "leftlon=-82" in url
+    assert "rightlon=-73" in url
+
+
+def test_hrrr_forecast_hours_and_domain_validation(tmp_path: Path):
+    assert hrrr_forecast_hour_sequence(18, 1) == list(range(19))
+    with pytest.raises(ValidationError, match="contiguous United States"):
+        generate_hrrr_weather_grib(
+            HRRRWeatherRequest(
+                bbox=BoundingBox(-8.5, 50.5, -2.5, 56.5),
+                output=tmp_path / "hrrr.grb2",
+                hours=1,
+            ),
+            http_get=lambda url, timeout: b"",
+        )
+
+
+def test_generate_hrrr_appends_grib_segments_atomically(monkeypatch, tmp_path: Path):
+    index_calls = []
+    range_calls = []
+    inventory = "\n".join(
+        [
+            "1:0:d=2026070112:UGRD:10 m above ground:anl:",
+            "2:20:d=2026070112:VGRD:10 m above ground:anl:",
+            "3:40:d=2026070112:PRES:surface:anl:",
+            "4:60:d=2026070112:TMP:2 m above ground:anl:",
+            "5:80:d=2026070112:REFC:entire atmosphere:anl:",
+        ]
+    ).encode()
+
+    def fake_http_get(url, timeout):
+        index_calls.append(url)
+        return inventory
+
+    def fake_http_get_range(url, start, end, timeout):
+        range_calls.append((url, start, end))
+        return _fake_grib2(f"hrrr-{len(range_calls)}".encode())
+
+    monkeypatch.setattr(
+        "tidal_current_grib_generator.weather.inspect_grib",
+        lambda path: {"stream_valid": True, "message_count": 12, "edition_counts": {2: 12}},
+    )
+
+    result = generate_hrrr_weather_grib(
+        HRRRWeatherRequest(
+            bbox=BoundingBox(-82.0, 25.0, -73.0, 35.0),
+            output=tmp_path / "hrrr.grb2",
+            hours=2,
+            step_hours=1,
+            cycle="12",
+            date="20260701",
+        ),
+        http_get=fake_http_get,
+        http_get_range=fake_http_get_range,
+    )
+
+    assert result.provider == "noaa_hrrr"
+    assert result.source == "NOAA HRRR 3 km forecast via NOMADS"
+    assert any("full-grid" in warning for warning in result.warnings)
+    assert result.forecast_hours == [0, 1, 2]
+    assert len(index_calls) == 3
+    assert len(range_calls) == 12
+    assert all(call.endswith(".idx") for call in index_calls)
+    assert all("/hrrr.20260701/conus/hrrr.t12z.wrfsfcf" in call[0] for call in range_calls)
+
+
+def test_dwd_icon_eu_url_and_hours():
+    url = build_dwd_icon_eu_url(GFSCycle("20260701", "00"), 3, "u_10m")
+
+    assert url == (
+        "https://opendata.dwd.de/weather/nwp/icon-eu/grib/00/u_10m/"
+        "icon-eu_europe_regular-lat-lon_single-level_2026070100_003_U_10M.grib2.bz2"
+    )
+    assert dwd_icon_eu_forecast_hour_sequence(48, 3) == list(range(0, 49, 3))
+
+
+def test_generate_dwd_icon_eu_decompresses_and_merges(monkeypatch, tmp_path: Path):
+    import bz2
+
+    calls = []
+
+    def fake_http_get(url, timeout):
+        calls.append(url)
+        return bz2.compress(_fake_grib2(f"icon-{len(calls)}".encode()))
+
+    monkeypatch.setattr(
+        "tidal_current_grib_generator.weather.inspect_grib",
+        lambda path: {"stream_valid": True, "message_count": 8, "edition_counts": {2: 8}},
+    )
+
+    result = generate_dwd_icon_eu_weather_grib(
+        DWDIconEUWeatherRequest(
+            bbox=BoundingBox(-8.5, 50.5, -2.5, 56.5),
+            output=tmp_path / "icon.grb2",
+            hours=3,
+            step_hours=3,
+            cycle="00",
+            date="20260701",
+        ),
+        http_get=fake_http_get,
+    )
+
+    assert result.provider == "dwd_icon_eu"
+    assert result.message_count == 8
+    assert len(calls) == 8
+    assert result.output.read_bytes().count(b"GRIB") == 8
+
+
+def test_ecmwf_aifs_uses_official_client_request(monkeypatch, tmp_path: Path):
+    calls = []
+    client_kwargs = []
+
+    class FakeClient:
+        def retrieve(self, **kwargs):
+            calls.append(kwargs)
+            Path(kwargs["target"]).write_bytes(_fake_grib2(b"aifs"))
+            return type("Result", (), {"datetime": datetime(2026, 7, 2, 0, tzinfo=timezone.utc)})()
+
+    def fake_factory(**kwargs):
+        client_kwargs.append(kwargs)
+        return FakeClient()
+
+    monkeypatch.setattr(
+        "tidal_current_grib_generator.weather.inspect_grib",
+        lambda path: {"stream_valid": True, "message_count": 1, "edition_counts": {2: 1}},
+    )
+
+    result = generate_ecmwf_aifs_weather_grib(
+        ECMWFWeatherRequest(
+            bbox=BoundingBox(-8.5, 50.5, -2.5, 56.5),
+            output=tmp_path / "aifs.grb2",
+            hours=12,
+            step_hours=6,
+            cycle="auto",
+        ),
+        client_factory=fake_factory,
+    )
+
+    assert result.provider == "ecmwf_aifs_open"
+    assert result.source == "ECMWF AIFS Open Data forecast"
+    assert client_kwargs[0]["model"] == "aifs"
+    assert calls[0]["step"] == [0, 6, 12]
+    assert calls[0]["param"] == ["10u", "10v", "msl", "2t"]
+    assert result.warnings
+
+
+def test_ecmwf_aifs_forecast_hour_sequence():
+    assert ecmwf_aifs_forecast_hour_sequence(72, 6) == list(range(0, 73, 6))
+    with pytest.raises(ValidationError, match="6 or 12"):
+        ecmwf_aifs_forecast_hour_sequence(12, 3)
+
+
+def test_generate_environment_with_hrrr_weather_mocked(monkeypatch, tmp_path: Path, capsys):
+    def fake_weather(request, *, progress_callback=None):
+        request.output.write_bytes(_fake_grib2(b"weather"))
+        return WeatherGenerateResult(
+            provider="noaa_hrrr",
+            source="NOAA HRRR 3 km forecast via NOMADS",
+            model="hrrr_conus_3km",
+            cycle=GFSCycle("20260701", "12"),
+            bbox=request.bbox,
+            forecast_hours=[0, 1],
+            output=request.output,
+            byte_count=request.output.stat().st_size,
+            message_count=1,
+            inspection={"stream_valid": True, "message_count": 1},
+            urls=[],
+            variables_levels={},
+        )
+
+    monkeypatch.setattr("tidal_current_grib_generator.cli.generate_hrrr_weather_grib", fake_weather)
+    monkeypatch.setattr(
+        "tidal_current_grib_generator.cli.inspect_grib",
+        lambda path: {"stream_valid": True, "message_count": 1, "edition_counts": {2: 1}},
+    )
+
+    rc = main([
+        "generate-environment-grib",
+        "--bbox",
+        "-82",
+        "25",
+        "-73",
+        "35",
+        "--hours",
+        "1",
+        "--step-hours",
+        "1",
+        "--weather-provider",
+        "noaa_hrrr",
+        "--current-source",
+        "none",
+        "--output",
+        str(tmp_path / "environment.grb"),
+        "--overwrite",
+        "--metadata-summary",
+    ])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "weather_provider: noaa_hrrr" in out
+    assert (tmp_path / "environment.grb").exists()

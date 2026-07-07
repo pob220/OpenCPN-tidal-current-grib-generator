@@ -21,10 +21,16 @@ from tidal_current_grib_generator.grib.validation import inspect_grib, scan_grib
 
 GFS_FILTER_ENDPOINT = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl"
 GFS_WAVE_FILTER_ENDPOINT = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfswave.pl"
+HRRR_FILTER_ENDPOINT = "https://nomads.ncep.noaa.gov/cgi-bin/filter_hrrr_2d.pl"
+HRRR_PUBLIC_BASE_URL = "https://nomads.ncep.noaa.gov/pub/data/nccf/com/hrrr/prod"
+DWD_ICON_EU_BASE_URL = "https://opendata.dwd.de/weather/nwp/icon-eu/grib"
 GFS_SOURCE_LABEL = "NOAA GFS 0.25° forecast via NOMADS"
 GFS_WAVE_SOURCE_LABEL = "NOAA GFS Wave forecast via NOMADS"
 COPERNICUS_GLOBAL_WAVE_SOURCE_LABEL = "Copernicus Marine Global Waves forecast"
 ECMWF_SOURCE_LABEL = "ECMWF IFS Open Data forecast"
+ECMWF_AIFS_SOURCE_LABEL = "ECMWF AIFS Open Data forecast"
+HRRR_SOURCE_LABEL = "NOAA HRRR 3 km forecast via NOMADS"
+DWD_ICON_EU_SOURCE_LABEL = "DWD ICON-EU 13 km forecast via Open Data"
 UKMO_UKV_SOURCE_LABEL = "Met Office UKV 2 km forecast"
 COPERNICUS_GLOBAL_WAVE_DATASET_ID = "cmems_mod_glo_wav_anfc_0.083deg_PT3H-i"
 COPERNICUS_GLOBAL_WAVE_PRODUCT_ID = "GLOBAL_ANALYSISFORECAST_WAV_001_027"
@@ -36,6 +42,8 @@ COPERNICUS_GLOBAL_WAVE_ALIASES = {
     "dirpw": ("VMDR", "mean_wave_direction", "sea_surface_wave_from_direction"),
 }
 UKMO_UKV_DOMAIN = BoundingBox(west=-12.0, south=48.0, east=4.0, north=62.0)
+HRRR_CONUS_DOMAIN = BoundingBox(west=-130.0, south=20.0, east=-60.0, north=55.0)
+DWD_ICON_EU_DOMAIN = BoundingBox(west=-32.5, south=20.0, east=42.5, north=72.5)
 UKMO_UKV_BUCKET = "met-office-atmospheric-model-data"
 UKMO_UKV_REGION = "eu-west-2"
 UKMO_UKV_S3_ENDPOINT = f"https://{UKMO_UKV_BUCKET}.s3.{UKMO_UKV_REGION}.amazonaws.com/"
@@ -64,7 +72,7 @@ UKMO_UKV_REQUIRED_SOURCE_FIELDS = {
 GFS_ROUTING_VARIABLES_LEVELS = {
     "var_UGRD": "on",
     "var_VGRD": "on",
-    "var_PRMSL": "on",
+    "var_PRES": "on",
     "var_TMP": "on",
     "lev_10_m_above_ground": "on",
     "lev_mean_sea_level": "on",
@@ -90,18 +98,59 @@ GFS_WAVE_VARIABLES_LEVELS = {
 }
 GFS_VARIABLES_LEVELS = GFS_ROUTING_VARIABLES_LEVELS
 ECMWF_PARAMETERS = ["10u", "10v", "msl", "2t"]
+ECMWF_AIFS_PARAMETERS = ["10u", "10v", "msl", "2t"]
 ECMWF_VARIABLES_LEVELS = {
     "param": ECMWF_PARAMETERS,
     "levtype": "sfc",
     "type": "fc",
 }
+ECMWF_AIFS_VARIABLES_LEVELS = {
+    "param": ECMWF_AIFS_PARAMETERS,
+    "levtype": "sfc",
+    "type": "fc",
+}
+HRRR_ROUTING_VARIABLES_LEVELS = {
+    "var_UGRD": "on",
+    "var_VGRD": "on",
+    "var_PRES": "on",
+    "var_TMP": "on",
+    "lev_10_m_above_ground": "on",
+    "lev_surface": "on",
+    "lev_2_m_above_ground": "on",
+}
+HRRR_MINIMAL_VARIABLES_LEVELS = {
+    "var_UGRD": "on",
+    "var_VGRD": "on",
+    "lev_10_m_above_ground": "on",
+}
+HRRR_MARINE_EXTRA_VARIABLES_LEVELS = {
+    "var_GUST": "on",
+    "lev_surface": "on",
+}
+DWD_ICON_EU_FIELDS = {
+    "10u": "u_10m",
+    "10v": "v_10m",
+    "prmsl": "pmsl",
+    "2t": "t_2m",
+}
+DWD_ICON_EU_MINIMAL_FIELDS = {"10u": "u_10m", "10v": "v_10m"}
 
 HttpGet = Callable[[str, float], bytes]
+HttpGetRange = Callable[[str, int, int, float], bytes]
 
 
 class EcmwfClientFactory(Protocol):
     def __call__(self, **kwargs: Any) -> Any:
         ...
+
+
+@dataclass(frozen=True)
+class HRRRInventoryEntry:
+    message_number: int
+    offset: int
+    short_name: str
+    level: str
+    forecast: str
 
 
 @dataclass(frozen=True)
@@ -152,6 +201,38 @@ class GFSWeatherRequest:
     date: str | None = None
     overwrite: bool = False
     timeout_seconds: float = 60.0
+    retry_delay_seconds: float = 1.0
+    max_auto_cycles: int = 8
+    dry_run: bool = False
+    preset: str = "routing"
+
+
+@dataclass(frozen=True)
+class HRRRWeatherRequest:
+    bbox: BoundingBox
+    output: Path
+    hours: int
+    step_hours: int = 1
+    cycle: str = "auto"
+    date: str | None = None
+    overwrite: bool = False
+    timeout_seconds: float = 60.0
+    retry_delay_seconds: float = 1.0
+    max_auto_cycles: int = 24
+    dry_run: bool = False
+    preset: str = "routing"
+
+
+@dataclass(frozen=True)
+class DWDIconEUWeatherRequest:
+    bbox: BoundingBox
+    output: Path
+    hours: int
+    step_hours: int = 3
+    cycle: str = "auto"
+    date: str | None = None
+    overwrite: bool = False
+    timeout_seconds: float = 90.0
     retry_delay_seconds: float = 1.0
     max_auto_cycles: int = 8
     dry_run: bool = False
@@ -365,6 +446,18 @@ def list_weather_providers() -> list[WeatherProvider]:
             ),
         ),
         WeatherProvider(
+            id="noaa_hrrr",
+            label="NOAA HRRR 3 km forecast",
+            source="NOAA NOMADS",
+            format="GRIB2",
+            account="free/no account",
+            description=(
+                "NOAA High-Resolution Rapid Refresh short-range hourly forecast for the contiguous United States. "
+                "Implemented and live-smoked. Currently downloads indexed full-grid GRIB messages; "
+                "bbox cropping is not yet implemented, so files can be large."
+            ),
+        ),
+        WeatherProvider(
             id="ukmo_ukv",
             label="Met Office UKV 2 km forecast",
             source="Met Office AWS/Open Data",
@@ -373,6 +466,18 @@ def list_weather_providers() -> list[WeatherProvider]:
             description=(
                 "High-resolution UK/Ireland short-range forecast. Good candidate for Irish Sea coastal routing. "
                 "CLI generation regrids the projected UKV NetCDF source to regular latitude/longitude GRIB2."
+            ),
+        ),
+        WeatherProvider(
+            id="dwd_icon_eu",
+            label="DWD ICON-EU 13 km forecast",
+            source="DWD Open Data",
+            format="GRIB2",
+            account="free/no account",
+            description=(
+                "DWD ICON-EU regional forecast over Europe. Implemented and live-smoked. "
+                "Currently downloads full-domain DWD regular-lat/lon GRIB2 field files; "
+                "bbox cropping is not yet implemented, so files can be large."
             ),
         ),
         WeatherProvider(
@@ -387,13 +492,16 @@ def list_weather_providers() -> list[WeatherProvider]:
             ),
         ),
         WeatherProvider(
-            id="dwd_icon_eu",
-            label="DWD ICON-EU forecast",
-            source="DWD Open Data",
+            id="ecmwf_aifs_open",
+            label="ECMWF AIFS Open Data forecast (experimental)",
+            source="ECMWF Open Data",
             format="GRIB2",
             account="free/no account",
-            description="Planned ICON-EU GRIB2 provider. Not implemented in this CLI build yet.",
-            implemented=False,
+            description=(
+                "ECMWF Artificial Intelligence Forecasting System Open Data global forecast. "
+                "Experimental/unverified in this build; live retrieval still needs validation. "
+                "Retrieves requested surface fields without spatial cropping when available, so files may be large."
+            ),
         ),
     ]
 
@@ -773,20 +881,235 @@ def generate_copernicus_global_wave_grib(
     )
 
 
+
+def generate_hrrr_weather_grib(
+    request: HRRRWeatherRequest,
+    *,
+    http_get: HttpGet | None = None,
+    http_get_range: HttpGetRange | None = None,
+    now: datetime | None = None,
+    progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+) -> WeatherGenerateResult:
+    request.bbox.validate()
+    _validate_hrrr_request(request)
+    http_get = http_get or _http_get
+    http_get_range = http_get_range or _http_get_range
+    output = request.output.expanduser()
+    if output.exists() and output.is_dir():
+        raise ValidationError("--output must be a file path, not a directory")
+    if output.exists() and not request.overwrite:
+        raise ValidationError(f"output already exists: {output}; use --overwrite to replace it")
+    forecast_hours = hrrr_forecast_hour_sequence(request.hours, request.step_hours)
+    variables_levels = hrrr_variables_for_preset(request.preset)
+    warnings = _marine_fallback_warnings("NOAA HRRR", request.preset, variables_levels, HRRR_ROUTING_VARIABLES_LEVELS, HRRR_MINIMAL_VARIABLES_LEVELS)
+    warnings.append("HRRR currently uses full-grid byte-range GRIB messages; bbox cropping is not yet implemented, so files can be large.")
+    candidates = hrrr_cycle_candidates(request, now=now)
+    if request.dry_run:
+        planned_cycle = candidates[0]
+        return WeatherGenerateResult(
+            provider="noaa_hrrr",
+            source=HRRR_SOURCE_LABEL,
+            model="hrrr_conus_3km",
+            cycle=planned_cycle,
+            bbox=request.bbox,
+            forecast_hours=forecast_hours,
+            output=output,
+            byte_count=0,
+            message_count=0,
+            inspection={"stream_valid": False, "message_count": 0, "dry_run": True},
+            urls=[build_hrrr_index_url(planned_cycle, hour) for hour in forecast_hours],
+            variables_levels=variables_levels,
+            warnings=warnings,
+        )
+
+    selected_cycle: GFSCycle | None = None
+    urls: list[str] = []
+    segments: list[tuple[int, str, bytes]] = []
+    errors: list[str] = []
+    for candidate in candidates:
+        try:
+            segments = _download_hrrr_cycle_segments(
+                candidate,
+                forecast_hours,
+                http_get,
+                http_get_range,
+                request.timeout_seconds,
+                variables_levels=variables_levels,
+                progress_callback=progress_callback,
+            )
+            selected_cycle = candidate
+            urls = [url for _, url, _ in segments]
+            _progress(progress_callback, "selected HRRR cycle", {"cycle": candidate.cycle_time})
+            break
+        except ValidationError as exc:
+            errors.append(f"{candidate.cycle_time}: {exc}")
+            if request.cycle != "auto":
+                raise
+            _progress(progress_callback, "HRRR cycle incomplete", {"cycle": candidate.cycle_time, "error": str(exc)})
+            time.sleep(min(request.retry_delay_seconds, 5.0))
+    if selected_cycle is None or not segments:
+        raise ValidationError(
+            "No complete HRRR cycle was available for the requested hours. "
+            "Try a shorter duration or explicit older cycle. Tried: " + "; ".join(errors)
+        )
+    tmp_path: Path | None = None
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(prefix=output.name + ".", suffix=".tmp", dir=output.parent, delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+            for forecast_hour, _url, segment in segments:
+                tmp.write(segment)
+                _progress(progress_callback, "downloaded HRRR forecast hour", {"cycle": selected_cycle.cycle_time, "hour": forecast_hour, "bytes": len(segment)})
+        scan = scan_grib_messages(tmp_path)
+        if scan.message_count <= 0:
+            raise ValidationError("combined HRRR GRIB contains no messages")
+        inspection = inspect_grib(tmp_path)
+        tmp_path.replace(output)
+        tmp_path = None
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink()
+    return WeatherGenerateResult(
+        provider="noaa_hrrr",
+        source=HRRR_SOURCE_LABEL,
+        model="hrrr_conus_3km",
+        cycle=selected_cycle,
+        bbox=request.bbox,
+        forecast_hours=forecast_hours,
+        output=output,
+        byte_count=scan.byte_count,
+        message_count=scan.message_count,
+        inspection=inspection,
+        urls=urls,
+        variables_levels=variables_levels,
+        warnings=warnings,
+    )
+
+
+def generate_dwd_icon_eu_weather_grib(
+    request: DWDIconEUWeatherRequest,
+    *,
+    http_get: HttpGet | None = None,
+    now: datetime | None = None,
+    progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+) -> WeatherGenerateResult:
+    request.bbox.validate()
+    _validate_dwd_icon_eu_request(request)
+    http_get = http_get or _http_get
+    output = request.output.expanduser()
+    if output.exists() and output.is_dir():
+        raise ValidationError("--output must be a file path, not a directory")
+    if output.exists() and not request.overwrite:
+        raise ValidationError(f"output already exists: {output}; use --overwrite to replace it")
+    forecast_hours = dwd_icon_eu_forecast_hour_sequence(request.hours, request.step_hours)
+    fields = dwd_icon_eu_fields_for_preset(request.preset)
+    warnings = _marine_fallback_warnings("DWD ICON-EU", request.preset, fields, DWD_ICON_EU_FIELDS, DWD_ICON_EU_MINIMAL_FIELDS)
+    warnings.append("ICON-EU currently downloads full-domain DWD field files; bbox cropping is not yet implemented, so files can be large.")
+    candidates = dwd_icon_eu_cycle_candidates(request, now=now)
+    if request.dry_run:
+        planned_cycle = candidates[0]
+        return WeatherGenerateResult(
+            provider="dwd_icon_eu",
+            source=DWD_ICON_EU_SOURCE_LABEL,
+            model="icon_eu_regular_lat_lon_13km",
+            cycle=planned_cycle,
+            bbox=request.bbox,
+            forecast_hours=forecast_hours,
+            output=output,
+            byte_count=0,
+            message_count=0,
+            inspection={"stream_valid": False, "message_count": 0, "dry_run": True},
+            urls=[build_dwd_icon_eu_url(planned_cycle, hour, field) for hour in forecast_hours for field in fields.values()],
+            variables_levels={"fields": fields, "domain": DWD_ICON_EU_DOMAIN.__dict__},
+            warnings=warnings,
+        )
+
+    selected_cycle: GFSCycle | None = None
+    segments: list[tuple[int, str, bytes]] = []
+    errors: list[str] = []
+    for candidate in candidates:
+        try:
+            segments = _download_dwd_icon_eu_segments(candidate, forecast_hours, fields, http_get, request.timeout_seconds, progress_callback)
+            selected_cycle = candidate
+            _progress(progress_callback, "selected DWD ICON-EU cycle", {"cycle": candidate.cycle_time})
+            break
+        except ValidationError as exc:
+            errors.append(f"{candidate.cycle_time}: {exc}")
+            if request.cycle != "auto":
+                raise
+            _progress(progress_callback, "DWD ICON-EU cycle incomplete", {"cycle": candidate.cycle_time, "error": str(exc)})
+            time.sleep(min(request.retry_delay_seconds, 5.0))
+    if selected_cycle is None or not segments:
+        raise ValidationError(
+            "No complete DWD ICON-EU cycle was available for the requested fields/hours. "
+            "Try a shorter duration or explicit older cycle. Tried: " + "; ".join(errors)
+        )
+    tmp_path: Path | None = None
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(prefix=output.name + ".", suffix=".tmp", dir=output.parent, delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+            for forecast_hour, url, segment in segments:
+                tmp.write(segment)
+                _progress(progress_callback, "downloaded DWD ICON-EU field", {"cycle": selected_cycle.cycle_time, "hour": forecast_hour, "url": url, "bytes": len(segment)})
+        scan = scan_grib_messages(tmp_path)
+        if scan.message_count <= 0:
+            raise ValidationError("combined DWD ICON-EU GRIB contains no messages")
+        inspection = inspect_grib(tmp_path)
+        tmp_path.replace(output)
+        tmp_path = None
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink()
+    return WeatherGenerateResult(
+        provider="dwd_icon_eu",
+        source=DWD_ICON_EU_SOURCE_LABEL,
+        model="icon_eu_regular_lat_lon_13km",
+        cycle=selected_cycle,
+        bbox=request.bbox,
+        forecast_hours=forecast_hours,
+        output=output,
+        byte_count=scan.byte_count,
+        message_count=scan.message_count,
+        inspection=inspection,
+        urls=[url for _, url, _ in segments],
+        variables_levels={"fields": fields, "domain": DWD_ICON_EU_DOMAIN.__dict__},
+        warnings=warnings,
+    )
+
+
 def generate_ecmwf_weather_grib(
     request: ECMWFWeatherRequest,
     *,
     client_factory: EcmwfClientFactory | None = None,
     progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> WeatherGenerateResult:
-    """Retrieve ECMWF IFS Open Data using the official ecmwf-opendata client.
+    return _generate_ecmwf_open_data_weather_grib(
+        request,
+        provider_id="ecmwf_ifs_open",
+        source_label=ECMWF_SOURCE_LABEL,
+        model_name="ecmwf_ifs_open_0p25",
+        client_model="ifs",
+        parameters=ECMWF_PARAMETERS,
+        variables_levels=ECMWF_VARIABLES_LEVELS,
+        client_factory=client_factory,
+        progress_callback=progress_callback,
+    )
 
-    The official client handles the ECMWF Open Data index and byte-range
-    retrieval. The public client API documents parameter/step/date/time
-    selection, but not geographic subsetting, so this first provider accepts a
-    bbox for workflow compatibility and metadata while retrieving the published
-    global 0.25 degree fields.
-    """
+
+def _generate_ecmwf_open_data_weather_grib(
+    request: ECMWFWeatherRequest,
+    *,
+    provider_id: str,
+    source_label: str,
+    model_name: str,
+    client_model: str,
+    parameters: list[str],
+    variables_levels: dict[str, Any],
+    client_factory: EcmwfClientFactory | None,
+    progress_callback: Callable[[str, dict[str, Any]], None] | None,
+) -> WeatherGenerateResult:
+    """Retrieve ECMWF Open Data using the official ecmwf-opendata client."""
 
     request.bbox.validate()
     _validate_ecmwf_request(request)
@@ -795,8 +1118,8 @@ def generate_ecmwf_weather_grib(
         raise ValidationError("--output must be a file path, not a directory")
     if output.exists() and not request.overwrite:
         raise ValidationError(f"output already exists: {output}; use --overwrite to replace it")
-    forecast_hours = forecast_hour_sequence(request.hours, request.step_hours)
-    warning = "ECMWF Open Data provider currently retrieves global fields; bbox is recorded but not spatially cropped"
+    forecast_hours = ecmwf_aifs_forecast_hour_sequence(request.hours, request.step_hours) if provider_id == "ecmwf_aifs_open" else forecast_hour_sequence(request.hours, request.step_hours)
+    warning = f"{source_label} provider currently retrieves global fields; bbox is recorded but not spatially cropped"
 
     if request.cycle == "auto":
         planned_cycle = WeatherCycle("auto", "auto")
@@ -807,9 +1130,9 @@ def generate_ecmwf_weather_grib(
 
     if request.dry_run:
         return WeatherGenerateResult(
-            provider="ecmwf_ifs_open",
-            source=ECMWF_SOURCE_LABEL,
-            model="ecmwf_ifs_open_0p25",
+            provider=provider_id,
+            source=source_label,
+            model=model_name,
             cycle=planned_cycle,
             bbox=request.bbox,
             forecast_hours=forecast_hours,
@@ -818,13 +1141,13 @@ def generate_ecmwf_weather_grib(
             message_count=0,
             inspection={"stream_valid": False, "message_count": 0, "dry_run": True},
             urls=[],
-            variables_levels=ECMWF_VARIABLES_LEVELS,
+            variables_levels=variables_levels,
             warnings=[warning],
         )
 
     client_factory = client_factory or _ecmwf_client_factory
     try:
-        client = client_factory(source="ecmwf", model="ifs", resol="0p25")
+        client = client_factory(source="ecmwf", model=client_model, resol="0p25")
     except MissingDependencyError:
         raise
     except Exception as exc:
@@ -833,7 +1156,7 @@ def generate_ecmwf_weather_grib(
     retrieve_request: dict[str, Any] = {
         "type": "fc",
         "step": forecast_hours,
-        "param": ECMWF_PARAMETERS,
+        "param": parameters,
         "target": None,
     }
     if request.cycle != "auto":
@@ -848,16 +1171,16 @@ def generate_ecmwf_weather_grib(
         retrieve_request["target"] = str(tmp_path)
         _progress(
             progress_callback,
-            "retrieving ECMWF Open Data forecast",
-            {"params": ECMWF_PARAMETERS, "forecast_hours": forecast_hours},
+            f"retrieving {source_label}",
+            {"model": client_model, "params": parameters, "forecast_hours": forecast_hours},
         )
         try:
             result = client.retrieve(**retrieve_request)
         except Exception as exc:
-            raise ValidationError(f"ECMWF Open Data retrieval failed: {exc}") from exc
+            raise ValidationError(f"{source_label} retrieval failed: {exc}") from exc
         if not tmp_path.exists() or tmp_path.stat().st_size == 0:
-            raise ValidationError("ECMWF Open Data retrieval produced an empty GRIB file")
-        _validate_downloaded_grib_file(tmp_path, "ECMWF Open Data")
+            raise ValidationError(f"{source_label} retrieval produced an empty GRIB file")
+        _validate_downloaded_grib_file(tmp_path, source_label)
         scan = scan_grib_messages(tmp_path)
         inspection = inspect_grib(tmp_path)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -870,9 +1193,9 @@ def generate_ecmwf_weather_grib(
     cycle_time = getattr(result, "datetime", None)
     selected_cycle = _weather_cycle_from_ecmwf_datetime(cycle_time) if cycle_time is not None else planned_cycle
     return WeatherGenerateResult(
-        provider="ecmwf_ifs_open",
-        source=ECMWF_SOURCE_LABEL,
-        model="ecmwf_ifs_open_0p25",
+        provider=provider_id,
+        source=source_label,
+        model=model_name,
         cycle=selected_cycle,
         bbox=request.bbox,
         forecast_hours=forecast_hours,
@@ -881,8 +1204,27 @@ def generate_ecmwf_weather_grib(
         message_count=scan.message_count,
         inspection=inspection,
         urls=[],
-        variables_levels=ECMWF_VARIABLES_LEVELS,
+        variables_levels=variables_levels,
         warnings=[warning],
+    )
+
+
+def generate_ecmwf_aifs_weather_grib(
+    request: ECMWFWeatherRequest,
+    *,
+    client_factory: EcmwfClientFactory | None = None,
+    progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+) -> WeatherGenerateResult:
+    return _generate_ecmwf_open_data_weather_grib(
+        request,
+        provider_id="ecmwf_aifs_open",
+        source_label=ECMWF_AIFS_SOURCE_LABEL,
+        model_name="ecmwf_aifs_open",
+        client_model="aifs",
+        parameters=ECMWF_AIFS_PARAMETERS,
+        variables_levels=ECMWF_AIFS_VARIABLES_LEVELS,
+        client_factory=client_factory,
+        progress_callback=progress_callback,
     )
 
 
@@ -2809,6 +3151,156 @@ def gfs_variables_for_preset(preset: str) -> dict[str, str]:
     raise ValidationError("--weather-preset must be minimal, routing, or marine")
 
 
+
+def hrrr_forecast_hour_sequence(hours: int, step_hours: int) -> list[int]:
+    if hours > 48:
+        raise ValidationError("HRRR forecasts are supported only to 48 hours")
+    if step_hours != 1:
+        raise ValidationError("--step-hours must be 1 for HRRR")
+    return forecast_hour_sequence(hours, step_hours)
+
+
+def dwd_icon_eu_forecast_hour_sequence(hours: int, step_hours: int) -> list[int]:
+    if hours > 120:
+        raise ValidationError("DWD ICON-EU forecasts are supported only to 120 hours")
+    if step_hours not in {1, 3}:
+        raise ValidationError("--step-hours must be 1 or 3 for DWD ICON-EU")
+    return forecast_hour_sequence(hours, step_hours)
+
+
+def ecmwf_aifs_forecast_hour_sequence(hours: int, step_hours: int) -> list[int]:
+    if step_hours not in {6, 12}:
+        raise ValidationError("--step-hours must be 6 or 12 for ECMWF AIFS Open Data")
+    return forecast_hour_sequence(hours, step_hours)
+
+
+def hrrr_variables_for_preset(preset: str) -> dict[str, str]:
+    normalized = preset.strip().lower()
+    if normalized == "minimal":
+        return dict(HRRR_MINIMAL_VARIABLES_LEVELS)
+    if normalized == "routing":
+        return dict(HRRR_ROUTING_VARIABLES_LEVELS)
+    if normalized == "marine":
+        fields = dict(HRRR_ROUTING_VARIABLES_LEVELS)
+        fields.update(HRRR_MARINE_EXTRA_VARIABLES_LEVELS)
+        return fields
+    raise ValidationError("--weather-preset must be minimal, routing, or marine")
+
+
+def dwd_icon_eu_fields_for_preset(preset: str) -> dict[str, str]:
+    normalized = preset.strip().lower()
+    if normalized == "minimal":
+        return dict(DWD_ICON_EU_MINIMAL_FIELDS)
+    if normalized in {"routing", "marine"}:
+        return dict(DWD_ICON_EU_FIELDS)
+    raise ValidationError("--weather-preset must be minimal, routing, or marine")
+
+
+def _marine_fallback_warnings(provider: str, preset: str, selected: dict[str, Any], routing: dict[str, Any], minimal: dict[str, Any]) -> list[str]:
+    if preset.strip().lower() == "marine" and set(selected) <= set(routing) | set(minimal):
+        return [f"Marine preset for {provider} currently generates routing fields only."]
+    return []
+
+
+def build_hrrr_filter_url(
+    cycle: GFSCycle,
+    forecast_hour: int,
+    bbox: BoundingBox,
+    *,
+    variables_levels: dict[str, str] | None = None,
+) -> str:
+    query = {
+        "dir": f"/hrrr.{cycle.date}/conus",
+        "file": f"hrrr.t{cycle.cycle}z.wrfsfcf{forecast_hour:02d}.grib2",
+        "subregion": "",
+        "leftlon": f"{bbox.west:g}",
+        "rightlon": f"{bbox.east:g}",
+        "toplat": f"{bbox.north:g}",
+        "bottomlat": f"{bbox.south:g}",
+        **(variables_levels or HRRR_ROUTING_VARIABLES_LEVELS),
+    }
+    return f"{HRRR_FILTER_ENDPOINT}?{urlencode(query)}"
+
+
+
+def build_hrrr_file_url(cycle: GFSCycle, forecast_hour: int) -> str:
+    return (
+        f"{HRRR_PUBLIC_BASE_URL}/hrrr.{cycle.date}/conus/"
+        f"hrrr.t{cycle.cycle}z.wrfsfcf{forecast_hour:02d}.grib2"
+    )
+
+
+def build_hrrr_index_url(cycle: GFSCycle, forecast_hour: int) -> str:
+    return build_hrrr_file_url(cycle, forecast_hour) + ".idx"
+
+
+def parse_hrrr_inventory(text: str) -> list[HRRRInventoryEntry]:
+    entries: list[HRRRInventoryEntry] = []
+    for line in text.splitlines():
+        parts = line.split(":")
+        if len(parts) < 6:
+            continue
+        try:
+            message_number = int(parts[0])
+            offset = int(parts[1])
+        except ValueError:
+            continue
+        entries.append(
+            HRRRInventoryEntry(
+                message_number=message_number,
+                offset=offset,
+                short_name=parts[3],
+                level=parts[4],
+                forecast=parts[5],
+            )
+        )
+    return entries
+
+
+def _hrrr_requested_fields(variables_levels: dict[str, str]) -> set[tuple[str, str]]:
+    requested_vars = {key.removeprefix("var_") for key, value in variables_levels.items() if key.startswith("var_") and value == "on"}
+    requested_levels = {
+        key.removeprefix("lev_").replace("_", " ")
+        for key, value in variables_levels.items()
+        if key.startswith("lev_") and value == "on"
+    }
+    field_map = {
+        "UGRD": "10 m above ground",
+        "VGRD": "10 m above ground",
+        "TMP": "2 m above ground",
+        "PRES": "surface",
+        "GUST": "surface",
+    }
+    return {
+        (short_name, level)
+        for short_name, level in field_map.items()
+        if short_name in requested_vars and level in requested_levels
+    }
+
+
+def _select_hrrr_ranges(entries: list[HRRRInventoryEntry], variables_levels: dict[str, str]) -> list[tuple[HRRRInventoryEntry, int, int]]:
+    requested = _hrrr_requested_fields(variables_levels)
+    selected: list[tuple[HRRRInventoryEntry, int, int]] = []
+    for index, entry in enumerate(entries):
+        if (entry.short_name, entry.level) not in requested:
+            continue
+        if index + 1 >= len(entries):
+            raise ValidationError(f"HRRR inventory selected final message without a following offset: {entry.short_name} {entry.level}")
+        selected.append((entry, entry.offset, entries[index + 1].offset - 1))
+    found = {(entry.short_name, entry.level) for entry, _start, _end in selected}
+    missing = requested - found
+    if missing:
+        missing_text = ", ".join(f"{name} {level}" for name, level in sorted(missing))
+        raise ValidationError(f"HRRR inventory did not contain required fields: {missing_text}")
+    return selected
+
+def build_dwd_icon_eu_url(cycle: GFSCycle, forecast_hour: int, field: str) -> str:
+    return (
+        f"{DWD_ICON_EU_BASE_URL}/{cycle.cycle}/{field}/"
+        f"icon-eu_europe_regular-lat-lon_single-level_{cycle.date}{cycle.cycle}_{forecast_hour:03d}_{field.upper()}.grib2.bz2"
+    )
+
+
 def build_gfs_filter_url(
     cycle: GFSCycle,
     forecast_hour: int,
@@ -2881,6 +3373,42 @@ def gfs_wave_cycle_candidates(request: GFSWaveRequest, *, now: datetime | None =
     return gfs_cycle_candidates(shim, now=now)
 
 
+
+def hrrr_cycle_candidates(request: HRRRWeatherRequest, *, now: datetime | None = None) -> list[GFSCycle]:
+    if request.cycle != "auto":
+        if not re.fullmatch(r"[0-2][0-9]", request.cycle) or int(request.cycle) > 23:
+            raise ValidationError("--cycle must be auto or an explicit hour 00-23 for HRRR")
+        if not request.date:
+            raise ValidationError("--date YYYYMMDD is required when --cycle is explicit")
+        _validate_date(request.date)
+        return [GFSCycle(request.date, request.cycle)]
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    cursor = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+    cycles: list[GFSCycle] = []
+    for _ in range(max(1, request.max_auto_cycles)):
+        cycles.append(GFSCycle(cursor.strftime("%Y%m%d"), f"{cursor.hour:02d}"))
+        cursor -= timedelta(hours=1)
+    return cycles
+
+
+def dwd_icon_eu_cycle_candidates(request: DWDIconEUWeatherRequest, *, now: datetime | None = None) -> list[GFSCycle]:
+    if request.cycle != "auto":
+        if request.cycle not in {"00", "03", "06", "09", "12", "15", "18", "21"}:
+            raise ValidationError("--cycle must be auto, 00, 03, 06, 09, 12, 15, 18, or 21 for DWD ICON-EU")
+        if not request.date:
+            raise ValidationError("--date YYYYMMDD is required when --cycle is explicit")
+        _validate_date(request.date)
+        return [GFSCycle(request.date, request.cycle)]
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    base_hour = (now.hour // 3) * 3
+    cursor = now.replace(hour=base_hour, minute=0, second=0, microsecond=0)
+    cycles: list[GFSCycle] = []
+    for _ in range(max(1, request.max_auto_cycles)):
+        cycles.append(GFSCycle(cursor.strftime("%Y%m%d"), f"{cursor.hour:02d}"))
+        cursor -= timedelta(hours=3)
+    return cycles
+
+
 def _download_gfs_cycle_segments(
     cycle: GFSCycle,
     forecast_hours: list[int],
@@ -2895,13 +3423,12 @@ def _download_gfs_cycle_segments(
 ) -> list[tuple[int, str, bytes]]:
     segments: list[tuple[int, str, bytes]] = []
     for forecast_hour in forecast_hours:
-        if provider_label == "GFS":
+        if variables_levels is not None:
             url = url_builder(cycle, forecast_hour, bbox, variables_levels=variables_levels)
-            download_step = "downloading GFS forecast hour"
         else:
             url = url_builder(cycle, forecast_hour, bbox)
-            download_step = "downloading GFS Wave forecast hour"
-        check_step = "checking GFS cycle" if provider_label == "GFS" else "checking GFS Wave cycle"
+        download_step = f"downloading {provider_label} forecast hour"
+        check_step = f"checking {provider_label} cycle"
         _progress(progress_callback, check_step, {"cycle": cycle.cycle_time, "hour": forecast_hour})
         _progress(progress_callback, download_step, {"cycle": cycle.cycle_time, "hour": forecast_hour})
         try:
@@ -2911,6 +3438,99 @@ def _download_gfs_cycle_segments(
         segments.append((forecast_hour, url, data))
     return segments
 
+
+
+def _download_dwd_icon_eu_segments(
+    cycle: GFSCycle,
+    forecast_hours: list[int],
+    fields: dict[str, str],
+    http_get: HttpGet,
+    timeout_seconds: float,
+    progress_callback: Callable[[str, dict[str, Any]], None] | None,
+) -> list[tuple[int, str, bytes]]:
+    import bz2
+
+    segments: list[tuple[int, str, bytes]] = []
+    for forecast_hour in forecast_hours:
+        for _short_name, field in fields.items():
+            url = build_dwd_icon_eu_url(cycle, forecast_hour, field)
+            _progress(progress_callback, "checking DWD ICON-EU cycle", {"cycle": cycle.cycle_time, "hour": forecast_hour, "field": field})
+            try:
+                compressed = http_get(url, timeout_seconds)
+                if not compressed:
+                    raise ValidationError("DWD ICON-EU download returned empty response")
+                stripped = compressed.lstrip()
+                if stripped.startswith((b"<", b"<!DOCTYPE", b"<html", b"<HTML")):
+                    raise ValidationError("DWD ICON-EU download returned HTML/text instead of GRIB2")
+                try:
+                    data = bz2.decompress(compressed)
+                except OSError as exc:
+                    raise ValidationError(f"DWD ICON-EU compressed GRIB could not be decompressed: {exc}") from exc
+                _validate_downloaded_grib_bytes(data, provider_label="DWD ICON-EU")
+            except (HTTPError, URLError, TimeoutError, OSError) as exc:
+                raise ValidationError(f"DWD ICON-EU download failed: {exc}") from exc
+            except ValidationError as exc:
+                raise ValidationError(f"incomplete at f{forecast_hour:03d} {field}: {exc}") from exc
+            segments.append((forecast_hour, url, data))
+    return segments
+
+
+
+def _download_hrrr_cycle_segments(
+    cycle: GFSCycle,
+    forecast_hours: list[int],
+    http_get: HttpGet,
+    http_get_range: HttpGetRange,
+    timeout_seconds: float,
+    *,
+    variables_levels: dict[str, str],
+    progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+) -> list[tuple[int, str, bytes]]:
+    segments: list[tuple[int, str, bytes]] = []
+    for forecast_hour in forecast_hours:
+        index_url = build_hrrr_index_url(cycle, forecast_hour)
+        file_url = build_hrrr_file_url(cycle, forecast_hour)
+        try:
+            inventory_text = http_get(index_url, timeout_seconds).decode("utf-8", errors="replace")
+            entries = parse_hrrr_inventory(inventory_text)
+            if not entries:
+                raise ValidationError("HRRR inventory was empty or unreadable")
+            ranges = _select_hrrr_ranges(entries, variables_levels)
+            hour_segments: list[bytes] = []
+            for entry, start, end in ranges:
+                data = http_get_range(file_url, start, end, timeout_seconds)
+                _validate_downloaded_grib_bytes(data, provider_label="HRRR")
+                hour_segments.append(data)
+                _progress(
+                    progress_callback,
+                    "downloaded HRRR indexed field",
+                    {
+                        "cycle": cycle.cycle_time,
+                        "hour": forecast_hour,
+                        "field": entry.short_name,
+                        "level": entry.level,
+                        "bytes": len(data),
+                    },
+                )
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            raise ValidationError(f"incomplete at f{forecast_hour:03d}: HRRR indexed download failed: {exc}") from exc
+        except ValidationError as exc:
+            raise ValidationError(f"incomplete at f{forecast_hour:03d}: {exc}") from exc
+        segments.append((forecast_hour, file_url, b"".join(hour_segments)))
+    return segments
+
+
+def _http_get_range(url: str, start: int, end: int, timeout_seconds: float) -> bytes:
+    expected = end - start + 1
+    request = Request(url, headers={"Range": f"bytes={start}-{end}", "User-Agent": "tidal-current-grib-generator"})
+    with urlopen(request, timeout=timeout_seconds) as response:
+        data = response.read()
+        status = getattr(response, "status", None)
+    if status != 206 and len(data) != expected:
+        raise ValidationError(f"server ignored byte range request for {url}")
+    if len(data) != expected:
+        raise ValidationError(f"short byte range response for {url}: expected {expected}, got {len(data)}")
+    return data
 
 def _download_grib_segment(url: str, http_get: HttpGet, timeout_seconds: float, *, provider_label: str = "GFS") -> bytes:
     try:
@@ -2987,6 +3607,36 @@ def _validate_copernicus_global_wave_request(request: CopernicusGlobalWaveReques
     if request.grid_spacing_deg is not None and request.grid_spacing_deg <= 0:
         raise ValidationError("--weather-grid-spacing-deg must be greater than zero")
     forecast_hour_sequence(request.hours, request.step_hours)
+
+
+def _validate_hrrr_request(request: HRRRWeatherRequest) -> None:
+    if request.bbox.west < HRRR_CONUS_DOMAIN.west or request.bbox.east > HRRR_CONUS_DOMAIN.east:
+        raise ValidationError("HRRR bbox is outside the supported contiguous United States domain")
+    if request.bbox.south < HRRR_CONUS_DOMAIN.south or request.bbox.north > HRRR_CONUS_DOMAIN.north:
+        raise ValidationError("HRRR bbox is outside the supported contiguous United States domain")
+    hrrr_forecast_hour_sequence(request.hours, request.step_hours)
+    hrrr_variables_for_preset(request.preset)
+    if request.cycle != "auto":
+        if not re.fullmatch(r"[0-2][0-9]", request.cycle) or int(request.cycle) > 23:
+            raise ValidationError("--cycle must be auto or an explicit hour 00-23 for HRRR")
+        if not request.date:
+            raise ValidationError("--date YYYYMMDD is required when --cycle is explicit")
+        _validate_date(request.date)
+
+
+def _validate_dwd_icon_eu_request(request: DWDIconEUWeatherRequest) -> None:
+    if request.bbox.west < DWD_ICON_EU_DOMAIN.west or request.bbox.east > DWD_ICON_EU_DOMAIN.east:
+        raise ValidationError("DWD ICON-EU bbox is outside the supported Europe regional domain")
+    if request.bbox.south < DWD_ICON_EU_DOMAIN.south or request.bbox.north > DWD_ICON_EU_DOMAIN.north:
+        raise ValidationError("DWD ICON-EU bbox is outside the supported Europe regional domain")
+    dwd_icon_eu_forecast_hour_sequence(request.hours, request.step_hours)
+    dwd_icon_eu_fields_for_preset(request.preset)
+    if request.cycle != "auto":
+        if request.cycle not in {"00", "03", "06", "09", "12", "15", "18", "21"}:
+            raise ValidationError("--cycle must be auto, 00, 03, 06, 09, 12, 15, 18, or 21 for DWD ICON-EU")
+        if not request.date:
+            raise ValidationError("--date YYYYMMDD is required when --cycle is explicit")
+        _validate_date(request.date)
 
 
 def _validate_ecmwf_request(request: ECMWFWeatherRequest) -> None:
